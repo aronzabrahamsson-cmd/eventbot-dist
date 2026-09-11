@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.0
+// @version      7.53.1
 // @description  v0.7.51 + Rewrite-agent (EventChecker) på edit-sidor, Draftvy-dubblettkoll på draft-listan. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.0 startar på ' + location.pathname);
+  vlog('Script v7.53.1 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -2214,11 +2214,14 @@
     injectStyle();
     const p = document.createElement('div');
     p.id = 'vseh-panel';
-    p.className = 'max';
+    p.className = mode;
     p.innerHTML = `
       <div id="vseh-head">
         <div class="t">Eventbot — SBR-läge</div>
         <div id="vseh-headbtns">
+          <button type="button" data-m="min" title="Minimera">▁</button>
+          <button type="button" data-m="max" title="Maximera">▢</button>
+          <span class="vseh-btn-gap"></span>
           <button type="button" id="vseh-logbtn" title="Visa logg">📋</button>
         </div>
       </div>
@@ -2227,7 +2230,7 @@
         <button type="button" class="vseh-tab" data-tab="sbr-crm">📥 CRM-import</button>
         <button type="button" class="vseh-tab" data-tab="sbr-src">📇 Källor</button>
         <button type="button" class="vseh-tab" data-tab="sbr-cal">📅 Eventlista</button>
-        <button type="button" class="vseh-tab" data-tab="sbr-set">⚙️ Inställningar</button>
+        <button type="button" class="vseh-tab" data-tab="sbr-set">⚙️</button>
       </div>
       <div id="vseh-scroll"><div id="vseh-inner">
 
@@ -2308,6 +2311,9 @@
     `;
     document.body.appendChild(p);
 
+    const mb = document.querySelector('#vseh-headbtns button[data-m="' + mode + '"]');
+    if (mb) mb.classList.add('on');
+    document.querySelectorAll('#vseh-headbtns button[data-m]').forEach(b => b.addEventListener('click', () => setMode(b.dataset.m)));
     document.querySelectorAll('.vseh-tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
     $('vseh-logbtn').addEventListener('click', () => { const w = $('vseh-logwrap'); w.style.display = (w.style.display === 'none' || !w.style.display) ? 'flex' : 'none'; renderLog(); });
     { const lc = document.getElementById('vseh-logclose'); if (lc) lc.addEventListener('click', () => { $('vseh-logwrap').style.display = 'none'; }); }
@@ -2397,7 +2403,7 @@
         <button type="button" class="vseh-tab active" data-tab="cal">📆 Kalendrar</button>
         <button type="button" class="vseh-tab" data-tab="url">🔗 URL</button>
         <button type="button" class="vseh-tab" data-tab="dup">🎭 Dubbletter <span id="vseh-dup-count"></span></button>
-        <button type="button" class="vseh-tab" data-tab="set">⚙️ Inställningar</button>
+        <button type="button" class="vseh-tab" data-tab="set">⚙️</button>
       </div>
       <div id="vseh-scroll"><div id="vseh-inner">
 
@@ -3746,6 +3752,9 @@
       setStatus(`Från cache: ${lastGrouped.length} event · hämtat ${ago(tmTs)}. Klicka Hämta för att uppdatera.`, 'ok');
     }
   } else if (KNOWN_SBR_URL.test(location.href)) {
+    mode = GM_getValue('window_mode', 'min');
+    if (mode === 'small') mode = 'max';            // legacy-läge → maximera
+    if (!['min', 'max'].includes(mode)) mode = 'min';
     buildSbrPanel();
   } else if (KNOWN_DRAFT_URL.test(location.href)) {
     initDraftvyDubblettkoll();
