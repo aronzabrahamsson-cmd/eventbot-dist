@@ -11,8 +11,8 @@
 // @match        https://www.visitstockholm.com/cms/api/event/edit/*
 // @match        https://www.visitstockholm.se/cms/api/event/edit/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/edit/*
-// @updateURL    https://raw.githubusercontent.com/aronzabrahamsson-cmd/eventbot/main/eventbot.user.js
-// @downloadURL  https://raw.githubusercontent.com/aronzabrahamsson-cmd/eventbot/main/eventbot.user.js
+// @updateURL    https://raw.githubusercontent.com/aronzabrahamsson-cmd/eventbot-dist/main/eventbot.user.js
+// @downloadURL  https://raw.githubusercontent.com/aronzabrahamsson-cmd/eventbot-dist/main/eventbot.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
