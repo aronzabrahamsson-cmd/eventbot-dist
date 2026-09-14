@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.4
-// @description  v7.53.4: Draftvy-dubblettkoll: knapparna sitter nu i en sticky mörk list med sidladdningsstatus, och rader flaggas med badges (✅ Ej inlagd / 🤔 Osäker / 🎭 Dublett) med klickbar jämförelsevy mot Visit-kalendern, istället för bara en färgad kant. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
+// @version      7.53.5
+// @description  v7.53.5: Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll: knapparna sitter nu i en sticky mörk list med sidladdningsstatus, och rader flaggas med badges (✅ Ej inlagd / 🤔 Osäker / 🎭 Dubblett) med klickbar jämförelsevy mot Visit-kalendern, istället för bara en färgad kant. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.4 startar på ' + location.pathname);
+  vlog('Script v7.53.5 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -3528,7 +3528,7 @@
         const bar = document.createElement('div');
         bar.id = 'vseh-draft-bar';
         bar.innerHTML = `
-          <button type="button" id="vseh-draft-check-btn">🎭Dublettkoll</button>
+          <button type="button" id="vseh-draft-check-btn">🎭Dubblettkoll</button>
           <button type="button" id="vseh-draft-fetch-btn">Hämta Visit-Kalendern</button>
           <span id="vseh-draft-ts"></span>
           <span id="vseh-draft-progress"></span>
@@ -3582,7 +3582,7 @@
   // utkastet redan finns i kalendern som en riktig dubblett (röd).
   function draftBadgeInfo(st) {
     if (st.key === 'out') return { emoji: '✅', label: 'Ej inlagd', bg: '#1f7a4d', fg: '#fff', expandable: false };
-    if (st.key === 'in') return { emoji: '🎭', label: 'Dublett', bg: '#c02626', fg: '#fff', expandable: true };
+    if (st.key === 'in') return { emoji: '🎭', label: 'Dubblett', bg: '#c02626', fg: '#fff', expandable: true };
     if (st.key === 'partial' || st.key === 'unsure') return { emoji: '🤔', label: 'Osäker', bg: '#c9881f', fg: '#fff', expandable: true };
     return null;   // 'unknown' — dedupIndex ej laddat än
   }
@@ -3606,7 +3606,7 @@
     document.querySelectorAll('.vseh-draft-cmp-row').forEach(r => r.remove());
 
     let checked = 0;
-    const counts = { 'Ej inlagd': 0, Osäker: 0, Dublett: 0 };
+    const counts = { 'Ej inlagd': 0, Osäker: 0, Dubblett: 0 };
     rows.forEach(row => {
       const rowData = extractRowData(row);
       if (!rowData || !rowData.title) return;
@@ -3644,8 +3644,8 @@
         });
       }
     });
-    vlog(`Draftvy: Kontrollerade ${checked} rader — ${counts.Dublett} dubblett(er), ${counts.Osäker} osäkra, ${counts['Ej inlagd']} ej inlagda`,
-      (counts.Dublett || counts.Osäker) ? 'err' : 'ok');
+    vlog(`Draftvy: Kontrollerade ${checked} rader — ${counts.Dubblett} dubblett(er), ${counts.Osäker} osäkra, ${counts['Ej inlagd']} ej inlagda`,
+      (counts.Dubblett || counts.Osäker) ? 'err' : 'ok');
   }
 
   function insertDraftCompareRow(row, rowData, st, pk) {
