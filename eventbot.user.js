@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.3
-// @description  v7.53.3: Draftvy-dubblettkoll läser nu riktiga tr[data-object-pk]-rader (td.field-title_en/address/start_date) istället för gissade CSS-klasser, så "🎭Dublettkoll" faktiskt flaggar mot Visit-kalendern. Ny "Hämta Visit-Kalendern"-knapp med tidsstämpel. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
+// @version      7.53.4
+// @description  v7.53.4: Draftvy-dubblettkoll: knapparna sitter nu i en sticky mörk list med sidladdningsstatus, och rader flaggas med badges (✅ Ej inlagd / 🤔 Osäker / 🎭 Dublett) med klickbar jämförelsevy mot Visit-kalendern, istället för bara en färgad kant. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.3 startar på ' + location.pathname);
+  vlog('Script v7.53.4 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -3493,37 +3493,52 @@
   // Ny sidtyp: draft-listan (KNOWN_DRAFT_URL). Ingen egen panel — märker bara
   // synliga rader i Wagtails egen listvy med en färgad kant baserad på samma
   // matchStatus()/dedupIndex som huvudpanelen redan använder.
+  // Egen liten stilbit för draft-listans stapel — själva märkena/jämförelse-
+  // vyn återanvänder PANEL_CSS:s .vseh-badge/.vseh-compare/.vseh-item-klasser
+  // rakt av (de är alla fristående klassregler, inte beroende av #vseh-panel
+  // som förälder), så de ser likadana ut som i huvudpanelens dubblettvy.
+  const DRAFT_EXTRA_CSS = `
+    #vseh-draft-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
+      flex-wrap:wrap; gap:10px; background:#2f3542; color:#e8eaee; padding:10px 14px;
+      margin:0 0 14px; border-radius:6px; box-shadow:0 2px 10px rgba(0,0,0,.3);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    #vseh-draft-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer;
+      font-size:13px; font-weight:600; }
+    #vseh-draft-check-btn { background:#4a9fe0; color:#fff; }
+    #vseh-draft-fetch-btn { background:#787e8a; color:#fff; }
+    #vseh-draft-bar button:disabled { opacity:.6; cursor:not-allowed; }
+    #vseh-draft-ts, #vseh-draft-progress { font-size:12px; color:#c3c8d1; }
+    .vseh-draft-cmp-row td { background:var(--vd-bg2); padding:10px 14px; }
+  `;
+
+  function ensureDraftStyle() {
+    if (document.getElementById('vseh-draft-css')) return;
+    const s = document.createElement('style');
+    s.id = 'vseh-draft-css';
+    s.textContent = PANEL_CSS + DRAFT_EXTRA_CSS;
+    document.head.appendChild(s);
+  }
+
   function initDraftvyDubblettkoll() {
     vlog('Draftvy-Dubblettkoll: Initierar på draft-lista');
-    if (!document.getElementById('vseh-draft-check-btn')) {
+    ensureDraftStyle();
+    if (!document.getElementById('vseh-draft-bar')) {
       const header = document.querySelector('.page-header, .header, header, h1');
       if (header) {
-        const btnStyle = 'margin-left:10px; padding:8px 16px; background:#4a9fe0; color:white; border:none; border-radius:4px; cursor:pointer;';
-
-        const checkBtn = document.createElement('button');
-        checkBtn.id = 'vseh-draft-check-btn';
-        checkBtn.type = 'button';
-        checkBtn.textContent = '🎭Dublettkoll';
-        checkBtn.style.cssText = btnStyle;
-        checkBtn.addEventListener('click', runDraftvyCheck);
-
-        const fetchBtn = document.createElement('button');
-        fetchBtn.id = 'vseh-draft-fetch-btn';
-        fetchBtn.type = 'button';
-        fetchBtn.textContent = 'Hämta Visit-Kalendern';
-        fetchBtn.style.cssText = btnStyle.replace('#4a9fe0', '#787e8a');
-        fetchBtn.addEventListener('click', loadDedupForDraft);
-
-        const ts = document.createElement('span');
-        ts.id = 'vseh-draft-ts';
-        ts.style.cssText = 'margin-left:8px; font-size:12px; color:#787e8a;';
-        ts.textContent = fmtStamp(GM_getValue('vs_fetched_ts', 0));
-
-        header.parentNode.insertBefore(ts, header.nextSibling);
-        header.parentNode.insertBefore(fetchBtn, header.nextSibling);
-        header.parentNode.insertBefore(checkBtn, header.nextSibling);
+        const bar = document.createElement('div');
+        bar.id = 'vseh-draft-bar';
+        bar.innerHTML = `
+          <button type="button" id="vseh-draft-check-btn">🎭Dublettkoll</button>
+          <button type="button" id="vseh-draft-fetch-btn">Hämta Visit-Kalendern</button>
+          <span id="vseh-draft-ts"></span>
+          <span id="vseh-draft-progress"></span>
+        `;
+        header.parentNode.insertBefore(bar, header.nextSibling);
+        document.getElementById('vseh-draft-check-btn').addEventListener('click', runDraftvyCheck);
+        document.getElementById('vseh-draft-fetch-btn').addEventListener('click', loadDedupForDraft);
       }
     }
+    updateDraftvyTs();
     if (!dedupIndex) {
       loadDedupForDraft();
     } else {
@@ -3539,22 +3554,40 @@
   async function loadDedupForDraft() {
     const btn = document.getElementById('vseh-draft-fetch-btn');
     if (btn) btn.disabled = true;
+    const prog = document.getElementById('vseh-draft-progress');
     try {
       const rows = await buildDedupIndex(
         m => vlog(m),
-        (cur, total) => {}
+        (cur, total) => { if (prog) prog.textContent = `Läser sida ${cur}/${total}`; }
       );
       dedupIndex = buildIndexFromRows(rows);
       GM_setValue('vs_fetched_ts', Date.now());
       updateDraftvyTs();
+      if (prog) prog.textContent = '';
       vlog(`Draftvy: Kalender laddad med ${rows.length} rader`, 'ok');
       runDraftvyCheck();
     } catch (error) {
+      if (prog) prog.textContent = '';
       vlog('Draftvy: Fel vid laddning - ' + error.message, 'err');
     } finally {
       if (btn) btn.disabled = false;
     }
   }
+
+  // Draft-vyns egna badge-kategorier — OBS: detta är INTE samma färgmappning
+  // som huvudpanelens STATUS (där "Ej inlagt" är rött, för att den vyn visar
+  // KÄLL-event som saknas i kalendern och alltså bör skapas). Här är
+  // semantiken den omvända: "ej inlagd" för ett UTKAST är den trygga,
+  // förväntade statusen (grön), medan en bekräftad träff ("in") betyder att
+  // utkastet redan finns i kalendern som en riktig dubblett (röd).
+  function draftBadgeInfo(st) {
+    if (st.key === 'out') return { emoji: '✅', label: 'Ej inlagd', bg: '#1f7a4d', fg: '#fff', expandable: false };
+    if (st.key === 'in') return { emoji: '🎭', label: 'Dublett', bg: '#c02626', fg: '#fff', expandable: true };
+    if (st.key === 'partial' || st.key === 'unsure') return { emoji: '🤔', label: 'Osäker', bg: '#c9881f', fg: '#fff', expandable: true };
+    return null;   // 'unknown' — dedupIndex ej laddat än
+  }
+
+  const draftExpandedPks = new Set();
 
   function runDraftvyCheck() {
     if (!dedupIndex) {
@@ -3567,26 +3600,104 @@
       vlog('Draftvy: Inga rader funna', 'err');
       return;
     }
-    let checked = 0; let matchesFound = 0;
+    // Städa bort ev. märken/jämförelserader från en tidigare körning innan
+    // vi ritar om, så de inte dubbleras.
+    document.querySelectorAll('.vseh-draft-badge').forEach(b => b.remove());
+    document.querySelectorAll('.vseh-draft-cmp-row').forEach(r => r.remove());
+
+    let checked = 0;
+    const counts = { 'Ej inlagd': 0, Osäker: 0, Dublett: 0 };
     rows.forEach(row => {
       const rowData = extractRowData(row);
       if (!rowData || !rowData.title) return;
       checked++;
       const st = matchStatus(rowData);
-      if (st.key === 'in' || st.key === 'partial' || st.key === 'unsure') {
-        matchesFound++;
-        const indicator = document.createElement('div');
-        indicator.style.position = 'absolute';
-        indicator.style.left = '0';
-        indicator.style.top = '0';
-        indicator.style.width = '4px';
-        indicator.style.height = '100%';
-        indicator.style.background = STATUS[st.key].bar || '#c0561f';
-        if (row.style.position !== 'relative') row.style.position = 'relative';
-        row.appendChild(indicator);
+      const info = draftBadgeInfo(st);
+      if (!info) return;
+      counts[info.label] = (counts[info.label] || 0) + 1;
+
+      const titleWrap = row.querySelector('td.field-title_en .title-wrapper');
+      if (!titleWrap) return;
+      titleWrap.style.display = 'inline-flex';
+      titleWrap.style.alignItems = 'center';
+      titleWrap.style.gap = '6px';
+
+      const badge = document.createElement('span');
+      badge.className = 'vseh-badge vseh-draft-badge' + (info.expandable ? ' expandable' : '');
+      badge.style.background = info.bg;
+      badge.style.color = info.fg;
+      badge.textContent = info.emoji + ' ' + info.label;
+      titleWrap.insertBefore(badge, titleWrap.firstChild);
+
+      const pk = row.dataset.objectPk;
+      if (info.expandable) {
+        if (draftExpandedPks.has(pk)) insertDraftCompareRow(row, rowData, st, pk);
+        badge.addEventListener('click', () => {
+          if (draftExpandedPks.has(pk)) {
+            draftExpandedPks.delete(pk);
+            const next = row.nextElementSibling;
+            if (next && next.classList.contains('vseh-draft-cmp-row')) next.remove();
+          } else {
+            draftExpandedPks.add(pk);
+            insertDraftCompareRow(row, rowData, st, pk);
+          }
+        });
       }
     });
-    vlog(`Draftvy: Kontrollerade ${checked} rader, ${matchesFound} med matchningar`, matchesFound > 0 ? 'err' : 'ok');
+    vlog(`Draftvy: Kontrollerade ${checked} rader — ${counts.Dublett} dubblett(er), ${counts.Osäker} osäkra, ${counts['Ej inlagd']} ej inlagda`,
+      (counts.Dublett || counts.Osäker) ? 'err' : 'ok');
+  }
+
+  function insertDraftCompareRow(row, rowData, st, pk) {
+    const old = row.nextElementSibling;
+    if (old && old.classList.contains('vseh-draft-cmp-row')) old.remove();
+    const tr = document.createElement('tr');
+    tr.className = 'vseh-draft-cmp-row';
+    const td = document.createElement('td');
+    td.colSpan = row.children.length;
+    td.innerHTML = draftCompareHTML(rowData, st, pk);
+    tr.appendChild(td);
+    row.insertAdjacentElement('afterend', tr);
+    tr.querySelectorAll('.dp-multi').forEach(el => el.addEventListener('click', () => {
+      const box = document.getElementById('dp-' + el.dataset.dp);
+      if (!box) return;
+      const open = box.style.display !== 'none';
+      box.style.display = open ? 'none' : 'block';
+      const arrow = el.querySelector('.dp-arrow');
+      if (arrow) arrow.textContent = open ? '▸' : '▾';
+    }));
+  }
+
+  // Jämförelsevy för draft-listan — samma visuella mönster som huvud-
+  // panelens compareHTML() (vseh-compare/vseh-cmp-grid/vseh-item), men
+  // vänster kolumn visar UTKASTET (verktygets egen import av tabellraden)
+  // istället för en API-källa som Ticketmaster.
+  function draftCompareHTML(rowData, st, pk) {
+    const ourDates = rowData.dates.map(d => d.date);
+    const draftSide = `
+      <div class="vseh-cmp-col">
+        <h5>Detta utkast</h5>
+        <div class="vseh-item">
+          <div class="vseh-item-title">${esc(rowData.title)}</div>
+          <div class="vseh-item-row"><span class="lab">Adress</span> ${esc(rowData.address) || '–'}</div>
+          <div class="vseh-item-row"><span class="lab">Datum</span> ${datePresent('draft', ourDates, false, ourDates[0], ourDates[ourDates.length - 1], 'draft-' + pk)}</div>
+        </div>
+      </div>`;
+
+    let calSide;
+    if (!st.matches.length) {
+      calSide = `<div class="vseh-cmp-col"><h5>Visit-kalendern</h5><div class="vseh-nomatch">Ingen matchande post.</div></div>`;
+    } else {
+      calSide = `<div class="vseh-cmp-col"><h5>Visit-kalendern (${st.matches.length} post${st.matches.length > 1 ? 'er' : ''})</h5>` +
+        st.matches.map((m, mi) => `
+          <div class="vseh-item">
+            ${m.href ? `<div class="vseh-item-btns"><a class="vseh-edit" href="${esc(m.href)}" target="_blank" rel="noopener">🔍 Granska</a></div>` : ''}
+            <div class="vseh-item-title">${esc(m.title)}</div>
+            <div class="vseh-item-row"><span class="lab">Plats</span> ${esc(m.venue_name || m.address) || '–'}</div>
+            <div class="vseh-item-row"><span class="lab">Datum</span> ${datePresent('cal', m.isSpan ? null : [m.start], m.isSpan, m.start, m.end, 'draftcal-' + pk + '-' + mi)}</div>
+          </div>`).join('') + `</div>`;
+    }
+    return `<div class="vseh-compare"><div class="vseh-cmp-grid">${draftSide}${calSide}</div></div>`;
   }
 
   // Kolumnerna är td.field-title_en / field-title_sv / field-address /
