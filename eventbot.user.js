@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.2
-// @description  v7.53.2: Draftvy-dubblettkoll döpt om till "🎭Dublettkoll", ny "Hämta Visit-Kalendern"-knapp med tidsstämpel bredvid. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
+// @version      7.53.3
+// @description  v7.53.3: Draftvy-dubblettkoll läser nu riktiga tr[data-object-pk]-rader (td.field-title_en/address/start_date) istället för gissade CSS-klasser, så "🎭Dublettkoll" faktiskt flaggar mot Visit-kalendern. Ny "Hämta Visit-Kalendern"-knapp med tidsstämpel. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.2 startar på ' + location.pathname);
+  vlog('Script v7.53.3 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -3562,7 +3562,7 @@
       return;
     }
     vlog('Draftvy: Kör dubblettkontroll på synliga rader');
-    const rows = document.querySelectorAll('.listing-item, .event-row, tr[data-id], .result-row');
+    const rows = document.querySelectorAll('tr[data-object-pk]');
     if (rows.length === 0) {
       vlog('Draftvy: Inga rader funna', 'err');
       return;
@@ -3589,24 +3589,30 @@
     vlog(`Draftvy: Kontrollerade ${checked} rader, ${matchesFound} med matchningar`, matchesFound > 0 ? 'err' : 'ok');
   }
 
+  // Kolumnerna är td.field-title_en / field-title_sv / field-address /
+  // field-start_date / field-modified_at / field-status, bekräftat mot
+  // riktig markup från draft-listan (2026-09-14). Titeln ligger i en <a>
+  // inuti .title-wrapper — "Redigera"/"Radera" är separata <li>-element i
+  // en .actions-lista i SAMMA <td>, inte en del av titeltexten, så inget
+  // behöver städas bort.
   function extractRowData(row) {
-    const data = { title: '', venue_name: '', address: '', start_date: null, end_date: null, dates: [], _source: 'draft' };
-    const titleEl = row.querySelector('.title, .event-title, .name, h3, h4, h5');
-    if (titleEl) data.title = titleEl.textContent?.trim() || '';
-    const venueEl = row.querySelector('.venue, .location, .place, .venue-name');
-    if (venueEl) data.venue_name = venueEl.textContent?.trim() || '';
-    const addrEl = row.querySelector('.address, .addr');
-    if (addrEl) data.address = addrEl.textContent?.trim() || '';
-    const dateEl = row.querySelector('.date, .start-date, .event-date');
-    if (dateEl) {
-      const dateText = dateEl.textContent?.trim() || '';
-      const dateMatch = dateText.match(/(\d{4}-\d{2}-\d{2})/);
-      if (dateMatch) {
-        data.start_date = dateMatch[1];
-        data.dates = [{ date: dateMatch[1] }];
-      }
-    }
-    return data.title ? data : null;
+    const titleEl = row.querySelector('td.field-title_en .title-wrapper a, td.field-title_en a');
+    const title = (titleEl?.textContent || '').trim();
+    if (!title) return null;
+
+    const address = (row.querySelector('td.field-address')?.textContent || '').trim();
+    const startRaw = (row.querySelector('td.field-start_date')?.textContent || '').trim();
+    const start_date = parseSwedishDate(startRaw);
+
+    return {
+      title,
+      venue_name: '',
+      address,
+      start_date,
+      end_date: null,
+      dates: start_date ? [{ date: start_date }] : [],
+      _source: 'draft'
+    };
   }
 
   // ---- EventChecker (Rewrite-agent, edit-sida) -----------------------------
