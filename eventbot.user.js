@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.1
-// @description  v0.7.51 + Rewrite-agent (EventChecker) på edit-sidor, Draftvy-dubblettkoll på draft-listan. All funktion från v0.7.51 bevarad.
+// @version      7.53.2
+// @description  v7.53.2: Draftvy-dubblettkoll döpt om till "🎭Dublettkoll", ny "Hämta Visit-Kalendern"-knapp med tidsstämpel bredvid. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.1 startar på ' + location.pathname);
+  vlog('Script v7.53.2 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -3495,34 +3495,49 @@
   // matchStatus()/dedupIndex som huvudpanelen redan använder.
   function initDraftvyDubblettkoll() {
     vlog('Draftvy-Dubblettkoll: Initierar på draft-lista');
+    if (!document.getElementById('vseh-draft-check-btn')) {
+      const header = document.querySelector('.page-header, .header, header, h1');
+      if (header) {
+        const btnStyle = 'margin-left:10px; padding:8px 16px; background:#4a9fe0; color:white; border:none; border-radius:4px; cursor:pointer;';
+
+        const checkBtn = document.createElement('button');
+        checkBtn.id = 'vseh-draft-check-btn';
+        checkBtn.type = 'button';
+        checkBtn.textContent = '🎭Dublettkoll';
+        checkBtn.style.cssText = btnStyle;
+        checkBtn.addEventListener('click', runDraftvyCheck);
+
+        const fetchBtn = document.createElement('button');
+        fetchBtn.id = 'vseh-draft-fetch-btn';
+        fetchBtn.type = 'button';
+        fetchBtn.textContent = 'Hämta Visit-Kalendern';
+        fetchBtn.style.cssText = btnStyle.replace('#4a9fe0', '#787e8a');
+        fetchBtn.addEventListener('click', loadDedupForDraft);
+
+        const ts = document.createElement('span');
+        ts.id = 'vseh-draft-ts';
+        ts.style.cssText = 'margin-left:8px; font-size:12px; color:#787e8a;';
+        ts.textContent = fmtStamp(GM_getValue('vs_fetched_ts', 0));
+
+        header.parentNode.insertBefore(ts, header.nextSibling);
+        header.parentNode.insertBefore(fetchBtn, header.nextSibling);
+        header.parentNode.insertBefore(checkBtn, header.nextSibling);
+      }
+    }
     if (!dedupIndex) {
       loadDedupForDraft();
     } else {
       runDraftvyCheck();
     }
-    let checkBtn = document.getElementById('vseh-draft-check-btn');
-    if (!checkBtn) {
-      const header = document.querySelector('.page-header, .header, header, h1');
-      if (header) {
-        checkBtn = document.createElement('button');
-        checkBtn.id = 'vseh-draft-check-btn';
-        checkBtn.type = 'button';
-        checkBtn.textContent = 'Kolla dubbletter';
-        checkBtn.style.marginLeft = '10px';
-        checkBtn.style.padding = '8px 16px';
-        checkBtn.style.background = '#4a9fe0';
-        checkBtn.style.color = 'white';
-        checkBtn.style.border = 'none';
-        checkBtn.style.borderRadius = '4px';
-        checkBtn.style.cursor = 'pointer';
-        header.parentNode.insertBefore(checkBtn, header.nextSibling);
-        checkBtn.addEventListener('click', runDraftvyCheck);
-      }
-    }
+  }
+
+  function updateDraftvyTs() {
+    const ts = document.getElementById('vseh-draft-ts');
+    if (ts) ts.textContent = fmtStamp(GM_getValue('vs_fetched_ts', 0));
   }
 
   async function loadDedupForDraft() {
-    const btn = document.getElementById('vseh-draft-check-btn');
+    const btn = document.getElementById('vseh-draft-fetch-btn');
     if (btn) btn.disabled = true;
     try {
       const rows = await buildDedupIndex(
@@ -3530,6 +3545,8 @@
         (cur, total) => {}
       );
       dedupIndex = buildIndexFromRows(rows);
+      GM_setValue('vs_fetched_ts', Date.now());
+      updateDraftvyTs();
       vlog(`Draftvy: Kalender laddad med ${rows.length} rader`, 'ok');
       runDraftvyCheck();
     } catch (error) {
