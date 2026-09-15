@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.6
-// @description  v7.53.6: Fix Billetto-hämtningen — API:et paginerar (has_more/next_url/total, bekräftat mot riktigt anrop), tidigare kod hämtade bara första sidan (100 av t.ex. 643 event) och trodde det var allt. Hämtar nu alla sidor. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
+// @version      7.53.8
+// @description  v7.53.8: Fix Billetto-dubbletter — venue_name var alltid tom sträng vilket fick groupEvents() att slå ihop OLIKA event som råkar dela titel (Billetto listar varje datum som ett helt eget event-objekt, till skillnad från Ticketmaster). Adressen används nu som venue_name så bara verkliga titel+adress-kollisioner dedupas. Käll-filterchipsen i "Ej inlagda" visar nu antal event per källa (t.ex. "Billetto (43)") och den valda källan får inverterade färger (fylld bakgrund i källans egen färg) istället för bara en tunn kantlinje. Fix Billetto-hämtningen från v7.53.6 (paginering via has_more/next_url/total). Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.6 startar på ' + location.pathname);
+  vlog('Script v7.53.8 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -475,6 +475,7 @@
     const isCancelled = ev.state === 'canceled';
     const image = ev.image_link ? { url: ev.image_link } : null;
     const addrParts = [loc.address_line, loc.address_line_2].filter(Boolean);
+    const address = addrParts.join(' ');
     return {
       _tm_id: ev.id || null, title: ev.title || '',
       description: ev.description || '', image,
@@ -483,8 +484,16 @@
       segment: cat.category_localized || cat.category || '',
       genre: cat.subcategory_localized || cat.subcategory || '',
       category: BILLETTO_CATEGORY_MAP[(cat.category || '').toLowerCase()] || cat.category_localized || 'Other',
-      venue_name: '',   // Billetto ger ingen separat venue-titel, bara adress
-      address: addrParts.join(' '), zip_code: loc.postal_code || '', city: loc.city || '',
+      // RÄTTAT: Billetto ger ingen separat venue-titel, men groupEvents()
+      // dedupar på title+venue_name — med venue_name alltid '' kolliderade
+      // OLIKA event som råkar dela titel (Billetto listar varje datum som ett
+      // helt eget event-objekt, inte som tillfällen under ETT event, till
+      // skillnad från Ticketmaster). Bekräftat i skarp logg: tre olika event
+      // med titeln "Matmilen Södermalm" mot tre olika kalenderrader slogs
+      // ihop till ett enda kort. Adressen används nu som venue_name istället
+      // — då kolliderar bara event som verkligen delar både titel OCH adress.
+      venue_name: address,
+      address, zip_code: loc.postal_code || '', city: loc.city || '',
       location: (loc.coordinates && loc.coordinates.latitude && loc.coordinates.longitude)
         ? { latitude: loc.coordinates.latitude, longitude: loc.coordinates.longitude } : null,
       external_website_url: ev.url || '',
@@ -3268,16 +3277,28 @@
     const srcBox = $('vseh-srcfilter');
     if (srcBox) {
       if (activeFilter === 'out') {
-        const outSources = new Set(withStatus.filter(w => w.st.key === 'out').map(w => w.ev._source || 'okänd'));
+        const outRows = withStatus.filter(w => w.st.key === 'out');
+        const outCounts = new Map();
+        outRows.forEach(w => {
+          const src = w.ev._source || 'okänd';
+          outCounts.set(src, (outCounts.get(src) || 0) + 1);
+        });
+        const outSources = new Set(outCounts.keys());
         if (activeSourceFilter !== 'all' && !outSources.has(activeSourceFilter)) activeSourceFilter = 'all';
         if (outSources.size > 1) {
           srcBox.style.display = 'flex';
           const chips = ['all', ...[...outSources].sort()];
           srcBox.innerHTML = chips.map(src => {
             const label = src === 'all' ? 'Alla källor' : (SOURCE_LABEL[src] || src);
-            const active = activeSourceFilter === src ? 'active' : '';
-            const color = src === 'all' ? '' : `border-color:${SOURCE_COLOR[src] || '#9aa0ad'};`;
-            return `<button type="button" data-src="${esc(src)}" class="${active}" style="${active ? '' : color}">${esc(label)}</button>`;
+            const count = src === 'all' ? outRows.length : (outCounts.get(src) || 0);
+            const active = activeSourceFilter === src;
+            const baseColor = src === 'all' ? 'var(--vd-accent)' : (SOURCE_COLOR[src] || '#9aa0ad');
+            // Vald källa: fylld bakgrund i källans egen färg (samma "inverterade"
+            // stil som andra aktiva knappar i panelen) — ej vald: bara kantfärg.
+            const style = active
+              ? `background:${baseColor}; border-color:${baseColor}; color:#0d1520;`
+              : `border-color:${baseColor};`;
+            return `<button type="button" data-src="${esc(src)}" class="${active ? 'active' : ''}" style="${style}">${esc(label)} (${count})</button>`;
           }).join('');
           srcBox.querySelectorAll('button[data-src]').forEach(b => b.addEventListener('click', () => {
             activeSourceFilter = b.dataset.src; render(lastGrouped);
