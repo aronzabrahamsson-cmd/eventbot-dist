@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.5
-// @description  v7.53.5: Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll: knapparna sitter nu i en sticky mörk list med sidladdningsstatus, och rader flaggas med badges (✅ Ej inlagd / 🤔 Osäker / 🎭 Dubblett) med klickbar jämförelsevy mot Visit-kalendern, istället för bara en färgad kant. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
+// @version      7.53.6
+// @description  v7.53.6: Fix Billetto-hämtningen — API:et paginerar (has_more/next_url/total, bekräftat mot riktigt anrop), tidigare kod hämtade bara första sidan (100 av t.ex. 643 event) och trodde det var allt. Hämtar nu alla sidor. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.5 startar på ' + location.pathname);
+  vlog('Script v7.53.6 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -531,17 +531,39 @@
     return false;
   }
 
-  async function fetchBilletto({ apiKeypair, baseUrl, onProgress }) {
+  // RÄTTAT: Billettos API paginerar visst — bekräftat via ett riktigt anrop
+  // (2026-09-15): svaret har has_more/total/next_url. Föregående version
+  // hämtade bara första sidan (100 av då 643 event) och trodde att var allt.
+  // Följer nu next_url tills has_more är false, med ett generöst tak (50
+  // sidor = 5000 event) som ren säkerhetsspärr mot en oändlig loop om API:et
+  // någon gång skulle bete sig oväntat.
+  const BILLETTO_MAX_PAGES = 50;
+
+  async function fetchBilletto({ apiKeypair, baseUrl, onProgress, onPage }) {
     if (!apiKeypair) throw new Error('Billetto API-nyckelpar saknas (fliken Inställningar).');
-    onProgress('Hämtar Billetto (1 anrop, max 100 event – ingen sidnumrering i API:et)…');
-    const url = baseUrl + '?' + new URLSearchParams({ limit: '100' }).toString();
-    const data = await gmGetHeaders(url, { 'Api-Keypair': apiKeypair });
-    const all = (data && data.data) || [];
-    const stockholm = all.filter(ev => normText((ev.location && ev.location.city) || '') === 'stockholm');
-    vlog('Billetto: ' + all.length + ' event totalt, ' + stockholm.length + ' i Stockholm.');
-    if (all.length >= 100) {
-      vlog('OBS: Billetto-svaret nådde gränsen på 100 event — fler kan saknas (ingen sidnumrering i API:et).', 'err');
+    let url = baseUrl + '?' + new URLSearchParams({ limit: '100' }).toString();
+    let all = [];
+    let total = null;
+    let page = 0;
+    while (url && page < BILLETTO_MAX_PAGES) {
+      page++;
+      onProgress('Hämtar Billetto, sida ' + page + (total ? ' (' + all.length + '/' + total + ' event)' : '') + '…');
+      // Innan vi vet totalen (efter första sidan) visas bara "sida N av N" —
+      // väldigt uppskattat totalt sidantal när det väl är känt.
+      if (onPage) onPage(page, total ? Math.max(page, Math.ceil(total / 100)) : page);
+      const data = await gmGetHeaders(url, { 'Api-Keypair': apiKeypair });
+      const batch = (data && data.data) || [];
+      all = all.concat(batch);
+      if (typeof data.total === 'number') total = data.total;
+      url = data && data.has_more ? data.next_url : null;
+      if (url) await new Promise(r => setTimeout(r, 200));
     }
+    if (url && page >= BILLETTO_MAX_PAGES) {
+      vlog('OBS: Billetto-hämtningen stoppades efter ' + BILLETTO_MAX_PAGES + ' sidor (säkerhetsspärr) — fler event kan saknas.', 'err');
+    }
+    const stockholm = all.filter(ev => normText((ev.location && ev.location.city) || '') === 'stockholm');
+    vlog('Billetto: ' + all.length + ' event totalt över ' + page + ' sida(or)' +
+      (total !== null ? ' (API rapporterar ' + total + ' totalt)' : '') + ', ' + stockholm.length + ' i Stockholm.');
     const occ = stockholm.map(mapBillettoEvent);
     return { grouped: groupEvents(occ, 'billetto'), rawCount: occ.length };
   }
@@ -3144,7 +3166,11 @@
     $('vseh-fetch-bl').disabled = true;
     showProgress('bl', 1, 1);
     try {
-      const { grouped, rawCount } = await fetchBilletto({ apiKeypair, baseUrl, onProgress: m => setStatus(m, 'work') });
+      const { grouped, rawCount } = await fetchBilletto({
+        apiKeypair, baseUrl,
+        onProgress: m => setStatus(m, 'work'),
+        onPage: (cur, total) => showProgress('bl', cur, total)
+      });
       hideProgress('bl');
       GM_setValue('billetto_fetched_ts', Date.now());
       { const ts = $('vseh-bl-ts'); if (ts) ts.textContent = fmtStamp(Date.now()); }
