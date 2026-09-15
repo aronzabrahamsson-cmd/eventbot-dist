@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.8
-// @description  v7.53.8: Fix Billetto-dubbletter — venue_name var alltid tom sträng vilket fick groupEvents() att slå ihop OLIKA event som råkar dela titel (Billetto listar varje datum som ett helt eget event-objekt, till skillnad från Ticketmaster). Adressen används nu som venue_name så bara verkliga titel+adress-kollisioner dedupas. Käll-filterchipsen i "Ej inlagda" visar nu antal event per källa (t.ex. "Billetto (43)") och den valda källan får inverterade färger (fylld bakgrund i källans egen färg) istället för bara en tunn kantlinje. Fix Billetto-hämtningen från v7.53.6 (paginering via has_more/next_url/total). Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
+// @version      7.53.9
+// @description  v7.53.9: Dokumenterar en bekräftad Billetto-begränsning — API-nyckelparet är knutet till ett publisher/annonskonto (utm_content=SE+7345087) och ger INTE hela billetto.se:s publika utbud (bekräftat: eventet "Grand Antiques Art & Design" syns på billetto.se men API:et svarar "not found" för samma nyckel). Ingen kodfix möjlig — kräver bredare API-scope från Billetto. Fix Billetto-dubbletter — venue_name var alltid tom sträng vilket fick groupEvents() att slå ihop OLIKA event som råkar dela titel (Billetto listar varje datum som ett helt eget event-objekt, till skillnad från Ticketmaster). Adressen används nu som venue_name så bara verkliga titel+adress-kollisioner dedupas. Käll-filterchipsen i "Ej inlagda" visar nu antal event per källa (t.ex. "Billetto (43)") och den valda källan får inverterade färger (fylld bakgrund i källans egen färg) istället för bara en tunn kantlinje. Fix Billetto-hämtningen från v7.53.6 (paginering via has_more/next_url/total). Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.8 startar på ' + location.pathname);
+  vlog('Script v7.53.9 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -98,6 +98,15 @@
   // (SED_BASE definieras nedan, vid buildDedupIndex.)
   // ANTAGANDE: Sverige-endpointen följer samma mönster som Danmark (billetto.dk).
   // Ej bekräftad i dokumentationen — rätta i Inställningar om detta visar sig fel.
+  // KÄND BEGRÄNSNING (bekräftad 2026-09-15): detta är Billettos "publisher"/
+  // annons-API, knutet till API-nyckelparets specifika konto (utm_content=SE+7345087
+  // på varje event-länk) — INTE hela billetto.se:s publika utbud. Ett riktigt,
+  // publikt Stockholmsevent ("Grand Antiques Art & Design", event-id 1948618)
+  // gav "Event 1948618 not found" på denna endpoint trots att det syns på
+  // billetto.se. Paginering (has_more/next_url/total) fungerar korrekt och hämtar
+  // ALLT nyckelparet har åtkomst till — det saknade är strukturellt utanför
+  // klientens kontroll. Enda fixarna: bredare API-scope från Billetto, eller en
+  // annan/obekräftad endpoint som driver billetto.se:s egen sökning.
   const BILLETTO_BASE_DEFAULT = 'https://billetto.se/api/v3/public/events';
   // Tickster v0.4 (dokumenterad filtersyntax: q=city:X). v1.0 finns men dess
   // ev. geografiska radiefilter kunde inte bekräftas (JS-renderad Swagger-sida).
@@ -2518,6 +2527,12 @@
             <input type="text" id="vseh-blkey" class="vseh-key" placeholder="Klistra in nyckelparet från Billetto" autocomplete="off" spellcheck="false"></div>
           <div class="vseh-row"><label>Billetto bas-URL (endast om standard är fel)</label>
             <input type="text" id="vseh-blbase" class="vseh-key" placeholder="https://billetto.se/api/v3/public/events" autocomplete="off" spellcheck="false"></div>
+          <div class="vseh-hint">OBS: detta API-nyckelpar är knutet till ett specifikt Billetto-"publisher"-konto
+            (varje hämtat event har utm_content=SE+7345087 i sin länk) — det ger INTE alla publika event i Stockholm,
+            bara de som är anslutna till den annonsfeeden. Bekräftat 2026-09-15: eventet "Grand Antiques Art &amp; Design"
+            (billetto.se/e/grand-antiques-art-design-biljetter-1948618) syns på billetto.se men API:et svarar
+            "Event 1948618 not found" för denna nyckel. Kontakta Billetto för bredare API-behörighet om fler event behövs
+            — fler sidor/hämtningar hjälper inte, det är inte en pagineringsbugg.</div>
           <div class="vseh-row"><label>Tickster API-nyckel</label>
             <input type="text" id="vseh-tixkey" class="vseh-key" placeholder="Tickster API-nyckel" autocomplete="off" spellcheck="false"></div>
           <div class="vseh-two">
