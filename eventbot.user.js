@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.54.0
+// @version      7.54.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -126,10 +126,16 @@
   // SSR-svaret (Nuxt-payload) från nortic.se/stad/stockholm, som avslöjade den
   // exakta anrops-URL:en sidan själv använder (self/next-länkar i svaret).
   // Bekräftat 2026-09-16 med city=Stockholm: totalItems=320 över 16 sidor.
-  // Ingen nyckel behövs. OBS: ren serverfetch (t.ex. PowerShell) blockeras med
-  // 404 av någon form av bot-/TLS-fingeravtrycksskydd — GM_xmlhttpRequest kör
-  // via webbläsarens riktiga nätverksstack så det bör fungera ändå, men detta
-  // är ett obekräftat gränssnitt som kan sluta fungera utan förvarning.
+  // Ingen nyckel behövs. OBS: både PowerShell OCH GM_xmlhttpRequest (riktig
+  // webbläsar-nätverksstack) får HTTP 404 med tomt svar mot denna URL, så det
+  // rör sig INTE bara om TLS-/bot-fingeravtryck — trolig orsak är att detta
+  // är en intern/SSR-endpoint som inte är avsedd att anropas direkt från
+  // klienten, eller att den faktiska publika URL:en skiljer sig från den som
+  // syntes i Nuxt-payloaden (fel path/parametrar). Nästa steg för att
+  // bekräfta: öppna nortic.se/stad/stockholm i webbläsarens DevTools →
+  // Network-flik och jämföra den FAKTISKA XHR/fetch-anropet (URL, metod,
+  // headers) mot NORTIC_BASE nedan, snarare än att lita på SSR-payloaden.
+  // Detta gränssnitt är obekräftat och kan sluta fungera utan förvarning.
   const NORTIC_BASE = 'https://services.nortic.se/public/v1/events';
   // Kommun-svep för att täcka Stockholmsregionen utan ett bekräftat radiefilter.
   const TICKSTER_MUNICIPALITIES = ['stockholm', 'solna', 'sundbyberg', 'nacka',
@@ -261,17 +267,36 @@
       });
     });
   }
-  // Origin/Referer sätts för att likna ett anrop från nortic.se självt — troligen
-  // inte det som stoppade PowerShell-testerna (se kommentar vid NORTIC_BASE),
-  // men billigt att lägga till som extra säkerhetsmarginal.
+  // Origin/Referer sätts för att likna ett anrop från nortic.se självt.
+  // 2026-09-16: bekräftat att även GM_xmlhttpRequest (riktig webbläsar-nätverksstack,
+  // inte bara PowerShell) får HTTP 404 med tomt svar — så det är INTE bara ett
+  // TLS-fingeravtrycksproblem. Sec-Fetch-*-headers läggs till här eftersom
+  // GM_xmlhttpRequest annars inte skickar dem (till skillnad från en vanlig
+  // sid-initierad fetch), i fall en WAF/CDN kräver dem. Om detta fortfarande
+  // ger 404 loggas svarshuvuden (server/cf-ray/via etc) i felmeddelandet så
+  // att man kan se vilken CDN/WAF som svarar utan att behöva DevTools.
   function gmGetNortic(url) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET', url,
-        headers: { 'Accept': 'application/json', 'Origin': 'https://nortic.se', 'Referer': 'https://nortic.se/' },
+        headers: {
+          'Accept': 'application/json',
+          'Origin': 'https://nortic.se',
+          'Referer': 'https://nortic.se/',
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Dest': 'empty'
+        },
         onload: r => {
           if (r.status === 429) return reject(new Error('Nortic: 429 – för många anrop, vänta lite'));
-          if (r.status < 200 || r.status >= 300) return reject(new Error('Nortic: HTTP ' + r.status + ' — ' + (r.responseText || '').slice(0, 200)));
+          if (r.status < 200 || r.status >= 300) {
+            const diagHeaders = (r.responseHeaders || '').split('\r\n')
+              .filter(h => /^(server|cf-ray|cf-cache-status|via|x-served-by|x-cache|report-to|nel):/i.test(h))
+              .join(' | ');
+            return reject(new Error('Nortic: HTTP ' + r.status + ' — ' +
+              (r.responseText ? r.responseText.slice(0, 200) : '(tomt svar)') +
+              (diagHeaders ? '  [' + diagHeaders + ']' : '')));
+          }
           try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('Nortic: ogiltig JSON i svaret')); }
         },
         onerror: () => reject(new Error('Nortic: nätverksfel')),
