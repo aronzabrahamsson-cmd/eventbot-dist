@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.9
-// @description  v7.53.9: Dokumenterar en bekräftad Billetto-begränsning — API-nyckelparet är knutet till ett publisher/annonskonto (utm_content=SE+7345087) och ger INTE hela billetto.se:s publika utbud (bekräftat: eventet "Grand Antiques Art & Design" syns på billetto.se men API:et svarar "not found" för samma nyckel). Ingen kodfix möjlig — kräver bredare API-scope från Billetto. Fix Billetto-dubbletter — venue_name var alltid tom sträng vilket fick groupEvents() att slå ihop OLIKA event som råkar dela titel (Billetto listar varje datum som ett helt eget event-objekt, till skillnad från Ticketmaster). Adressen används nu som venue_name så bara verkliga titel+adress-kollisioner dedupas. Käll-filterchipsen i "Ej inlagda" visar nu antal event per källa (t.ex. "Billetto (43)") och den valda källan får inverterade färger (fylld bakgrund i källans egen färg) istället för bara en tunn kantlinje. Fix Billetto-hämtningen från v7.53.6 (paginering via has_more/next_url/total). Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
+// @version      7.53.10
+// @description  v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Utesluter event utan egen bild (samma filter som billetto.se:s sökning). Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.9 startar på ' + location.pathname);
+  vlog('Script v7.53.10 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -96,18 +96,29 @@
   const STHLM = { lat: 59.3293, lng: 18.0686 };
   const DEFAULT_RADIUS = 25;
   // (SED_BASE definieras nedan, vid buildDedupIndex.)
-  // ANTAGANDE: Sverige-endpointen följer samma mönster som Danmark (billetto.dk).
-  // Ej bekräftad i dokumentationen — rätta i Inställningar om detta visar sig fel.
-  // KÄND BEGRÄNSNING (bekräftad 2026-09-15): detta är Billettos "publisher"/
-  // annons-API, knutet till API-nyckelparets specifika konto (utm_content=SE+7345087
-  // på varje event-länk) — INTE hela billetto.se:s publika utbud. Ett riktigt,
-  // publikt Stockholmsevent ("Grand Antiques Art & Design", event-id 1948618)
-  // gav "Event 1948618 not found" på denna endpoint trots att det syns på
-  // billetto.se. Paginering (has_more/next_url/total) fungerar korrekt och hämtar
-  // ALLT nyckelparet har åtkomst till — det saknade är strukturellt utanför
-  // klientens kontroll. Enda fixarna: bredare API-scope från Billetto, eller en
-  // annan/obekräftad endpoint som driver billetto.se:s egen sökning.
-  const BILLETTO_BASE_DEFAULT = 'https://billetto.se/api/v3/public/events';
+  // BILLETTO: hämtar via samma Algolia-index som driver billetto.se:s EGEN
+  // sökning (nätverksfliken på billetto.se → "events_by_popularity"-anropen),
+  // inte det dokumenterade "public events"-API:et. Det API:et (v3/public/events)
+  // visade sig — bekräftat 2026-09-15 — bara returnera events som opt-at in i
+  // Billettos annonsprogram (varje träff hade utm_content=SE+7345087; ett
+  // riktigt, publikt Stockholmsevent gav "not found" trots att det syns på
+  // billetto.se). Algolia-indexet har ingen sådan begränsning: samma sökväg
+  // som besökare på billetto.se själva använder. Appid/nyckel nedan är
+  // Algolias publika "search-only"-nyckel som billetto.se skickar till varje
+  // besökares webbläsare (synlig för vem som helst via DevTools) — inte en
+  // hemlighet, och inte kopplad till någon specifik användare. Detta är dock
+  // inte ett dokumenterat, sanktionerat tredjepartsgränssnitt, så det kan
+  // sluta fungera utan förvarning vid en frontend-omgörning hos Billetto.
+  const BILLETTO_ALGOLIA_APP_ID = 'YNEUY03Z8Q';
+  const BILLETTO_ALGOLIA_SEARCH_KEY = '8de1d74c7c7de20e35c1f7215e7c699a';
+  const BILLETTO_ALGOLIA_INDEX = 'events_by_popularity';
+  const BILLETTO_ALGOLIA_URL = 'https://' + BILLETTO_ALGOLIA_APP_ID.toLowerCase() + '-dsn.algolia.net/1/indexes/'
+    + BILLETTO_ALGOLIA_INDEX + '/query?x-algolia-agent=' + encodeURIComponent('Algolia for JavaScript (4.22.1); Browser (lite)')
+    + '&x-algolia-api-key=' + BILLETTO_ALGOLIA_SEARCH_KEY + '&x-algolia-application-id=' + BILLETTO_ALGOLIA_APP_ID;
+  // organization_id 46 = Billettos svenska konto (samma index blandar alla
+  // länder Billetto verkar i — bekräftat: en sökning utan detta filter gav
+  // även träffar från billetto.es).
+  const BILLETTO_ORG_ID = 46;
   // Tickster v0.4 (dokumenterad filtersyntax: q=city:X). v1.0 finns men dess
   // ev. geografiska radiefilter kunde inte bekräftas (JS-renderad Swagger-sida).
   const TICKSTER_BASE = 'https://api.tickster.com/sv/api/0.4/events/upcoming';
@@ -122,11 +133,17 @@
     'Music': 'Concerts', 'Arts & Theatre': 'Culture', 'Sports': 'Sport',
     'Family': 'Family', 'Film': 'Film', 'Miscellaneous': 'Other'
   };
-  // Billettos categorisation.category → samma interna kategorier som Ticketmaster.
+  // Billettos (Algolia) category-fält → samma interna kategorier som Ticketmaster.
+  // Nycklarna här är bekräftade via en riktig facet-räkning mot events_by_popularity
+  // (2026-09-16), inte gissade.
   const BILLETTO_CATEGORY_MAP = {
-    'music': 'Concerts', 'concert': 'Concerts', 'arts': 'Culture', 'theatre': 'Culture',
-    'culture': 'Culture', 'sports': 'Sport', 'sport': 'Sport', 'family': 'Family',
-    'film': 'Film', 'business': 'Other', 'food-drink': 'Other', 'nightlife': 'Concerts'
+    'music': 'Concerts', 'performing_arts': 'Culture', 'film_media': 'Film',
+    'sports': 'Sport', 'family': 'Family',
+    'food_drink': 'Other', 'community': 'Other', 'hobbies': 'Other',
+    'health_wellness': 'Other', 'other': 'Other', 'seasonal': 'Other',
+    'business': 'Other', 'travel': 'Other', 'science': 'Other', 'charity': 'Other',
+    'auto_boat': 'Other', 'lifestyle': 'Other', 'religion': 'Other',
+    'fashion': 'Other', 'government': 'Other'
   };
   const CATEGORY_COLOR = {
     'Concerts': '#a98bd6', 'Culture': '#d68b73', 'Sport': '#6fb98f',
@@ -184,22 +201,6 @@
       });
     });
   }
-  function gmGetHeaders(url, headers) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET', url, headers,
-        onload: r => {
-          if (r.status === 401) return reject(new Error('Billetto: 401 – ogiltigt API-nyckelpar'));
-          if (r.status === 403) return reject(new Error('Billetto: 403 – åtkomst nekad, kontrollera nyckelpar/behörighet'));
-          if (r.status === 429) return reject(new Error('Billetto: 429 – för många anrop, vänta lite'));
-          if (r.status < 200 || r.status >= 300) return reject(new Error('Billetto: HTTP ' + r.status + ' — ' + (r.responseText || '').slice(0, 200)));
-          try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('Billetto: ogiltig JSON i svaret')); }
-        },
-        onerror: () => reject(new Error('Billetto: nätverksfel')),
-        ontimeout: () => reject(new Error('Billetto: timeout')), timeout: 25000
-      });
-    });
-  }
   function gmPost(url, headers, body) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -216,6 +217,24 @@
         },
         onerror: () => reject(new Error('Mistral: nätverksfel')),
         ontimeout: () => reject(new Error('Mistral: timeout')), timeout: 120000
+      });
+    });
+  }
+  // Algolias JS-klient postar JSON men sätter Content-Type till
+  // x-www-form-urlencoded (bekräftat via en riktig fångad request från
+  // billetto.se) — ovanligt, men det är vad servern faktiskt förväntar sig.
+  function gmPostAlgolia(url, body) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST', url, data: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        onload: r => {
+          if (r.status === 429) return reject(new Error('Billetto: 429 – för många anrop, vänta lite'));
+          if (r.status < 200 || r.status >= 300) return reject(new Error('Billetto: HTTP ' + r.status + ' — ' + (r.responseText || '').slice(0, 200)));
+          try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('Billetto: ogiltig JSON i svaret')); }
+        },
+        onerror: () => reject(new Error('Billetto: nätverksfel')),
+        ontimeout: () => reject(new Error('Billetto: timeout')), timeout: 25000
       });
     });
   }
@@ -477,36 +496,44 @@
     } catch { return { date: null, time: null }; }
   }
 
+  // Algolia-träffen har ingen ren gatuadress som eget fält (bara den hopslagna
+  // "Venue, Ort"-strängen i `location`) — men den inbäddade schema.org JSON-LD-
+  // strängen har en riktig PostalAddress. Den parsas här för en exakt adress;
+  // om det skulle strula (fältet saknas/ändras) faller vi tillbaka på det som
+  // finns direkt på träffen, så ett trasigt schema-fält kan aldrig kasta.
+  function billettoAddressFromSchema(ev) {
+    try {
+      const s = JSON.parse(ev.schema);
+      const a = (s && s.location && s.location.address) || {};
+      return { street: a.streetAddress || '', zip: a.postalCode || '', city: a.addressLocality || '' };
+    } catch { return { street: '', zip: '', city: '' }; }
+  }
+
   function mapBillettoEvent(ev) {
-    const loc = ev.location || {};
-    const cat = ev.categorisation || {};
-    const { date, time } = isoToStockholm(ev.startdate);
+    const { date, time } = isoToStockholm((ev.start_time || 0) * 1000);
     const isCancelled = ev.state === 'canceled';
-    const image = ev.image_link ? { url: ev.image_link } : null;
-    const addrParts = [loc.address_line, loc.address_line_2].filter(Boolean);
-    const address = addrParts.join(' ');
+    const image = ev.image ? { url: ev.image } : null;
+    const schemaAddr = billettoAddressFromSchema(ev);
+    const address = schemaAddr.street || ev.location || '';
+    const geo = ev._geoloc && ev._geoloc.lat && ev._geoloc.lng ? ev._geoloc : null;
     return {
-      _tm_id: ev.id || null, title: ev.title || '',
+      _tm_id: ev.id || null, title: ev.name || '',
       description: ev.description || '', image,
       date, time, tm_status: isCancelled ? 'cancelled' : '',
       href: ev.url || '',
-      segment: cat.category_localized || cat.category || '',
-      genre: cat.subcategory_localized || cat.subcategory || '',
-      category: BILLETTO_CATEGORY_MAP[(cat.category || '').toLowerCase()] || cat.category_localized || 'Other',
-      // RÄTTAT: Billetto ger ingen separat venue-titel, men groupEvents()
-      // dedupar på title+venue_name — med venue_name alltid '' kolliderade
-      // OLIKA event som råkar dela titel (Billetto listar varje datum som ett
-      // helt eget event-objekt, inte som tillfällen under ETT event, till
-      // skillnad från Ticketmaster). Bekräftat i skarp logg: tre olika event
-      // med titeln "Matmilen Södermalm" mot tre olika kalenderrader slogs
-      // ihop till ett enda kort. Adressen används nu som venue_name istället
-      // — då kolliderar bara event som verkligen delar både titel OCH adress.
-      venue_name: address,
-      address, zip_code: loc.postal_code || '', city: loc.city || '',
-      location: (loc.coordinates && loc.coordinates.latitude && loc.coordinates.longitude)
-        ? { latitude: loc.coordinates.latitude, longitude: loc.coordinates.longitude } : null,
+      segment: ev.category || '', genre: ev.subcategory || '',
+      category: BILLETTO_CATEGORY_MAP[(ev.category || '').toLowerCase()] || 'Other',
+      // Algolia ger (till skillnad från det gamla publisher-API:et) en riktig
+      // venue_name för de flesta event — men inte alla (t.ex. Matmilens egna
+      // pop-up-adresser saknar den), så vi faller tillbaka på den hopslagna
+      // location-strängen istället för en tom sträng, för att undvika samma
+      // titel-kollisionsbugg som tidigare (se v7.53.8).
+      venue_name: ev.venue_name || ev.location || '',
+      address, zip_code: schemaAddr.zip || (ev.postal_code != null ? String(ev.postal_code) : ''),
+      city: schemaAddr.city || ev.city || '',
+      location: geo ? { latitude: geo.lat, longitude: geo.lng } : null,
       external_website_url: ev.url || '',
-      promoter: (ev.organizer && ev.organizer.name) || ''
+      promoter: ev.brand || ''
     };
   }
 
@@ -549,40 +576,45 @@
     return false;
   }
 
-  // RÄTTAT: Billettos API paginerar visst — bekräftat via ett riktigt anrop
-  // (2026-09-15): svaret har has_more/total/next_url. Föregående version
-  // hämtade bara första sidan (100 av då 643 event) och trodde att var allt.
-  // Följer nu next_url tills has_more är false, med ett generöst tak (50
-  // sidor = 5000 event) som ren säkerhetsspärr mot en oändlig loop om API:et
-  // någon gång skulle bete sig oväntat.
-  const BILLETTO_MAX_PAGES = 50;
+  // RÄTTAT (2026-09-16): bytt datakälla helt, från det publisher-begränsade
+  // v3/public/events till samma Algolia-index som driver billetto.se:s egen
+  // sökning (se kommentaren vid BILLETTO_ALGOLIA_URL). Paginerar via page/
+  // nbPages (Algolias facit-svar) istället för has_more/next_url. Taket nedan
+  // är samma sorts säkerhetsspärr som tidigare — ren skyddsmekanism, inte en
+  // förväntad gräns (Stockholmsregionen brukar ligga runt 20-25 sidor).
+  const BILLETTO_MAX_PAGES = 60;
+  const BILLETTO_HITS_PER_PAGE = 1000;
 
-  async function fetchBilletto({ apiKeypair, baseUrl, onProgress, onPage }) {
-    if (!apiKeypair) throw new Error('Billetto API-nyckelpar saknas (fliken Inställningar).');
-    let url = baseUrl + '?' + new URLSearchParams({ limit: '100' }).toString();
+  async function fetchBilletto({ onProgress, onPage }) {
+    const baseBody = {
+      query: '', clickAnalytics: false,
+      aroundLatLng: STHLM.lat + ',' + STHLM.lng, aroundRadius: DEFAULT_RADIUS * 1000,
+      hitsPerPage: BILLETTO_HITS_PER_PAGE,
+      filters: 'organization_id = ' + BILLETTO_ORG_ID,
+      // Utesluter event som inte laddat upp en egen bild (Billettos
+      // platshållarbild) — samma filter som billetto.se:s egen sökning
+      // använder, på uttrycklig begäran.
+      facetFilters: ['uses_generic_billetto_image:false']
+    };
     let all = [];
-    let total = null;
-    let page = 0;
-    while (url && page < BILLETTO_MAX_PAGES) {
-      page++;
-      onProgress('Hämtar Billetto, sida ' + page + (total ? ' (' + all.length + '/' + total + ' event)' : '') + '…');
-      // Innan vi vet totalen (efter första sidan) visas bara "sida N av N" —
-      // väldigt uppskattat totalt sidantal när det väl är känt.
-      if (onPage) onPage(page, total ? Math.max(page, Math.ceil(total / 100)) : page);
-      const data = await gmGetHeaders(url, { 'Api-Keypair': apiKeypair });
-      const batch = (data && data.data) || [];
+    let page = 0, nbPages = 1, total = null;
+    while (page < nbPages && page < BILLETTO_MAX_PAGES) {
+      onProgress('Hämtar Billetto, sida ' + (page + 1) + (total ? ' av ' + nbPages + ' (' + all.length + '/' + total + ' event)' : '') + '…');
+      if (onPage) onPage(page + 1, nbPages);
+      const data = await gmPostAlgolia(BILLETTO_ALGOLIA_URL, Object.assign({}, baseBody, { page }));
+      const batch = (data && data.hits) || [];
       all = all.concat(batch);
-      if (typeof data.total === 'number') total = data.total;
-      url = data && data.has_more ? data.next_url : null;
-      if (url) await new Promise(r => setTimeout(r, 200));
+      if (typeof data.nbPages === 'number') nbPages = data.nbPages;
+      if (typeof data.nbHits === 'number') total = data.nbHits;
+      page++;
+      if (page < nbPages) await new Promise(r => setTimeout(r, 200));
     }
-    if (url && page >= BILLETTO_MAX_PAGES) {
+    if (page >= BILLETTO_MAX_PAGES && page < nbPages) {
       vlog('OBS: Billetto-hämtningen stoppades efter ' + BILLETTO_MAX_PAGES + ' sidor (säkerhetsspärr) — fler event kan saknas.', 'err');
     }
-    const stockholm = all.filter(ev => normText((ev.location && ev.location.city) || '') === 'stockholm');
-    vlog('Billetto: ' + all.length + ' event totalt över ' + page + ' sida(or)' +
-      (total !== null ? ' (API rapporterar ' + total + ' totalt)' : '') + ', ' + stockholm.length + ' i Stockholm.');
-    const occ = stockholm.map(mapBillettoEvent);
+    vlog('Billetto: ' + all.length + ' event hämtade över ' + page + ' sida(or)' +
+      (total !== null ? ' (Algolia rapporterar ' + total + ' totalt inom radien)' : '') + '.');
+    const occ = all.map(mapBillettoEvent);
     return { grouped: groupEvents(occ, 'billetto'), rawCount: occ.length };
   }
 
@@ -2523,16 +2555,8 @@
             <input type="text" id="vseh-mkey" class="vseh-key" placeholder="Mistral Bearer-nyckel" autocomplete="off" spellcheck="false"></div>
           <div class="vseh-row"><label>Mistral agent-ID</label>
             <input type="text" id="vseh-magent" class="vseh-key" placeholder="ag_..." autocomplete="off" spellcheck="false"></div>
-          <div class="vseh-row"><label>Billetto API-nyckelpar</label>
-            <input type="text" id="vseh-blkey" class="vseh-key" placeholder="Klistra in nyckelparet från Billetto" autocomplete="off" spellcheck="false"></div>
-          <div class="vseh-row"><label>Billetto bas-URL (endast om standard är fel)</label>
-            <input type="text" id="vseh-blbase" class="vseh-key" placeholder="https://billetto.se/api/v3/public/events" autocomplete="off" spellcheck="false"></div>
-          <div class="vseh-hint">OBS: detta API-nyckelpar är knutet till ett specifikt Billetto-"publisher"-konto
-            (varje hämtat event har utm_content=SE+7345087 i sin länk) — det ger INTE alla publika event i Stockholm,
-            bara de som är anslutna till den annonsfeeden. Bekräftat 2026-09-15: eventet "Grand Antiques Art &amp; Design"
-            (billetto.se/e/grand-antiques-art-design-biljetter-1948618) syns på billetto.se men API:et svarar
-            "Event 1948618 not found" för denna nyckel. Kontakta Billetto för bredare API-behörighet om fler event behövs
-            — fler sidor/hämtningar hjälper inte, det är inte en pagineringsbugg.</div>
+          <div class="vseh-hint">Billetto kräver ingen egen nyckel längre — hämtas via samma sökindex som
+            billetto.se:s egen sajt använder (se kod-kommentar vid BILLETTO_ALGOLIA_URL för detaljer).</div>
           <div class="vseh-row"><label>Tickster API-nyckel</label>
             <input type="text" id="vseh-tixkey" class="vseh-key" placeholder="Tickster API-nyckel" autocomplete="off" spellcheck="false"></div>
           <div class="vseh-two">
@@ -2551,8 +2575,6 @@
     $('vseh-key').value = GM_getValue('tm_key', '');
     $('vseh-mkey').value = GM_getValue('mistral_key', '');
     $('vseh-magent').value = GM_getValue('mistral_agent', '');
-    $('vseh-blkey').value = GM_getValue('billetto_keypair', '');
-    $('vseh-blbase').value = GM_getValue('billetto_base', '');
     $('vseh-tixkey').value = GM_getValue('tickster_key', '');
     const mb = document.querySelector('#vseh-headbtns button[data-m="' + mode + '"]');
     if (mb) mb.classList.add('on');
@@ -3013,8 +3035,6 @@
     $('vseh-key').addEventListener('change', () => GM_setValue('tm_key', $('vseh-key').value.trim()));
     $('vseh-mkey').addEventListener('change', () => GM_setValue('mistral_key', $('vseh-mkey').value.trim()));
     $('vseh-magent').addEventListener('change', () => GM_setValue('mistral_agent', $('vseh-magent').value.trim()));
-    $('vseh-blkey').addEventListener('change', () => GM_setValue('billetto_keypair', $('vseh-blkey').value.trim()));
-    $('vseh-blbase').addEventListener('change', () => GM_setValue('billetto_base', $('vseh-blbase').value.trim()));
     $('vseh-tixkey').addEventListener('change', () => GM_setValue('tickster_key', $('vseh-tixkey').value.trim()));
     $('vseh-fetch-tix').addEventListener('click', runTickster);
     $('vseh-fetch-bl').addEventListener('click', runBilletto);
@@ -3182,16 +3202,10 @@
   }
 
   async function runBilletto() {
-    const apiKeypair = $('vseh-blkey').value.trim();
-    if (!apiKeypair) { setStatus('Fyll i Billetto API-nyckelpar (fliken Inställningar) först.', 'err'); switchTab('set'); return; }
-    GM_setValue('billetto_keypair', apiKeypair);
-    const baseUrl = $('vseh-blbase').value.trim() || BILLETTO_BASE_DEFAULT;
-    vlog('Billetto-endpoint: ' + baseUrl + (baseUrl === BILLETTO_BASE_DEFAULT ? ' (antagen standard – rätta i Inställningar om detta är fel)' : ' (egen, inställd av dig)'));
     $('vseh-fetch-bl').disabled = true;
     showProgress('bl', 1, 1);
     try {
       const { grouped, rawCount } = await fetchBilletto({
-        apiKeypair, baseUrl,
         onProgress: m => setStatus(m, 'work'),
         onPage: (cur, total) => showProgress('bl', cur, total)
       });
