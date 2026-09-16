@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.53.10
-// @description  v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Utesluter event utan egen bild (samma filter som billetto.se:s sökning). Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
+// @version      7.54.0
+// @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
@@ -87,7 +87,7 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.53.10 startar på ' + location.pathname);
+  vlog('Script v7.54.0 startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -122,6 +122,15 @@
   // Tickster v0.4 (dokumenterad filtersyntax: q=city:X). v1.0 finns men dess
   // ev. geografiska radiefilter kunde inte bekräftas (JS-renderad Swagger-sida).
   const TICKSTER_BASE = 'https://api.tickster.com/sv/api/0.4/events/upcoming';
+  // Nortic: ingen dokumenterad publik API — hittad genom att läsa av det egna
+  // SSR-svaret (Nuxt-payload) från nortic.se/stad/stockholm, som avslöjade den
+  // exakta anrops-URL:en sidan själv använder (self/next-länkar i svaret).
+  // Bekräftat 2026-09-16 med city=Stockholm: totalItems=320 över 16 sidor.
+  // Ingen nyckel behövs. OBS: ren serverfetch (t.ex. PowerShell) blockeras med
+  // 404 av någon form av bot-/TLS-fingeravtrycksskydd — GM_xmlhttpRequest kör
+  // via webbläsarens riktiga nätverksstack så det bör fungera ändå, men detta
+  // är ett obekräftat gränssnitt som kan sluta fungera utan förvarning.
+  const NORTIC_BASE = 'https://services.nortic.se/public/v1/events';
   // Kommun-svep för att täcka Stockholmsregionen utan ett bekräftat radiefilter.
   const TICKSTER_MUNICIPALITIES = ['stockholm', 'solna', 'sundbyberg', 'nacka',
     'danderyd', 'lidingö', 'huddinge', 'järfälla', 'sollentuna', 'täby', 'botkyrka'];
@@ -149,9 +158,23 @@
     'Concerts': '#a98bd6', 'Culture': '#d68b73', 'Sport': '#6fb98f',
     'Family': '#d6b56f', 'Film': '#7f9bd6', 'Other': '#9aa0ad'
   };
+  // Nortics category-fält är svenska klartextnamn (inte slugs) — bekräftade
+  // direkt ur ett riktigt svar från events-listan (2026-09-16).
+  const NORTIC_CATEGORY_MAP = {
+    'konsert': 'Concerts', 'nattklubb': 'Concerts',
+    'barnteater': 'Family',
+    'bio': 'Film', 'film': 'Film',
+    'sport': 'Sport', 'motor': 'Sport',
+    'föreställning': 'Culture', 'humor': 'Culture', 'musikal': 'Culture',
+    'opera': 'Culture', 'revy': 'Culture', 'show': 'Culture', 'spex': 'Culture',
+    'kultursoppa': 'Culture', 'cirkus': 'Culture',
+    'entré': 'Other', 'båttur': 'Other', 'festival': 'Other', 'föredrag': 'Other',
+    'guidad visning': 'Other', 'mässa': 'Other', 'resebiljetter': 'Other',
+    'skärgårdstur': 'Other', 'vip': 'Other', 'övrigt': 'Other'
+  };
   // Källtagg per event — egen färg per arrangör/API-källa.
-  const SOURCE_LABEL = { ticketmaster: 'Ticketmaster', billetto: 'Billetto', tickster: 'Tickster' };
-  const SOURCE_COLOR = { ticketmaster: '#4a9fe0', billetto: '#e05a9a', tickster: '#5ad1a8' };
+  const SOURCE_LABEL = { ticketmaster: 'Ticketmaster', billetto: 'Billetto', tickster: 'Tickster', nortic: 'Nortic' };
+  const SOURCE_COLOR = { ticketmaster: '#4a9fe0', billetto: '#e05a9a', tickster: '#5ad1a8', nortic: '#f0a848' };
   const STATUS = {
     in:      { label: 'Inlagt',    bg: '#1f7a4d', fg: '#fff', bar: '#2f9a63' },
     partial: { label: 'Delvis',    bg: '#c9881f', fg: '#fff', bar: '#e0a52e' },
@@ -235,6 +258,24 @@
         },
         onerror: () => reject(new Error('Billetto: nätverksfel')),
         ontimeout: () => reject(new Error('Billetto: timeout')), timeout: 25000
+      });
+    });
+  }
+  // Origin/Referer sätts för att likna ett anrop från nortic.se självt — troligen
+  // inte det som stoppade PowerShell-testerna (se kommentar vid NORTIC_BASE),
+  // men billigt att lägga till som extra säkerhetsmarginal.
+  function gmGetNortic(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET', url,
+        headers: { 'Accept': 'application/json', 'Origin': 'https://nortic.se', 'Referer': 'https://nortic.se/' },
+        onload: r => {
+          if (r.status === 429) return reject(new Error('Nortic: 429 – för många anrop, vänta lite'));
+          if (r.status < 200 || r.status >= 300) return reject(new Error('Nortic: HTTP ' + r.status + ' — ' + (r.responseText || '').slice(0, 200)));
+          try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('Nortic: ogiltig JSON i svaret')); }
+        },
+        onerror: () => reject(new Error('Nortic: nätverksfel')),
+        ontimeout: () => reject(new Error('Nortic: timeout')), timeout: 25000
       });
     });
   }
@@ -616,6 +657,56 @@
       (total !== null ? ' (Algolia rapporterar ' + total + ' totalt inom radien)' : '') + '.');
     const occ = all.map(mapBillettoEvent);
     return { grouped: groupEvents(occ, 'billetto'), rawCount: occ.length };
+  }
+
+  // ---- Nortic: List Public Events (odokumenterat, se kommentar vid NORTIC_BASE) --
+  function mapNorticEvent(ev) {
+    const { date, time } = isoToStockholm(ev.startsAt);
+    const loc = ev.location || {};
+    const venue = loc.venue || {};
+    const isSoldOut = ev.availability && ev.availability.status === 'SOLD_OUT';
+    return {
+      _tm_id: ev.id || null, title: ev.name || '',
+      description: ev.description || ev.shortDescription || '', image: ev.imageUrl ? { url: ev.imageUrl } : null,
+      date, time, tm_status: isSoldOut ? 'cancelled' : '',
+      href: ev.eventUrl || '',
+      segment: ev.category || '', genre: '',
+      category: NORTIC_CATEGORY_MAP[(ev.category || '').toLowerCase()] || 'Other',
+      venue_name: venue.name || '', address: '', zip_code: '', city: loc.city || '',
+      location: null,
+      external_website_url: ev.eventUrl || '',
+      promoter: (ev.organizer && ev.organizer.name) || ''
+    };
+  }
+
+  const NORTIC_MAX_PAGES = 40;   // säkerhetsspärr — Stockholm låg på 16 sidor á 20 vid bekräftelsen
+  const NORTIC_PAGE_SIZE = 100;
+
+  async function fetchNortic({ onProgress, onPage }) {
+    let all = [];
+    let page = 1, totalPages = 1, total = null;
+    while (page <= totalPages && page <= NORTIC_MAX_PAGES) {
+      onProgress('Hämtar Nortic, sida ' + page + (total ? ' av ' + totalPages + ' (' + all.length + '/' + total + ' event)' : '') + '…');
+      if (onPage) onPage(page, totalPages);
+      const url = NORTIC_BASE + '?' + new URLSearchParams({
+        city: 'Stockholm', maxPerOrganizer: '0', page: String(page), size: String(NORTIC_PAGE_SIZE)
+      }).toString();
+      const data = await gmGetNortic(url);
+      const batch = (data && data.items) || [];
+      all = all.concat(batch);
+      const pag = data && data.pagination;
+      if (pag && typeof pag.totalPages === 'number') totalPages = pag.totalPages;
+      if (pag && typeof pag.totalItems === 'number') total = pag.totalItems;
+      page++;
+      if (page <= totalPages) await new Promise(r => setTimeout(r, 200));
+    }
+    if (page > NORTIC_MAX_PAGES && page <= totalPages) {
+      vlog('OBS: Nortic-hämtningen stoppades efter ' + NORTIC_MAX_PAGES + ' sidor (säkerhetsspärr) — fler event kan saknas.', 'err');
+    }
+    vlog('Nortic: ' + all.length + ' event hämtade' +
+      (total !== null ? ' (API rapporterar ' + total + ' totalt i Stockholm)' : '') + '.');
+    const occ = all.map(mapNorticEvent);
+    return { grouped: groupEvents(occ, 'nortic'), rawCount: occ.length };
   }
 
   // ---- Dedup ---------------------------------------------------------------
@@ -2503,6 +2594,11 @@
             <span class="vseh-fetch-ts" id="vseh-tix-ts">ej hämtad</span>
           </div>
           <div class="vseh-prog" id="vseh-tix-prog" style="display:none;"><div class="vseh-prog-bar" id="vseh-tix-bar"></div><span class="vseh-prog-txt" id="vseh-tix-ptxt"></span></div>
+          <div class="vseh-fetch-line">
+            <button type="button" id="vseh-fetch-nortic">Nortic</button>
+            <span class="vseh-fetch-ts" id="vseh-nortic-ts">ej hämtad</span>
+          </div>
+          <div class="vseh-prog" id="vseh-nortic-prog" style="display:none;"><div class="vseh-prog-bar" id="vseh-nortic-bar"></div><span class="vseh-prog-txt" id="vseh-nortic-ptxt"></span></div>
           <div id="vseh-stats" style="display:none;">
             <div class="s" data-f="out"><div class="n" style="color:#ff8080" id="vseh-n-out">0</div><div class="l">Ej inlagda</div></div>
             <div class="s" data-f="partial"><div class="n" style="color:#e0b060" id="vseh-n-part">0</div><div class="l">Delvis/Osäkra</div></div>
@@ -3038,6 +3134,7 @@
     $('vseh-tixkey').addEventListener('change', () => GM_setValue('tickster_key', $('vseh-tixkey').value.trim()));
     $('vseh-fetch-tix').addEventListener('click', runTickster);
     $('vseh-fetch-bl').addEventListener('click', runBilletto);
+    $('vseh-fetch-nortic').addEventListener('click', runNortic);
     $('vseh-url-create').addEventListener('click', () => createEventFromUrl($('vseh-url-input').value.trim()));
     { const ucj = document.getElementById('vseh-url-copyjson'); if (ucj) ucj.addEventListener('click', async () => {
         if (!lastUrlAgentData) { ucj.textContent = 'Inget svar ännu'; setTimeout(() => ucj.textContent = '📋 Kopiera senaste agent-svar (JSON)', 1500); return; }
@@ -3221,6 +3318,28 @@
       else setStatus(`Klart. ${grouped.length} Billetto-event (${rawCount} tillfällen).${note}`, 'ok');
     } catch (e) { hideProgress('bl'); setStatus(e.message, 'err'); }
     finally { $('vseh-fetch-bl').disabled = false; }
+  }
+
+  async function runNortic() {
+    $('vseh-fetch-nortic').disabled = true;
+    showProgress('nortic', 1, 1);
+    try {
+      const { grouped, rawCount } = await fetchNortic({
+        onProgress: m => setStatus(m, 'work'),
+        onPage: (cur, total) => showProgress('nortic', cur, total)
+      });
+      hideProgress('nortic');
+      GM_setValue('nortic_fetched_ts', Date.now());
+      { const ts = $('vseh-nortic-ts'); if (ts) ts.textContent = fmtStamp(Date.now()); }
+      // Ersätt BARA Nortic-posterna i den samlade listan — rör inte övriga källor.
+      lastGrouped = lastGrouped.filter(g => g._source !== 'nortic').concat(grouped);
+      expanded.clear();
+      render(lastGrouped); saveCache();
+      const note = dedupIndex ? '' : ' (ladda er kalender för status)';
+      if (!grouped.length) setStatus('Inga Nortic-event i Stockholm just nu.', 'ok');
+      else setStatus(`Klart. ${grouped.length} Nortic-event (${rawCount} tillfällen).${note}`, 'ok');
+    } catch (e) { hideProgress('nortic'); setStatus(e.message, 'err'); }
+    finally { $('vseh-fetch-nortic').disabled = false; }
   }
 
   function fmtDates(dates) {
@@ -3951,7 +4070,8 @@
     { const t1 = GM_getValue('tm_fetched_ts', 0); const e1 = $('vseh-tm-ts'); if (e1 && t1) e1.textContent = fmtStamp(t1);
       const t2 = GM_getValue('vs_fetched_ts', 0); const e2 = $('vseh-vs-ts'); if (e2 && t2) e2.textContent = fmtStamp(t2);
       const t3 = GM_getValue('billetto_fetched_ts', 0); const e3 = $('vseh-bl-ts'); if (e3 && t3) e3.textContent = fmtStamp(t3);
-      const t4 = GM_getValue('tickster_fetched_ts', 0); const e4 = $('vseh-tix-ts'); if (e4 && t4) e4.textContent = fmtStamp(t4); }
+      const t4 = GM_getValue('tickster_fetched_ts', 0); const e4 = $('vseh-tix-ts'); if (e4 && t4) e4.textContent = fmtStamp(t4);
+      const t5 = GM_getValue('nortic_fetched_ts', 0); const e5 = $('vseh-nortic-ts'); if (e5 && t5) e5.textContent = fmtStamp(t5); }
     const { calTs, tmTs } = loadCache();
     if (dedupIndex && calTs) {
       // dedup-tidsstämpeln visas nu vid VisitStockholm-raden
