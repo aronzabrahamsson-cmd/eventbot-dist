@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.54.1
+// @version      7.54.2
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -290,12 +290,12 @@
         onload: r => {
           if (r.status === 429) return reject(new Error('Nortic: 429 – för många anrop, vänta lite'));
           if (r.status < 200 || r.status >= 300) {
-            const diagHeaders = (r.responseHeaders || '').split('\r\n')
-              .filter(h => /^(server|cf-ray|cf-cache-status|via|x-served-by|x-cache|report-to|nel):/i.test(h))
-              .join(' | ');
+            const rawHeaders = (r.responseHeaders || '').trim().replace(/\r?\n/g, ' | ');
+            const redirected = r.finalUrl && r.finalUrl !== url ? '  slutlig URL: ' + r.finalUrl : '';
             return reject(new Error('Nortic: HTTP ' + r.status + ' — ' +
               (r.responseText ? r.responseText.slice(0, 200) : '(tomt svar)') +
-              (diagHeaders ? '  [' + diagHeaders + ']' : '')));
+              redirected +
+              '  headers: [' + (rawHeaders ? rawHeaders.slice(0, 500) : '(inga headers alls)') + ']'));
           }
           try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('Nortic: ogiltig JSON i svaret')); }
         },
