@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.56.0
+// @version      7.56.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4004,34 +4004,47 @@
   // Ny sidtyp: edit-sidan (KNOWN_EDIT_URL). Läser ifyllda formulärfält, skickar
   // dem till samma Mistral-agent (mistral_key/mistral_agent) för omskrivning,
   // och visar resultatet — separat från huvudflödet, rör inte create-panelen.
-  // PAUSAD 2026-09-17 på begäran (rutan visade sig konstigt) — koden ligger
-  // kvar orörd men anropas inte längre från dispatchern längst ner, se
-  // initEventEditAutomation() istället för vad som faktiskt körs på edit-sidan.
+  // Återinförd 2026-09-17 som en sticky bar högst upp (samma mönster som
+  // draft-vyns #vseh-draft-bar) istället för den gamla inrutade boxen mitt i
+  // formuläret, som "visade sig konstigt".
+  const EDIT_BAR_CSS = `
+    #vseh-edit-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
+      flex-wrap:wrap; gap:10px; background:#2f3542; color:#e8eaee; padding:10px 14px;
+      margin:0 0 14px; border-radius:6px; box-shadow:0 2px 10px rgba(0,0,0,.3);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    #vseh-edit-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer;
+      font-size:13px; font-weight:600; background:#4a9fe0; color:#fff; }
+    #vseh-edit-bar button:disabled { opacity:.6; cursor:not-allowed; }
+    #vseh-rewrite-status { font-size:12px; color:#c3c8d1; }
+    #vseh-rewrite-result { max-height:200px; overflow-y:auto; background:#1b1f27; color:#e8eaee;
+      border-radius:6px; padding:10px; margin:0 0 14px; font-size:12px; }
+  `;
+  function ensureEditBarStyle() {
+    if (document.getElementById('vseh-edit-css')) return;
+    const s = document.createElement('style');
+    s.id = 'vseh-edit-css';
+    s.textContent = EDIT_BAR_CSS;
+    document.head.appendChild(s);
+  }
   function initEventChecker() {
     vlog('EventChecker: Initierar på edit-sida');
-    let rewriteBtn = document.getElementById('vseh-rewrite-btn');
-    if (!rewriteBtn) {
-      const form = document.querySelector('form');
-      if (form) {
-        const container = document.createElement('div');
-        container.id = 'vseh-edit-container';
-        container.style.margin = '20px 0';
-        container.style.padding = '15px';
-        container.style.border = '1px solid #ccc';
-        container.style.borderRadius = '5px';
-        container.style.background = '#f9f9f9';
-        container.innerHTML = `
-          <h3 style="margin-top:0;">EventBot - Omskrivning</h3>
+    ensureEditBarStyle();
+    if (!document.getElementById('vseh-edit-bar')) {
+      const anchor = document.querySelector('.page-header, .header, header, h1') || document.querySelector('form');
+      if (anchor) {
+        const bar = document.createElement('div');
+        bar.id = 'vseh-edit-bar';
+        bar.innerHTML = `
           <button id="vseh-rewrite-btn" type="button">Omskriv med Mistral</button>
-          <div id="vseh-rewrite-status" style="margin-top:10px;"></div>
-          <div id="vseh-rewrite-result" style="margin-top:10px;max-height:200px;overflow-y:auto;border:1px solid #ddd;padding:10px;display:none;"></div>
+          <span id="vseh-rewrite-status"></span>
         `;
-        form.insertBefore(container, form.firstChild);
-        rewriteBtn = container.querySelector('#vseh-rewrite-btn');
+        anchor.parentNode.insertBefore(bar, anchor.nextSibling);
+        const result = document.createElement('div');
+        result.id = 'vseh-rewrite-result';
+        result.style.display = 'none';
+        bar.insertAdjacentElement('afterend', result);
+        document.getElementById('vseh-rewrite-btn').addEventListener('click', rewriteWithAgent);
       }
-    }
-    if (rewriteBtn) {
-      rewriteBtn.addEventListener('click', rewriteWithAgent);
     }
   }
 
@@ -4122,13 +4135,12 @@
   }
 
   // ---- Edit-sidans automatiska kontroller (v7.56.0) -------------------------
-  // Körs automatiskt på edit-sidan (KNOWN_EDIT_URL), separat från den pausade
-  // EventChecker-rutan ovan. Allt här är antingen läsande (prisflagg) eller
-  // återställer exakt samma värde det läste (adress-aktivering) — utom
-  // rubrik-emojiborttagningen (skriver direkt i title_en/sv, enkla textfält,
-  // lätt att se/ångra) och relaterade guider (bara ett tillägg, inte en
-  // destruktiv ändring). Beskrivningens emoji-borttagning är EN KNAPP man
-  // klickar själv, inte automatisk — se kommentar vid checkDescriptionEmoji.
+  // Körs automatiskt på edit-sidan (KNOWN_EDIT_URL), utöver EventChecker-
+  // rewrite-baren ovan (initEventEditAutomation anropar båda). Emoji tas bort
+  // automatiskt ur både titlar och beskrivning (bekräftat OK — texten är i
+  // regel oformaterad). Pris-flaggen är bara läsande. Guide-taggning lägger
+  // bara till, ändrar inget befintligt. Adress-aktiveringen återställer
+  // exakt samma värde den läste.
   const PRICE_WORD_RE = /\b(sek|kr|eur)\b|€/gi;
   const EMOJI_RE = /\p{Extended_Pictographic}/gu;
 
@@ -4185,67 +4197,58 @@
     });
   }
 
-  // Beskrivningen är Draftail (rich text) — enda beprövade sättet i det här
-  // scriptet att skriva till den (updateDraftail, se DRAFTAIL-avsnittet) gör
-  // det via en total nyskriven ContentState, vilket plattar ut eventuell
-  // befintlig formatering (fetstil, länkar) till vanliga textstycken. Det är
-  // en rimlig risk för ETT event man själv skapat via URL-flödet, men inte
-  // något vi vill göra blint på ett befintligt, kanske redan publicerat,
-  // utkast. Därför bara EN FLAGGA + knapp här, ingen automatisk körning.
-  function checkDescriptionEmoji() {
-    ['id_description_en', 'id_description_sv'].forEach(fieldId => {
-      const hidden = document.getElementById(fieldId);
+  // Beskrivningen är Draftail (rich text) — enda sättet i det här scriptet
+  // att skriva till den (updateDraftail) gör det via en total nyskriven
+  // ContentState, vilket plattar ut eventuell befintlig formatering (fetstil,
+  // länkar) till vanliga textstycken. Bekräftat OK (2026-09-17): texten är i
+  // regel oformaterad ändå, så vi kör detta automatiskt precis som titlarna.
+  function stripDescriptionEmoji() {
+    ['id_description_en', 'id_description_sv'].forEach(async fieldId => {
       const text = readDraftailText(fieldId);
-      const hits = text.match(EMOJI_RE);
-      if (!hits || !hits.length) { setFieldNote(hidden, 'emoji', ''); return; }
-      setFieldNote(hidden, 'emoji',
-        '<span style="color:#c9881f;font-weight:600;">🙂 ' + hits.length + ' emoji hittade — </span>' +
-        '<button type="button" class="vseh-strip-emoji-btn" data-field="' + fieldId + '" ' +
-        'style="font-size:12px;padding:2px 8px;cursor:pointer;">Ta bort (plattar ut ev. formatering till vanlig text)</button>');
-      const btn = document.querySelector('.vseh-strip-emoji-btn[data-field="' + fieldId + '"]');
-      if (btn) btn.onclick = async () => {
-        btn.disabled = true; btn.textContent = 'Tar bort…';
-        await updateDraftail(fieldId, text.replace(EMOJI_RE, '').replace(/ {2,}/g, ' '));
-        setFieldNote(document.getElementById(fieldId), 'emoji', '');
-      };
+      if (!text || !EMOJI_RE.test(text)) return;
+      await updateDraftail(fieldId, text.replace(EMOJI_RE, '').replace(/ {2,}/g, ' '));
     });
   }
 
+  // Kategorierna nedan är den bekräftade fullständiga listan (2026-09-17) —
+  // exakt jämförelse mot main_category/categories-titeln (engelska, som är
+  // vad JSON-fälten faktiskt lagrar) istället för en löst gissad regex.
+  const CATEGORY_MUSIC = 'Music';
+  const CATEGORY_EXHIBITIONS = 'Exhibitions';
+
+  function currentCategoryTitles() {
+    try {
+      const main = JSON.parse(document.querySelector('input[name="main_category"]')?.value || 'null');
+      const cats = JSON.parse(document.querySelector('input[name="categories"]')?.value || 'null');
+      return [main?.title, ...(Array.isArray(cats) ? cats.map(c => c.title) : [])].filter(Boolean);
+    } catch { return []; }
+  }
+
   // Musikevent på Avicii Arena/Friends Arena → taggar related_guides mot
-  // "Biggest events"/"Största evenemangen". Bygger bara på venue-namnet
-  // (nästan allt på de här två arenorna är konserter) för att slippa gissa
-  // exakt kategori-taxonomivärde vi inte kan se från utsidan.
+  // "Biggest events"/"Största evenemangen".
   let arenaGuideTagged = false;
   async function autoTagArenaGuide() {
     if (arenaGuideTagged) return;
     const venue = ((document.getElementById('id_venue_name_en')?.value || '') + ' ' +
       (document.getElementById('id_venue_name_sv')?.value || '')).toLowerCase();
     if (!/avicii arena|friends arena/.test(venue)) return;
+    if (!currentCategoryTitles().includes(CATEGORY_MUSIC)) return;
     arenaGuideTagged = true;
     await selectAutocompleteValue('id_related_guides', 'Biggest events');
     await selectAutocompleteValue('id_related_guides', 'Största evenemangen');
-    vlog('EventEdit: Taggade "Biggest events"/"Största evenemangen" (arena-venue hittad).', 'ok');
+    vlog('EventEdit: Taggade "Biggest events"/"Största evenemangen" (Music-event på arena).', 'ok');
   }
 
   // Utställningsevent → taggar related_guides mot "Utställningar just nu"/
-  // "Ongoing exhibitions". Kategorins EXAKTA taxonomivärde i er Wagtail-
-  // installation är en gissning ("exhibition"/"utställning" i main_category
-  // eller categories-titeln) — går tyst (ingen tagg) om det inte träffar,
-  // så fel gissning är ofarlig men bör verifieras/justeras.
+  // "Ongoing exhibitions".
   let exhibitionGuideTagged = false;
   async function autoTagExhibitionGuide() {
     if (exhibitionGuideTagged) return;
-    let catTitles = '';
-    try {
-      const main = JSON.parse(document.querySelector('input[name="main_category"]')?.value || 'null');
-      const cats = JSON.parse(document.querySelector('input[name="categories"]')?.value || 'null');
-      catTitles = [main?.title, ...(Array.isArray(cats) ? cats.map(c => c.title) : [])].filter(Boolean).join(' ');
-    } catch {}
-    if (!/exhibition|utställning/i.test(catTitles)) return;
+    if (!currentCategoryTitles().includes(CATEGORY_EXHIBITIONS)) return;
     exhibitionGuideTagged = true;
     await selectAutocompleteValue('id_related_guides', 'Utställningar just nu');
     await selectAutocompleteValue('id_related_guides', 'Ongoing exhibitions');
-    vlog('EventEdit: Taggade "Utställningar just nu"/"Ongoing exhibitions" (kategori: ' + catTitles + ').', 'ok');
+    vlog('EventEdit: Taggade "Utställningar just nu"/"Ongoing exhibitions" (Exhibitions-kategori).', 'ok');
   }
 
   // Geotaggning aktiveras tydligen av något som lyssnar på interaktion med
@@ -4267,16 +4270,17 @@
   }
 
   function runEditPageChecks() {
+    stripEmojisFromTitles();
+    stripDescriptionEmoji();
     checkPriceMentions();
-    checkDescriptionEmoji();
     autoTagArenaGuide().catch(() => {});
     autoTagExhibitionGuide().catch(() => {});
   }
 
   function initEventEditAutomation() {
     vlog('EventEdit: Initierar automatiska kontroller på edit-sidan');
-    stripEmojisFromTitles();
     activateAddressGeotag();
+    initEventChecker();
     runEditPageChecks();
     // Formuläret uppdaterar sina dolda fält utan DOM-mutationer vi enkelt kan
     // observera (Draftails onChange, autocompletens val-klick) — en enkel
