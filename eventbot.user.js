@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.55.1
+// @version      7.55.2
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -125,21 +125,21 @@
   // Tickster v0.4 (dokumenterad filtersyntax: q=city:X). v1.0 finns men dess
   // ev. geografiska radiefilter kunde inte bekräftas (JS-renderad Swagger-sida).
   const TICKSTER_BASE = 'https://api.tickster.com/sv/api/0.4/events/upcoming';
-  // Nortic: ingen dokumenterad publik API — hittad genom att läsa av det egna
-  // SSR-svaret (Nuxt-payload) från nortic.se/stad/stockholm, som avslöjade den
-  // exakta anrops-URL:en sidan själv använder (self/next-länkar i svaret).
-  // Bekräftat 2026-09-16 med city=Stockholm: totalItems=320 över 16 sidor.
-  // Ingen nyckel behövs. OBS: både PowerShell OCH GM_xmlhttpRequest (riktig
-  // webbläsar-nätverksstack) får HTTP 404 med tomt svar mot denna URL, så det
-  // rör sig INTE bara om TLS-/bot-fingeravtryck — trolig orsak är att detta
-  // är en intern/SSR-endpoint som inte är avsedd att anropas direkt från
-  // klienten, eller att den faktiska publika URL:en skiljer sig från den som
-  // syntes i Nuxt-payloaden (fel path/parametrar). Nästa steg för att
-  // bekräfta: öppna nortic.se/stad/stockholm i webbläsarens DevTools →
-  // Network-flik och jämföra den FAKTISKA XHR/fetch-anropet (URL, metod,
-  // headers) mot NORTIC_BASE nedan, snarare än att lita på SSR-payloaden.
-  // Detta gränssnitt är obekräftat och kan sluta fungera utan förvarning.
-  const NORTIC_BASE = 'https://services.nortic.se/public/v1/events';
+  // Nortic: inget publikt API gick att nå. Två försök gav båda HTTP 404 med
+  // tomt svar mot services.nortic.se/public/v1/events (inferred från en SSR-
+  // payload) — både utan och med den X-Api-Key sidans egen "ajar"-klient
+  // skickar, så antingen är path:en fel (troligen /api/ajar, ett schema-styrt
+  // internt gränssnitt vars faktiska rutter inte gick att gissa) eller så är
+  // hela endpointen inte menad att nås utifrån. Lösning: skrapar istället
+  // HTML:en från nortic.se/stad/stockholm direkt (bekräftat 2026-09-17: ingen
+  // blockering, riktig URL-paginering via ?page=N, och varje sidas
+  // .BaseEventCard-kort har titel/datum/plats/länk inbäddat i klartext).
+  // Kategori visas inte per kort i listvyn så alla Nortic-event taggas 'Other'.
+  const NORTIC_LIST_URL = 'https://nortic.se/stad/stockholm';
+  const NORTIC_MONTH_ABBR = {
+    jan: 1, feb: 2, mar: 3, mars: 3, apr: 4, april: 4, maj: 5, jun: 6, juni: 6,
+    jul: 7, juli: 7, aug: 8, sep: 9, okt: 10, nov: 11, dec: 12
+  };
   // Kommun-svep för att täcka Stockholmsregionen utan ett bekräftat radiefilter.
   const TICKSTER_MUNICIPALITIES = ['stockholm', 'solna', 'sundbyberg', 'nacka',
     'danderyd', 'lidingö', 'huddinge', 'järfälla', 'sollentuna', 'täby', 'botkyrka'];
@@ -166,20 +166,6 @@
   const CATEGORY_COLOR = {
     'Concerts': '#a98bd6', 'Culture': '#d68b73', 'Sport': '#6fb98f',
     'Family': '#d6b56f', 'Film': '#7f9bd6', 'Other': '#9aa0ad'
-  };
-  // Nortics category-fält är svenska klartextnamn (inte slugs) — bekräftade
-  // direkt ur ett riktigt svar från events-listan (2026-09-16).
-  const NORTIC_CATEGORY_MAP = {
-    'konsert': 'Concerts', 'nattklubb': 'Concerts',
-    'barnteater': 'Family',
-    'bio': 'Film', 'film': 'Film',
-    'sport': 'Sport', 'motor': 'Sport',
-    'föreställning': 'Culture', 'humor': 'Culture', 'musikal': 'Culture',
-    'opera': 'Culture', 'revy': 'Culture', 'show': 'Culture', 'spex': 'Culture',
-    'kultursoppa': 'Culture', 'cirkus': 'Culture',
-    'entré': 'Other', 'båttur': 'Other', 'festival': 'Other', 'föredrag': 'Other',
-    'guidad visning': 'Other', 'mässa': 'Other', 'resebiljetter': 'Other',
-    'skärgårdstur': 'Other', 'vip': 'Other', 'övrigt': 'Other'
   };
   // Källtagg per event — egen färg per arrangör/API-källa.
   const SOURCE_LABEL = { ticketmaster: 'Ticketmaster', billetto: 'Billetto', tickster: 'Tickster', nortic: 'Nortic' };
@@ -290,43 +276,17 @@
       });
     });
   }
-  // Origin/Referer sätts för att likna ett anrop från nortic.se självt.
-  // 2026-09-16: bekräftat att både PowerShell och GM_xmlhttpRequest (riktig
-  // webbläsar-nätverksstack) fick HTTP 404 med tomt svar mot NORTIC_BASE.
-  // 2026-09-17: hittade trolig orsak i sidkällan för nortic.se/stad/stockholm
-  // — dess inbäddade Nuxt-config avslöjar en "ajar"-klient konfigurerad mot
-  // https://services.nortic.se/api/ajar med en X-Api-Key-header
-  // ("bobby3pharaohs7cornwall", en publik sidnyckel skickad till alla
-  // besökare, inte en hemlighet). Vi hade alltså varken rätt path (gissad
-  // från en gammal SSR-payload, /public/v1/events, snarare än /api/ajar)
-  // eller den nyckeln. Testar nyckeln mot befintlig NORTIC_BASE här — om
-  // det fortfarande 404:ar är nästa steg att byta bas till /api/ajar eller
-  // falla tillbaka på att skrapa de paginerade HTML-sidorna direkt
-  // (bekräftat fungerande: nortic.se/stad/stockholm?page=N).
-  function gmGetNortic(url) {
+  // Hämtar en HTML-sida av nortic.se/stad/stockholm som text (ingen API-nyckel
+  // eller specialheaders behövs — det är samma sida en vanlig besökare öppnar).
+  function gmGetNorticHtml(url) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET', url,
-        headers: {
-          'Accept': 'application/json',
-          'Origin': 'https://nortic.se',
-          'Referer': 'https://nortic.se/',
-          'X-Api-Key': 'bobby3pharaohs7cornwall',
-          'Sec-Fetch-Site': 'same-origin',
-          'Sec-Fetch-Mode': 'cors',
-          'Sec-Fetch-Dest': 'empty'
-        },
+        headers: { 'Accept': 'text/html' },
         onload: r => {
           if (r.status === 429) return reject(new Error('Nortic: 429 – för många anrop, vänta lite'));
-          if (r.status < 200 || r.status >= 300) {
-            const rawHeaders = (r.responseHeaders || '').trim().replace(/\r?\n/g, ' | ');
-            const redirected = r.finalUrl && r.finalUrl !== url ? '  slutlig URL: ' + r.finalUrl : '';
-            return reject(new Error('Nortic: HTTP ' + r.status + ' — ' +
-              (r.responseText ? r.responseText.slice(0, 200) : '(tomt svar)') +
-              redirected +
-              '  headers: [' + (rawHeaders ? rawHeaders.slice(0, 500) : '(inga headers alls)') + ']'));
-          }
-          try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('Nortic: ogiltig JSON i svaret')); }
+          if (r.status < 200 || r.status >= 300) return reject(new Error('Nortic: HTTP ' + r.status));
+          resolve(r.responseText || '');
         },
         onerror: () => reject(new Error('Nortic: nätverksfel')),
         ontimeout: () => reject(new Error('Nortic: timeout')), timeout: 25000
@@ -713,54 +673,91 @@
     return { grouped: groupEvents(occ, 'billetto'), rawCount: occ.length };
   }
 
-  // ---- Nortic: List Public Events (odokumenterat, se kommentar vid NORTIC_BASE) --
-  function mapNorticEvent(ev) {
-    const { date, time } = isoToStockholm(ev.startsAt);
-    const loc = ev.location || {};
-    const venue = loc.venue || {};
-    const isSoldOut = ev.availability && ev.availability.status === 'SOLD_OUT';
-    return {
-      _tm_id: ev.id || null, title: ev.name || '',
-      description: ev.description || ev.shortDescription || '', image: ev.imageUrl ? { url: ev.imageUrl } : null,
-      date, time, tm_status: isSoldOut ? 'cancelled' : '',
-      href: ev.eventUrl || '',
-      segment: ev.category || '', genre: '',
-      category: NORTIC_CATEGORY_MAP[(ev.category || '').toLowerCase()] || 'Other',
-      venue_name: venue.name || '', address: '', zip_code: '', city: loc.city || '',
-      location: null,
-      external_website_url: ev.eventUrl || '',
-      promoter: (ev.organizer && ev.organizer.name) || ''
-    };
+  // ---- Nortic: skrapar city-sidans HTML (se kommentar vid NORTIC_LIST_URL) --
+  // Tolkar "17 sep." / "5 okt. – 14 nov." / "28 mars 2027" (år utelämnas om
+  // det är underförstått). Om det tolkade datumet hamnar mer än ~2 månader
+  // bakåt i tiden antas det mena nästa år (hanterar årsskiften i listan).
+  function parseNorticDatePart(str, refDate) {
+    const m = str.trim().match(/^(\d{1,2})\s+([a-zA-ZåäöÅÄÖ]+)\.?\s*(\d{4})?$/);
+    if (!m) return null;
+    const day = parseInt(m[1], 10);
+    const month = NORTIC_MONTH_ABBR[m[2].toLowerCase()];
+    if (!month) return null;
+    let year = m[3] ? parseInt(m[3], 10) : refDate.getFullYear();
+    if (!m[3]) {
+      const cutoff = new Date(refDate);
+      cutoff.setMonth(cutoff.getMonth() - 2);
+      if (new Date(year, month - 1, day) < cutoff) year += 1;
+    }
+    return year + '-' + String(month).padStart(2, '0') + '-' + String(day).padStart(2, '0');
   }
 
-  const NORTIC_MAX_PAGES = 40;   // säkerhetsspärr — Stockholm låg på 16 sidor á 20 vid bekräftelsen
-  const NORTIC_PAGE_SIZE = 100;
+  // Läser ut sidantal + eventkort ur en renderad .BaseEventCard-lista.
+  // Ett kort som spänner flera datum ("5 okt. – 14 nov.") ger bara start-
+  // och slutdatum, inte varje enskild föreställning — grupperingen nedan
+  // (groupEvents) räknar start_date/end_date från detta, så intervallet
+  // blir korrekt även om occurrence_count blir en underskattning.
+  function parseNorticListPage(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const pagText = doc.querySelector('.BasePagination-condensed')?.textContent || '';
+    const pm = pagText.match(/Sida\s+\d+\s+av\s+(\d+)/);
+    const totalPages = pm ? parseInt(pm[1], 10) : 1;
+    const now = new Date();
+    const items = [];
+    doc.querySelectorAll('a.BaseEventCard').forEach(a => {
+      const href = a.getAttribute('href') || '';
+      const titleEl = a.querySelector('.BaseEventCard__title');
+      const title = (titleEl?.getAttribute('title') || titleEl?.textContent || '').trim();
+      const metas = a.querySelectorAll('.BaseEventCard__meta');
+      const dateText = (metas[0]?.textContent || '').trim();
+      const venueText = (metas[1]?.getAttribute('title') || metas[1]?.textContent || '').trim();
+      if (!title || !dateText) return;
+      const [startStr, endStr] = dateText.split('–').map(s => s.trim());
+      const start = parseNorticDatePart(startStr, now);
+      const end = endStr ? parseNorticDatePart(endStr, now) : start;
+      if (start) items.push({ title, href, venue: venueText, start, end });
+    });
+    return { totalPages, items };
+  }
+
+  // Kategori går inte att läsa av per kort i listvyn (bara i filterdropdownen),
+  // så alla Nortic-event taggas 'Other' tills vidare.
+  function norticItemToOccurrences(item) {
+    const dates = (item.end && item.end !== item.start) ? [item.start, item.end] : [item.start];
+    return dates.map(date => ({
+      _tm_id: null, title: item.title,
+      description: '', image: null,
+      date, time: '', tm_status: '',
+      href: item.href,
+      segment: '', genre: '', category: 'Other',
+      venue_name: item.venue, address: '', zip_code: '', city: '',
+      location: null,
+      external_website_url: item.href,
+      promoter: ''
+    }));
+  }
+
+  const NORTIC_MAX_PAGES = 40;   // säkerhetsspärr — Stockholm låg på ~17 sidor vid bekräftelsen
 
   async function fetchNortic({ onProgress, onPage }) {
     let all = [];
-    let page = 1, totalPages = 1, total = null;
+    let page = 1, totalPages = 1;
     while (page <= totalPages && page <= NORTIC_MAX_PAGES) {
-      onProgress('Hämtar Nortic, sida ' + page + (total ? ' av ' + totalPages + ' (' + all.length + '/' + total + ' event)' : '') + '…');
+      onProgress('Hämtar Nortic, sida ' + page + (totalPages > 1 ? ' av ' + totalPages : '') + '…');
       if (onPage) onPage(page, totalPages);
-      const url = NORTIC_BASE + '?' + new URLSearchParams({
-        city: 'Stockholm', maxPerOrganizer: '0', page: String(page), size: String(NORTIC_PAGE_SIZE)
-      }).toString();
-      const data = await gmGetNortic(url);
-      const batch = (data && data.items) || [];
-      all = all.concat(batch);
-      const pag = data && data.pagination;
-      if (pag && typeof pag.totalPages === 'number') totalPages = pag.totalPages;
-      if (pag && typeof pag.totalItems === 'number') total = pag.totalItems;
+      const url = NORTIC_LIST_URL + (page > 1 ? '?page=' + page : '');
+      const html = await gmGetNorticHtml(url);
+      const { totalPages: tp, items } = parseNorticListPage(html);
+      totalPages = tp;
+      items.forEach(it => { all = all.concat(norticItemToOccurrences(it)); });
       page++;
       if (page <= totalPages) await new Promise(r => setTimeout(r, 200));
     }
     if (page > NORTIC_MAX_PAGES && page <= totalPages) {
       vlog('OBS: Nortic-hämtningen stoppades efter ' + NORTIC_MAX_PAGES + ' sidor (säkerhetsspärr) — fler event kan saknas.', 'err');
     }
-    vlog('Nortic: ' + all.length + ' event hämtade' +
-      (total !== null ? ' (API rapporterar ' + total + ' totalt i Stockholm)' : '') + '.');
-    const occ = all.map(mapNorticEvent);
-    return { grouped: groupEvents(occ, 'nortic'), rawCount: occ.length };
+    vlog('Nortic: ' + all.length + ' tillfällen hämtade över ' + (page - 1) + ' sida(or).');
+    return { grouped: groupEvents(all, 'nortic'), rawCount: all.length };
   }
 
   // ---- Dedup ---------------------------------------------------------------
