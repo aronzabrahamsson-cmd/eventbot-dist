@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.57.0
+// @version      7.57.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3081,20 +3081,29 @@
     document.head.appendChild(s);
   }
 
+  // Delad av alla sticky bars (draft/edit/guide) som injiceras ovanpå Wagtails
+  // egen sida. Wagtails admin-vyer har inte alltid samma header-markup —
+  // om ingen av de vanliga selektorerna hittas (t.ex. en annan sidlayout på
+  // guide-listan än på draft-listan) faller vi tillbaka på att lägga baren
+  // överst i <body> istället för att tyst inte visa något alls.
+  function insertBarAtTop(bar) {
+    const anchor = document.querySelector('.page-header, .header, header, h1');
+    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(bar, anchor.nextSibling);
+    else document.body.insertBefore(bar, document.body.firstChild);
+  }
+
   function initGuideListTool() {
     vlog('GuideLista: Initierar på sidlistan (content_type=46)');
     ensureGuideListStyle();
     loadGuideList();
     if (!document.getElementById('vseh-guide-bar')) {
-      const anchor = document.querySelector('.page-header, .header, header, h1');
-      if (anchor) {
         const bar = document.createElement('div');
         bar.id = 'vseh-guide-bar';
         bar.innerHTML = `
           <button type="button" id="vseh-guide-toggle">📋 Guide-lista</button>
           <span id="vseh-guide-count"></span>
         `;
-        anchor.parentNode.insertBefore(bar, anchor.nextSibling);
+        insertBarAtTop(bar);
         const panel = document.createElement('div');
         panel.id = 'vseh-guide-panel';
         panel.style.display = 'none';
@@ -3128,7 +3137,6 @@
           if (!confirm('Radera alla sparade guider?')) return;
           guideList = []; saveGuideList(); renderGuideList();
         });
-      }
     }
     renderGuideList();
   }
@@ -3941,8 +3949,6 @@
     vlog('Draftvy-Dubblettkoll: Initierar på draft-lista');
     ensureDraftStyle();
     if (!document.getElementById('vseh-draft-bar')) {
-      const header = document.querySelector('.page-header, .header, header, h1');
-      if (header) {
         const bar = document.createElement('div');
         bar.id = 'vseh-draft-bar';
         bar.innerHTML = `
@@ -3951,10 +3957,9 @@
           <span id="vseh-draft-ts"></span>
           <span id="vseh-draft-progress"></span>
         `;
-        header.parentNode.insertBefore(bar, header.nextSibling);
+        insertBarAtTop(bar);
         document.getElementById('vseh-draft-check-btn').addEventListener('click', runDraftvyCheck);
         document.getElementById('vseh-draft-fetch-btn').addEventListener('click', loadDedupForDraft);
-      }
     }
     updateDraftvyTs();
     // Ingen automatisk hämtning här (den är tung — läser hela Visit-kalendern
