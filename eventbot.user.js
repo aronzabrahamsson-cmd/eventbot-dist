@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.55.0
+// @version      7.55.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -291,13 +291,18 @@
     });
   }
   // Origin/Referer sätts för att likna ett anrop från nortic.se självt.
-  // 2026-09-16: bekräftat att även GM_xmlhttpRequest (riktig webbläsar-nätverksstack,
-  // inte bara PowerShell) får HTTP 404 med tomt svar — så det är INTE bara ett
-  // TLS-fingeravtrycksproblem. Sec-Fetch-*-headers läggs till här eftersom
-  // GM_xmlhttpRequest annars inte skickar dem (till skillnad från en vanlig
-  // sid-initierad fetch), i fall en WAF/CDN kräver dem. Om detta fortfarande
-  // ger 404 loggas svarshuvuden (server/cf-ray/via etc) i felmeddelandet så
-  // att man kan se vilken CDN/WAF som svarar utan att behöva DevTools.
+  // 2026-09-16: bekräftat att både PowerShell och GM_xmlhttpRequest (riktig
+  // webbläsar-nätverksstack) fick HTTP 404 med tomt svar mot NORTIC_BASE.
+  // 2026-09-17: hittade trolig orsak i sidkällan för nortic.se/stad/stockholm
+  // — dess inbäddade Nuxt-config avslöjar en "ajar"-klient konfigurerad mot
+  // https://services.nortic.se/api/ajar med en X-Api-Key-header
+  // ("bobby3pharaohs7cornwall", en publik sidnyckel skickad till alla
+  // besökare, inte en hemlighet). Vi hade alltså varken rätt path (gissad
+  // från en gammal SSR-payload, /public/v1/events, snarare än /api/ajar)
+  // eller den nyckeln. Testar nyckeln mot befintlig NORTIC_BASE här — om
+  // det fortfarande 404:ar är nästa steg att byta bas till /api/ajar eller
+  // falla tillbaka på att skrapa de paginerade HTML-sidorna direkt
+  // (bekräftat fungerande: nortic.se/stad/stockholm?page=N).
   function gmGetNortic(url) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -306,6 +311,7 @@
           'Accept': 'application/json',
           'Origin': 'https://nortic.se',
           'Referer': 'https://nortic.se/',
+          'X-Api-Key': 'bobby3pharaohs7cornwall',
           'Sec-Fetch-Site': 'same-origin',
           'Sec-Fetch-Mode': 'cors',
           'Sec-Fetch-Dest': 'empty'
