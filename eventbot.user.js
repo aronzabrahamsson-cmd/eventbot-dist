@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.54.2
+// @version      7.55.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -87,7 +87,10 @@
     try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
   });
 
-  vlog('Script v7.54.0 startar på ' + location.pathname);
+  // Läses från userscript-metadatan (GM_info) istället för att hårdkodas här,
+  // så den aldrig kan halka efter @version-raden i huvudet ovan.
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '?';
+  vlog('Script v' + SCRIPT_VERSION + ' startar på ' + location.pathname);
 
 
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
@@ -195,6 +198,26 @@
   let mode = 'min';
   let activeFilter = 'out';
   let activeSourceFilter = 'all';   // käll-underfilter, gäller bara vyn "Ej inlagda"
+  let monthFilter = 'all';          // 'all' | 'month' | '6m' — Kalendrar/Dubbletter-listan
+  // Delad av alla vyer med månadsfiltret. dateStr är en YYYY-MM-DD-sträng
+  // (ev.start_date) — 'month' = samma kalendermånad som idag, '6m' = från
+  // idag till och med 6 kalendermånader fram.
+  function passesMonthFilter(dateStr, filter) {
+    if (filter === 'all') return true;
+    if (!dateStr) return false;
+    const now = new Date();
+    if (filter === 'month') {
+      const ym = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+      return dateStr.slice(0, 7) === ym;
+    }
+    if (filter === '6m') {
+      const todayStr = now.toISOString().slice(0, 10);
+      const future = new Date(now);
+      future.setMonth(future.getMonth() + 6);
+      return dateStr >= todayStr && dateStr <= future.toISOString().slice(0, 10);
+    }
+    return true;
+  }
   const expanded = new Set();
   const busyCreate = new Set();   // event-index som just nu skapas
   const eventStatus = new Map();  // event-index -> { msg, kind }
@@ -2194,6 +2217,7 @@
     #vseh-panel * { box-sizing:border-box; }
     #vseh-head { padding:11px 14px; background:var(--vd-bg3); color:var(--vd-txt); display:flex; align-items:center; justify-content:space-between; gap:8px; flex-shrink:0; border-bottom:1px solid var(--vd-line); }
     #vseh-head .t { font-size:17px; font-weight:700; letter-spacing:-.01em; }
+    #vseh-head .v { font-size:9px; font-weight:400; color:#1a3a6b; margin-left:6px; letter-spacing:0; }
     #vseh-headbtns { display:flex; gap:3px; align-items:center; }
     #vseh-headbtns .vseh-btn-gap { width:14px; display:inline-block; }
     #vseh-headbtns button { background:rgba(255,255,255,.08); border:none; color:var(--vd-txt); cursor:pointer; width:26px; height:24px; border-radius:6px; font-size:12px; line-height:1; display:flex; align-items:center; justify-content:center; }
@@ -2255,6 +2279,11 @@
     #vseh-actions { display:flex; gap:8px; margin:6px 0 12px; }
     #vseh-actions button { flex:1; font-size:12px; font-weight:500; padding:8px; border:1px solid var(--vd-line); background:var(--vd-bg2); color:var(--vd-accent); border-radius:7px; cursor:pointer; }
     #vseh-actions button:hover:not(:disabled) { background:var(--vd-bg3); } #vseh-actions button:disabled { color:var(--vd-txt3); cursor:not-allowed; }
+    #vseh-monthfilter, #sbr-crm-monthfilter { margin-top:8px; }
+    #vseh-monthfilter select, #sbr-crm-monthfilter select {
+      font-size:11px; font-weight:600; padding:4px 8px; border:1px solid var(--vd-line);
+      background:var(--vd-bg2); color:var(--vd-txt); border-radius:6px; cursor:pointer;
+    }
     #vseh-filters { display:flex; gap:5px; margin-bottom:9px; flex-wrap:wrap; }
     #vseh-filters button { font-size:10.5px; font-weight:600; padding:4px 10px; border:1px solid var(--vd-line); background:var(--vd-bg2); border-radius:20px; cursor:pointer; }
     #vseh-filters button[data-f="out"] { color:#ff8080; }
@@ -2405,7 +2434,7 @@
     p.className = mode;
     p.innerHTML = `
       <div id="vseh-head">
-        <div class="t">Eventbot — SBR-läge</div>
+        <div class="t">Eventbot — SBR-läge<span class="v">v${SCRIPT_VERSION}</span></div>
         <div id="vseh-headbtns">
           <button type="button" data-m="min" title="Minimera">▁</button>
           <button type="button" data-m="max" title="Maximera">▢</button>
@@ -2453,6 +2482,13 @@
             <button type="button" class="crm-f" data-f="in_sbr">SBR (<span id="crm-count-in_sbr">0</span>)</button>
             <button type="button" class="crm-f" data-f="not_in_cal">Ej inlagt (<span id="crm-count-not_in_cal">0</span>)</button>
             <button type="button" class="crm-f" data-f="passed">Passerat (<span id="crm-count-passed">0</span>)</button>
+          </div>
+          <div id="sbr-crm-monthfilter" style="margin-top:6px;">
+            <select id="sbr-crm-month-select">
+              <option value="all">Alla event</option>
+              <option value="month">Denna månad</option>
+              <option value="6m">Inom 6 månader</option>
+            </select>
           </div>
           <div id="sbr-crm-body" style="margin-top:10px;"><div class="vseh-empty">Inga CRM-event ännu.</div></div>
         </div>
@@ -2566,6 +2602,7 @@
       document.querySelectorAll('#vseh-scroll .crm-f').forEach(x => x.classList.toggle('active', x === b));
       renderCrmEvents();
     }));
+    $('sbr-crm-month-select').addEventListener('change', e => { crmMonthFilter = e.target.value; renderCrmEvents(); });
 
     vlog('Eventbot SBR-läge startar på ' + location.pathname);
   }
@@ -2579,7 +2616,7 @@
     const p = document.createElement('div'); p.id = 'vseh-panel'; p.className = mode;
     p.innerHTML = `
       <div id="vseh-head">
-        <div class="t">Eventbot</div>
+        <div class="t">Eventbot<span class="v">v${SCRIPT_VERSION}</span></div>
         <div id="vseh-headbtns">
           <button type="button" data-m="min" title="Minimera">▁</button>
           <button type="button" data-m="max" title="Maximera">▢</button>
@@ -2631,6 +2668,13 @@
             <div class="s" data-f="cancelled" id="vseh-stat-cancel" style="display:none;"><div class="n" style="color:#ff8080" id="vseh-n-cancel">0</div><div class="l">⚠️ Inställda</div></div>
           </div>
           <div id="vseh-srcfilter" style="display:none;"></div>
+          <div id="vseh-monthfilter">
+            <select id="vseh-month-select">
+              <option value="all">Alla event</option>
+              <option value="month">Denna månad</option>
+              <option value="6m">Inom 6 månader</option>
+            </select>
+          </div>
           <div id="vseh-list"><div class="vseh-empty">Inga event hämtade ännu.</div></div>
         </div>
 
@@ -2767,6 +2811,7 @@
   const SBR_CRM_KEY = 'sbr_crm_events';
   let sbrCrmEvents = [];
   let crmFilter = 'all';
+  let crmMonthFilter = 'all';   // 'all' | 'month' | '6m'
 
   const CRM_STATUS = {
     in_visit:   { label: 'inlagt Visit',        bg: '#1f7a4d', fg: '#fff', bar: '#2f9a63' },
@@ -2881,6 +2926,7 @@
     const today = new Date().toISOString().split('T')[0];
 
     const shown = sbrCrmEvents.filter(ev => {
+      if (!passesMonthFilter(ev.start_date, crmMonthFilter)) return false;
       if (crmFilter === 'all') return true;
       if (crmFilter === 'passed') return ev.status === 'passed' || (ev.end_date && ev.end_date < today);
       if (crmFilter === 'in_visit') return ev.status === 'in_visit' || ev.status === 'both';
@@ -3174,6 +3220,7 @@
       if (activeFilter !== 'out') activeSourceFilter = 'all';
       render(lastGrouped);
     }));
+    $('vseh-month-select').addEventListener('change', e => { monthFilter = e.target.value; render(lastGrouped); });
   }
 
   async function loadDedup() {
@@ -3485,6 +3532,7 @@
     }
 
     const shown = withStatus.map((w, i) => ({ ...w, idx: i })).filter(w => {
+      if (!passesMonthFilter(w.ev.start_date, monthFilter)) return false;
       if (activeFilter === 'cancelled') {
         const isCancelled = !!w.ev._tm_status_flag && !isManualIn(w.ev);
         const inOurCal = w.st.key === 'in' || w.st.key === 'partial';
