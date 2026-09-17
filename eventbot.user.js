@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.57.1
+// @version      7.57.2
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4376,8 +4376,18 @@
     } catch { return []; }
   }
 
+  // Guide-titlarna nedan är verifierade (2026-09-17) mot en riktig export ur
+  // guide-list-verktyget — inte gissade. De ursprungliga gissningarna
+  // ("Biggest events"/"Största evenemangen", "Ongoing exhibitions"/
+  // "Utställningar just nu") fanns inte i den riktiga listan.
+  const GUIDE_ARENA_EN = 'The biggest Stockholm events in 2026';
+  const GUIDE_ARENA_SV = 'De största evenemangen i Stockholm 2026';
+  const GUIDE_EXHIBITIONS_EN = 'Current and Upcoming Exhibitions in Stockholm';
+  const GUIDE_EXHIBITIONS_SV = 'Utställningar i Stockholm - Aktuella och kommande';
+
   // Musikevent på Avicii Arena/Friends Arena → taggar related_guides mot
-  // "Biggest events"/"Största evenemangen".
+  // "The biggest Stockholm events in 2026"/"De största evenemangen i
+  // Stockholm 2026".
   let arenaGuideTagged = false;
   async function autoTagArenaGuide() {
     if (arenaGuideTagged) return;
@@ -4386,21 +4396,22 @@
     if (!/avicii arena|friends arena/.test(venue)) return;
     if (!currentCategoryTitles().includes(CATEGORY_MUSIC)) return;
     arenaGuideTagged = true;
-    await selectAutocompleteValue('id_related_guides', 'Biggest events');
-    await selectAutocompleteValue('id_related_guides', 'Största evenemangen');
-    vlog('EventEdit: Taggade "Biggest events"/"Största evenemangen" (Music-event på arena).', 'ok');
+    await selectAutocompleteValue('id_related_guides', GUIDE_ARENA_EN);
+    await selectAutocompleteValue('id_related_guides', GUIDE_ARENA_SV);
+    vlog('EventEdit: Taggade "' + GUIDE_ARENA_EN + '"/"' + GUIDE_ARENA_SV + '" (Music-event på arena).', 'ok');
   }
 
-  // Utställningsevent → taggar related_guides mot "Utställningar just nu"/
-  // "Ongoing exhibitions".
+  // Utställningsevent → taggar related_guides mot "Current and Upcoming
+  // Exhibitions in Stockholm"/"Utställningar i Stockholm - Aktuella och
+  // kommande".
   let exhibitionGuideTagged = false;
   async function autoTagExhibitionGuide() {
     if (exhibitionGuideTagged) return;
     if (!currentCategoryTitles().includes(CATEGORY_EXHIBITIONS)) return;
     exhibitionGuideTagged = true;
-    await selectAutocompleteValue('id_related_guides', 'Utställningar just nu');
-    await selectAutocompleteValue('id_related_guides', 'Ongoing exhibitions');
-    vlog('EventEdit: Taggade "Utställningar just nu"/"Ongoing exhibitions" (Exhibitions-kategori).', 'ok');
+    await selectAutocompleteValue('id_related_guides', GUIDE_EXHIBITIONS_EN);
+    await selectAutocompleteValue('id_related_guides', GUIDE_EXHIBITIONS_SV);
+    vlog('EventEdit: Taggade "' + GUIDE_EXHIBITIONS_EN + '"/"' + GUIDE_EXHIBITIONS_SV + '" (Exhibitions-kategori).', 'ok');
   }
 
   // Geotaggning aktiveras tydligen av något som lyssnar på interaktion med
