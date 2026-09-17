@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.56.1
+// @version      7.57.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -11,6 +11,8 @@
 // @match        https://www.visitstockholm.com/cms/api/event/edit/*
 // @match        https://www.visitstockholm.se/cms/api/event/edit/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/edit/*
+// @match        https://www.visitstockholm.com/cms/pages/*
+// @match        https://www.visitstockholm.se/cms/pages/*
 // @updateURL    https://raw.githubusercontent.com/aronzabrahamsson-cmd/eventbot-dist/main/eventbot.user.js
 // @downloadURL  https://raw.githubusercontent.com/aronzabrahamsson-cmd/eventbot-dist/main/eventbot.user.js
 // @grant        GM_xmlhttpRequest
@@ -2986,6 +2988,151 @@
     return header + '\n' + rows.join('\n');
   }
 
+  // ---- Guide-lista (sidlistan på /cms/pages/<id>/?...content_type=46) ------
+  // Wagtails egen sidlista har ingen egen export, och ett innehållstyp-filter
+  // (Guide) kan spänna över flera sidor (paginering, ?p=N). Samma paste-och-
+  // spara-mönster som SBR:s CRM-import: markera hela den synliga tabellen på
+  // sidan (Ctrl+A i listan, kopiera), klistra in här, importera. Klistrar man
+  // in flera sidor efter varandra (en per ?p=N) byggs en komplett lista upp i
+  // GM-cacheminnet — samma titel skrivs över (uppdaterar status), ingen
+  // dublett. "Exportera" ger en enkel radlista (titel + status) att klistra
+  // in i t.ex. related_guides-sökrutan på edit-sidan.
+  const GUIDE_LIST_KEY = 'guide_list_v1';
+  let guideList = [];
+
+  function loadGuideList() {
+    try { guideList = JSON.parse(GM_getValue(GUIDE_LIST_KEY, '[]')) || []; }
+    catch { guideList = []; }
+  }
+  function saveGuideList() { GM_setValue(GUIDE_LIST_KEY, JSON.stringify(guideList)); }
+
+  // Wagtails sidlista kopieras som friliggande textrader (inte en riktig
+  // HTML-tabell markerad med kolumner) — titelrad, sen en metarad med
+  // "<ålder> sedan", "Guide" och "Nuvarande sidstatus:<status>" tab-
+  // separerat. Tolkar det genom att låta senaste icke-metaraden bli titeln
+  // på nästa metarad, istället för att anta ett fast antal rader per post
+  // (robustare mot extra tomrader från copy/paste).
+  function parseGuideListPaste(text) {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const items = [];
+    let pendingTitle = null;
+    for (const line of lines) {
+      const statusMatch = line.match(/Nuvarande sidstatus:\s*(\S+)/i);
+      if (/\bGuide\b/.test(line) && statusMatch) {
+        if (pendingTitle) items.push({ title: pendingTitle, status: statusMatch[1].toLowerCase() });
+        pendingTitle = null;
+      } else {
+        pendingTitle = line;
+      }
+    }
+    return items;
+  }
+
+  function importGuideListPaste(text) {
+    const items = parseGuideListPaste(text);
+    items.forEach(it => {
+      const idx = guideList.findIndex(g => g.title.toLowerCase() === it.title.toLowerCase());
+      if (idx >= 0) guideList[idx].status = it.status;
+      else guideList.push(it);
+    });
+    guideList.sort((a, b) => a.title.localeCompare(b.title, 'sv'));
+    saveGuideList();
+    return items.length;
+  }
+
+  function exportGuideList() {
+    return guideList.map(g => g.title + '\t' + g.status).join('\n');
+  }
+
+  function renderGuideList() {
+    const count = document.getElementById('vseh-guide-count');
+    if (count) count.textContent = guideList.length + ' guide(r) sparade';
+    const body = document.getElementById('vseh-guide-body');
+    if (!body) return;
+    if (!guideList.length) { body.innerHTML = '<div class="vseh-empty">Inga guider sparade ännu.</div>'; return; }
+    body.innerHTML = guideList.map(g =>
+      '<div class="vseh-guide-row" style="padding:4px 0;border-bottom:1px solid #3a3f4b;">' +
+      esc(g.title) + ' <span style="color:' + (g.status === 'publicerad' ? '#7ddca0' : '#e0b060') + ';font-size:11px;">' +
+      esc(g.status) + '</span></div>'
+    ).join('');
+  }
+
+  const GUIDE_LIST_CSS = `
+    #vseh-guide-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
+      flex-wrap:wrap; gap:10px; background:#2f3542; color:#e8eaee; padding:10px 14px;
+      margin:0 0 14px; border-radius:6px; box-shadow:0 2px 10px rgba(0,0,0,.3);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    #vseh-guide-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer;
+      font-size:13px; font-weight:600; background:#4a9fe0; color:#fff; }
+    #vseh-guide-count { font-size:12px; color:#c3c8d1; }
+    #vseh-guide-panel { background:#1b1f27; color:#e8eaee; border-radius:6px; padding:14px; margin:0 0 14px; }
+    #vseh-guide-paste { width:100%; min-height:120px; font-family:inherit; font-size:13px;
+      box-sizing:border-box; margin-bottom:8px; }
+    #vseh-guide-panel .vseh-guide-actions { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+    #vseh-guide-panel .vseh-guide-actions button { padding:6px 12px; border:none; border-radius:5px;
+      cursor:pointer; font-size:12px; font-weight:600; background:#787e8a; color:#fff; }
+    #vseh-guide-body { max-height:300px; overflow-y:auto; font-size:13px; }
+  `;
+  function ensureGuideListStyle() {
+    if (document.getElementById('vseh-guide-css')) return;
+    const s = document.createElement('style');
+    s.id = 'vseh-guide-css';
+    s.textContent = GUIDE_LIST_CSS;
+    document.head.appendChild(s);
+  }
+
+  function initGuideListTool() {
+    vlog('GuideLista: Initierar på sidlistan (content_type=46)');
+    ensureGuideListStyle();
+    loadGuideList();
+    if (!document.getElementById('vseh-guide-bar')) {
+      const anchor = document.querySelector('.page-header, .header, header, h1');
+      if (anchor) {
+        const bar = document.createElement('div');
+        bar.id = 'vseh-guide-bar';
+        bar.innerHTML = `
+          <button type="button" id="vseh-guide-toggle">📋 Guide-lista</button>
+          <span id="vseh-guide-count"></span>
+        `;
+        anchor.parentNode.insertBefore(bar, anchor.nextSibling);
+        const panel = document.createElement('div');
+        panel.id = 'vseh-guide-panel';
+        panel.style.display = 'none';
+        panel.innerHTML = `
+          <div class="vseh-hint" style="margin-bottom:8px;">Markera hela den synliga listan på sidan (t.ex. Ctrl+A), kopiera och klistra in här. Fungerar sida för sida (?p=1, ?p=2 …) — redan sparade titlar uppdateras istället för att dubbliceras.</div>
+          <textarea id="vseh-guide-paste" placeholder="Klistra in kopierad text från sidlistan…"></textarea>
+          <div class="vseh-guide-actions">
+            <button type="button" id="vseh-guide-import">Importera inklistrad data</button>
+            <button type="button" id="vseh-guide-export">📤 Exportera lista</button>
+            <button type="button" id="vseh-guide-clear">🗑 Rensa allt</button>
+          </div>
+          <div id="vseh-guide-body"></div>
+        `;
+        bar.insertAdjacentElement('afterend', panel);
+        document.getElementById('vseh-guide-toggle').addEventListener('click', () => {
+          panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        });
+        document.getElementById('vseh-guide-import').addEventListener('click', () => {
+          const ta = document.getElementById('vseh-guide-paste');
+          const n = importGuideListPaste(ta.value);
+          ta.value = '';
+          renderGuideList();
+          vlog('GuideLista: Importerade ' + n + ' rad(er) från inklistringen.', 'ok');
+        });
+        document.getElementById('vseh-guide-export').addEventListener('click', async () => {
+          const btn = document.getElementById('vseh-guide-export');
+          try { await navigator.clipboard.writeText(exportGuideList()); btn.textContent = '✓ Kopierat'; setTimeout(() => btn.textContent = '📤 Exportera lista', 1500); }
+          catch { btn.textContent = 'Fel'; setTimeout(() => btn.textContent = '📤 Exportera lista', 1500); }
+        });
+        document.getElementById('vseh-guide-clear').addEventListener('click', () => {
+          if (!confirm('Radera alla sparade guider?')) return;
+          guideList = []; saveGuideList(); renderGuideList();
+        });
+      }
+    }
+    renderGuideList();
+  }
+
   function parseSwedishDate(str) {
     if (!str) return null;
     const m = /(\d{1,2})\s+([a-zåäö]+)\s+(\d{4})/i.exec(str.trim());
@@ -4303,6 +4450,10 @@
   // matchar på förekomst av parametern snarare än en exakt query-sträng.
   const KNOWN_DRAFT_URL = /\/(?:cms\/api\/event|wt\/cms\/snippets\/api\/event)\/\?(?:.*&)?status__exact=draft(?:&|$)/;
   const KNOWN_EDIT_URL = /(\/cms\/api\/event\/edit\/)|(\/wt\/cms\/snippets\/api\/event\/edit\/)/;
+  // Sidlistan (Wagtails generella explorer/sökresultat) filtrerad på
+  // content_type=46 (bekräftat värde för "Guide") — samma "kan stå var som
+  // helst i query-strängen"-logik som draft-listan ovan.
+  const KNOWN_GUIDE_LIST_URL = /\/cms\/pages\/\d+\/\?(?:.*&)?content_type=46(?:&|$)/;
   if (KNOWN_PRODUCTION_URL.test(location.href)) {
     injectStyle();
     loadDismissals();
@@ -4343,6 +4494,8 @@
     initDraftvyDubblettkoll();
   } else if (KNOWN_EDIT_URL.test(location.href)) {
     initEventEditAutomation();
+  } else if (KNOWN_GUIDE_LIST_URL.test(location.href)) {
+    initGuideListTool();
   }
   // (Ingen else-gren längre — scriptet matchar numera bara de kända URL:erna
   // ovan, se @match. Kartläggningsverktyget för okända sidor lever nu i ett
