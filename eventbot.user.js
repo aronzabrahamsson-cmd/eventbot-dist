@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.55.2
+// @version      7.56.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
-// @match        https://www.visitstockholm.com/cms/api/event/?status__exact=draft
-// @match        https://www.visitstockholm.se/cms/api/event/?status__exact=draft
+// @match        https://www.visitstockholm.com/cms/api/event/?*
+// @match        https://www.visitstockholm.se/cms/api/event/?*
 // @match        https://www.visitstockholm.com/cms/api/event/edit/*
 // @match        https://www.visitstockholm.se/cms/api/event/edit/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/edit/*
@@ -3810,11 +3810,13 @@
       }
     }
     updateDraftvyTs();
-    if (!dedupIndex) {
-      loadDedupForDraft();
-    } else {
-      runDraftvyCheck();
-    }
+    // Ingen automatisk hämtning här (den är tung — läser hela Visit-kalendern
+    // sida för sida). Vi hydrerar bara från det som redan finns sparat i
+    // GM-cacheminnet (CACHE_CAL, samma cache som huvudpanelens "VisitStockholm"-
+    // knapp sparar till) och visar dubblettmärken direkt från det om det finns
+    // — annars väntar vi på att "Hämta Visit-Kalendern" klickas manuellt.
+    if (!dedupIndex) loadCache();
+    if (dedupIndex) runDraftvyCheck();
   }
 
   function updateDraftvyTs() {
@@ -3834,6 +3836,7 @@
       dedupIndex = buildIndexFromRows(rows);
       GM_setValue('vs_fetched_ts', Date.now());
       updateDraftvyTs();
+      saveCache();
       if (prog) prog.textContent = '';
       vlog(`Draftvy: Kalender laddad med ${rows.length} rader`, 'ok');
       runDraftvyCheck();
@@ -4001,6 +4004,9 @@
   // Ny sidtyp: edit-sidan (KNOWN_EDIT_URL). Läser ifyllda formulärfält, skickar
   // dem till samma Mistral-agent (mistral_key/mistral_agent) för omskrivning,
   // och visar resultatet — separat från huvudflödet, rör inte create-panelen.
+  // PAUSAD 2026-09-17 på begäran (rutan visade sig konstigt) — koden ligger
+  // kvar orörd men anropas inte längre från dispatchern längst ner, se
+  // initEventEditAutomation() istället för vad som faktiskt körs på edit-sidan.
   function initEventChecker() {
     vlog('EventChecker: Initierar på edit-sida');
     let rewriteBtn = document.getElementById('vseh-rewrite-btn');
@@ -4115,6 +4121,170 @@
     return null;
   }
 
+  // ---- Edit-sidans automatiska kontroller (v7.56.0) -------------------------
+  // Körs automatiskt på edit-sidan (KNOWN_EDIT_URL), separat från den pausade
+  // EventChecker-rutan ovan. Allt här är antingen läsande (prisflagg) eller
+  // återställer exakt samma värde det läste (adress-aktivering) — utom
+  // rubrik-emojiborttagningen (skriver direkt i title_en/sv, enkla textfält,
+  // lätt att se/ångra) och relaterade guider (bara ett tillägg, inte en
+  // destruktiv ändring). Beskrivningens emoji-borttagning är EN KNAPP man
+  // klickar själv, inte automatisk — se kommentar vid checkDescriptionEmoji.
+  const PRICE_WORD_RE = /\b(sek|kr|eur)\b|€/gi;
+  const EMOJI_RE = /\p{Extended_Pictographic}/gu;
+
+  function fieldWrapper(el) {
+    return (el && (el.closest('.w-field, .w-panel, [data-field]') || el.parentElement)) || null;
+  }
+
+  // Beskrivningsfältens dolda input hålls av Draftail synkad med en rå
+  // Draft.js-JSON ({"blocks":[{"text":"..."}]}) — läser den direkt istället
+  // för att montera/röra själva rich text-editorn, eftersom vi bara LÄSER.
+  function readDraftailText(fieldId) {
+    const hidden = document.getElementById(fieldId);
+    if (!hidden || !hidden.value) return '';
+    try { return (JSON.parse(hidden.value).blocks || []).map(b => b.text || '').join('\n'); }
+    catch { return ''; }
+  }
+
+  function setFieldNote(el, key, html) {
+    const wrap = fieldWrapper(el);
+    if (!wrap) return;
+    let note = wrap.querySelector('.vseh-field-note-' + key);
+    if (!html) { if (note) note.remove(); return; }
+    if (!note) {
+      note = document.createElement('div');
+      note.className = 'vseh-field-note vseh-field-note-' + key;
+      note.style.cssText = 'font-size:13px;margin:4px 0;';
+      wrap.insertBefore(note, wrap.firstChild);
+    }
+    note.innerHTML = html;
+  }
+
+  // Flaggar (bara läser, ändrar inget) om "sek"/"kr"/"eur" (som egna ord) eller
+  // "€" syns i beskrivningen — enligt riktlinjerna ska priser inte stå där.
+  function checkPriceMentions() {
+    ['id_description_en', 'id_description_sv'].forEach(fieldId => {
+      const hidden = document.getElementById(fieldId);
+      const hits = readDraftailText(fieldId).match(PRICE_WORD_RE);
+      const words = hits ? [...new Set(hits.map(h => h.toLowerCase()))] : [];
+      setFieldNote(hidden, 'price', words.length
+        ? '<span style="color:#c02626;font-weight:600;">⚠️ Möjlig prisuppgift i texten (' + esc(words.join(', ')) +
+          ') — priser ska enligt riktlinjerna inte stå i beskrivningen.</span>'
+        : '');
+    });
+  }
+
+  // Tar bort emojis direkt ur title_en/title_sv (vanliga textfält — säkert
+  // att skriva om via simulateInput, syns direkt, lätt att ångra manuellt).
+  function stripEmojisFromTitles() {
+    ['id_title_en', 'id_title_sv'].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el || !el.value || !EMOJI_RE.test(el.value)) return;
+      const stripped = el.value.replace(EMOJI_RE, '').replace(/ {2,}/g, ' ').trim();
+      if (stripped !== el.value) simulateInput(el, stripped);
+    });
+  }
+
+  // Beskrivningen är Draftail (rich text) — enda beprövade sättet i det här
+  // scriptet att skriva till den (updateDraftail, se DRAFTAIL-avsnittet) gör
+  // det via en total nyskriven ContentState, vilket plattar ut eventuell
+  // befintlig formatering (fetstil, länkar) till vanliga textstycken. Det är
+  // en rimlig risk för ETT event man själv skapat via URL-flödet, men inte
+  // något vi vill göra blint på ett befintligt, kanske redan publicerat,
+  // utkast. Därför bara EN FLAGGA + knapp här, ingen automatisk körning.
+  function checkDescriptionEmoji() {
+    ['id_description_en', 'id_description_sv'].forEach(fieldId => {
+      const hidden = document.getElementById(fieldId);
+      const text = readDraftailText(fieldId);
+      const hits = text.match(EMOJI_RE);
+      if (!hits || !hits.length) { setFieldNote(hidden, 'emoji', ''); return; }
+      setFieldNote(hidden, 'emoji',
+        '<span style="color:#c9881f;font-weight:600;">🙂 ' + hits.length + ' emoji hittade — </span>' +
+        '<button type="button" class="vseh-strip-emoji-btn" data-field="' + fieldId + '" ' +
+        'style="font-size:12px;padding:2px 8px;cursor:pointer;">Ta bort (plattar ut ev. formatering till vanlig text)</button>');
+      const btn = document.querySelector('.vseh-strip-emoji-btn[data-field="' + fieldId + '"]');
+      if (btn) btn.onclick = async () => {
+        btn.disabled = true; btn.textContent = 'Tar bort…';
+        await updateDraftail(fieldId, text.replace(EMOJI_RE, '').replace(/ {2,}/g, ' '));
+        setFieldNote(document.getElementById(fieldId), 'emoji', '');
+      };
+    });
+  }
+
+  // Musikevent på Avicii Arena/Friends Arena → taggar related_guides mot
+  // "Biggest events"/"Största evenemangen". Bygger bara på venue-namnet
+  // (nästan allt på de här två arenorna är konserter) för att slippa gissa
+  // exakt kategori-taxonomivärde vi inte kan se från utsidan.
+  let arenaGuideTagged = false;
+  async function autoTagArenaGuide() {
+    if (arenaGuideTagged) return;
+    const venue = ((document.getElementById('id_venue_name_en')?.value || '') + ' ' +
+      (document.getElementById('id_venue_name_sv')?.value || '')).toLowerCase();
+    if (!/avicii arena|friends arena/.test(venue)) return;
+    arenaGuideTagged = true;
+    await selectAutocompleteValue('id_related_guides', 'Biggest events');
+    await selectAutocompleteValue('id_related_guides', 'Största evenemangen');
+    vlog('EventEdit: Taggade "Biggest events"/"Största evenemangen" (arena-venue hittad).', 'ok');
+  }
+
+  // Utställningsevent → taggar related_guides mot "Utställningar just nu"/
+  // "Ongoing exhibitions". Kategorins EXAKTA taxonomivärde i er Wagtail-
+  // installation är en gissning ("exhibition"/"utställning" i main_category
+  // eller categories-titeln) — går tyst (ingen tagg) om det inte träffar,
+  // så fel gissning är ofarlig men bör verifieras/justeras.
+  let exhibitionGuideTagged = false;
+  async function autoTagExhibitionGuide() {
+    if (exhibitionGuideTagged) return;
+    let catTitles = '';
+    try {
+      const main = JSON.parse(document.querySelector('input[name="main_category"]')?.value || 'null');
+      const cats = JSON.parse(document.querySelector('input[name="categories"]')?.value || 'null');
+      catTitles = [main?.title, ...(Array.isArray(cats) ? cats.map(c => c.title) : [])].filter(Boolean).join(' ');
+    } catch {}
+    if (!/exhibition|utställning/i.test(catTitles)) return;
+    exhibitionGuideTagged = true;
+    await selectAutocompleteValue('id_related_guides', 'Utställningar just nu');
+    await selectAutocompleteValue('id_related_guides', 'Ongoing exhibitions');
+    vlog('EventEdit: Taggade "Utställningar just nu"/"Ongoing exhibitions" (kategori: ' + catTitles + ').', 'ok');
+  }
+
+  // Geotaggning aktiveras tydligen av något som lyssnar på interaktion med
+  // adressfältet (bekräftat manuellt arbetssätt: klicka i fältet, skriv ett
+  // mellanslag, radera det). Återskapar exakt det med simulateInput — sätter
+  // ett tillfälligt värde (utlöser input/change), sätter sedan tillbaka det
+  // URSPRUNGLIGA värdet (utlöser input/change igen) — adressen ändras aldrig
+  // på riktigt, bara de händelser sidan lyssnar på.
+  let addressActivated = false;
+  function activateAddressGeotag() {
+    if (addressActivated) return;
+    const el = document.getElementById('id_address');
+    if (!el || !el.value) return;
+    addressActivated = true;
+    const original = el.value;
+    simulateInput(el, original + ' ');
+    simulateInput(el, original);
+    vlog('EventEdit: Aktiverade adressfältet för geotaggning.', 'ok');
+  }
+
+  function runEditPageChecks() {
+    checkPriceMentions();
+    checkDescriptionEmoji();
+    autoTagArenaGuide().catch(() => {});
+    autoTagExhibitionGuide().catch(() => {});
+  }
+
+  function initEventEditAutomation() {
+    vlog('EventEdit: Initierar automatiska kontroller på edit-sidan');
+    stripEmojisFromTitles();
+    activateAddressGeotag();
+    runEditPageChecks();
+    // Formuläret uppdaterar sina dolda fält utan DOM-mutationer vi enkelt kan
+    // observera (Draftails onChange, autocompletens val-klick) — en enkel
+    // poll täcker alla kontrollerna ovan billigt nog för ett formulär av den
+    // här storleken.
+    setInterval(runEditPageChecks, 1500);
+  }
+
   // ---- Init ----------------------------------------------------------------
   // Full produktionsdrift ENDAST på de kända Wagtail-skapa-sidorna — där antar
   // vi specifika fält-id:n (id_title_sv m.fl.) som bara finns där. På alla
@@ -4124,7 +4294,10 @@
   const KNOWN_SBR_URL = /^https:\/\/www\.stockholmbusinessregion\.se\/wt\/cms\/snippets\/api\/event\//;
   // Nya sidtyper (v0.7.52): draft-listan och edit-sidan. Läggs som egna,
   // fristående grenar — rör inte create-grenen ovan.
-  const KNOWN_DRAFT_URL = /(\/cms\/api\/event\/\?status__exact=draft)|(\/wt\/cms\/snippets\/api\/event\/\?status__exact=draft)/;
+  // status__exact=draft kan stå var som helst i query-strängen (Wagtails
+  // egen sortering lägger t.ex. till o=4.3 eller o=3.-4 FÖRE den), så vi
+  // matchar på förekomst av parametern snarare än en exakt query-sträng.
+  const KNOWN_DRAFT_URL = /\/(?:cms\/api\/event|wt\/cms\/snippets\/api\/event)\/\?(?:.*&)?status__exact=draft(?:&|$)/;
   const KNOWN_EDIT_URL = /(\/cms\/api\/event\/edit\/)|(\/wt\/cms\/snippets\/api\/event\/edit\/)/;
   if (KNOWN_PRODUCTION_URL.test(location.href)) {
     injectStyle();
@@ -4165,7 +4338,7 @@
   } else if (KNOWN_DRAFT_URL.test(location.href)) {
     initDraftvyDubblettkoll();
   } else if (KNOWN_EDIT_URL.test(location.href)) {
-    initEventChecker();
+    initEventEditAutomation();
   }
   // (Ingen else-gren längre — scriptet matchar numera bara de kända URL:erna
   // ovan, se @match. Kartläggningsverktyget för okända sidor lever nu i ett
