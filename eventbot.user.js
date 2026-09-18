@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.75.1
+// @version      7.76.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2566,7 +2566,7 @@
         <button type="button" class="vseh-tab active" data-tab="url">🔗 URL</button>
         <button type="button" class="vseh-tab" data-tab="sbr-crm">📥 CRM-import</button>
         <button type="button" class="vseh-tab" data-tab="sbr-src">📇 Källor</button>
-        <button type="button" class="vseh-tab" data-tab="sbr-cal">📅 Eventlista</button>
+        <button type="button" class="vseh-tab" data-tab="sbr-cal">📅 Eventlista <span id="sbr-cal-count"></span></button>
         <button type="button" class="vseh-tab" data-tab="sbr-set">⚙️</button>
       </div>
       <div id="vseh-scroll"><div id="vseh-inner">
@@ -2626,20 +2626,14 @@
 
         <div class="vseh-tabpane" data-pane="sbr-cal">
           <div class="vseh-fetch-h">Eventlista — manuell dedup-koll</div>
-          <div class="vseh-hint">Står du på SBR:s eventlista just nu räcker det att klicka
-            "Hämta synliga event" — den läser tabellraderna som redan syns på sidan direkt,
-            ingen kopiering behövs. Klicka "nästa sida" i SBR:s egen paginering och klicka
-            knappen igen för varje sida. Klistra in-rutan nedan finns kvar som reserv om
-            sidstrukturen skulle se annorlunda ut någonstans (två rader per event: engelsk
-            titel, sedan svensk titel + startdatum + ändringsdatum + status). Överlappande
-            hämtning/inklistring är säker — event som redan finns i listan (samma titlar +
+          <div class="vseh-hint">Stå på SBR:s eventlista och klicka "Hämta synliga event" —
+            den läser tabellraderna som redan syns på sidan direkt, ingen kopiering behövs.
+            Klicka "nästa sida" i SBR:s egen paginering och klicka knappen igen för varje sida.
+            Överlappande hämtning är säker — event som redan finns i listan (samma titlar +
             startdatum) uppdateras i stället för att dubbliceras. När du skapar ett utkast via
             URL-fliken jämförs det automatiskt mot den här listan, med en varning i loggen om
             något liknar ett befintligt event.</div>
           <button type="button" id="sbr-cal-fetch" style="margin-bottom:10px;">📋 Hämta synliga event</button>
-          <textarea id="sbr-cal-paste" class="vseh-key" rows="5" style="width:100%; resize:vertical; font-family:inherit;"
-            placeholder="Eller klistra in från SBR:s eventlista…"></textarea>
-          <button type="button" id="sbr-cal-import" style="margin-top:6px;">Importera inklistrad data</button>
           <div id="sbr-cal-body" style="margin-top:14px;"></div>
         </div>
 
@@ -2699,12 +2693,6 @@
     loadSbrManualCal();
     renderSbrManualCal();
     $('sbr-cal-fetch').addEventListener('click', fetchVisibleSbrEvents);
-    $('sbr-cal-import').addEventListener('click', () => {
-      const ta = $('sbr-cal-paste');
-      if (!ta.value.trim()) { vlog('Eventlista: inget att importera — klistra in data först.', 'err'); return; }
-      importSbrEventList(ta.value);
-      ta.value = '';
-    });
 
     // ---- CRM-import ----
     loadSbrCrmEvents();
@@ -3289,29 +3277,11 @@
   }
   function saveSbrManualCal() { GM_setValue(SBR_CAL_KEY, JSON.stringify(sbrManualCal)); }
 
-  // Formatet från SBR:s adminlista: två rader per event —
-  // rad 1 = "\t<engelsk titel>", rad 2 = "<svensk titel>\t<startdatum>\t<ändrad>\t<status>".
-  function parseSbrEventListPaste(text) {
-    const lines = text.split('\n').map(l => l.replace(/\r$/, '')).filter(l => l.trim() !== '');
-    const out = [];
-    for (let i = 0; i < lines.length - 1; i++) {
-      if (!lines[i].startsWith('\t')) continue;   // rad 1 måste vara en ren titel-rad
-      const titleEn = lines[i].replace(/^\t/, '').trim();
-      const parts = lines[i + 1].split('\t');
-      if (parts.length < 4) continue;
-      const [titleSv, startRaw, modifiedRaw, status] = parts.map(p => p.trim());
-      const startDate = parseSwedishDate(startRaw);
-      if (!titleEn || !titleSv || !startDate) continue;
-      out.push({ title_en: titleEn, title_sv: titleSv, start_date: startDate, start_raw: startRaw, modified_raw: modifiedRaw, status });
-      i++;   // hoppa över rad 2, redan konsumerad
-    }
-    return out;
-  }
-
   function sbrCalKey(ev) { return normText(ev.title_en) + '@' + normText(ev.title_sv) + '@' + ev.start_date; }
 
-  // Delad av både inklistrings- och DOM-hämtningsvägen (fetchVisibleSbrEvents
-  // nedan) — samma upsert-logik oavsett var raderna kom ifrån.
+  // Upsert-logik för importerade rader (bara DOM-hämtningen numera — den
+  // manuella inklistrings-vägen och dess parser togs bort 2026-09-19 sedan
+  // fetchVisibleSbrEvents() visade sig fungera).
   function mergeSbrCalEntries(parsed, sourceLabel) {
     if (!parsed.length) return;
     const byKey = new Map(sbrManualCal.map(e => [sbrCalKey(e), e]));
@@ -3355,20 +3325,19 @@
     const titleCells = [...document.querySelectorAll('td.title')];
     if (!titleCells.length) { vlog('Eventlista: hittade inga rader (ingen td.title) på sidan — är du på SBR:s eventlista?', 'err'); return; }
     const parsed = titleCells.map(td => extractSbrRowData(td.closest('tr'))).filter(Boolean);
-    if (!parsed.length) { vlog('Eventlista: hittade ' + titleCells.length + ' rad(er) men kunde inte läsa ut kolumndata ur någon — sidstrukturen kan ha ändrats igen, klistra in manuellt istället.', 'err'); return; }
+    if (!parsed.length) { vlog('Eventlista: hittade ' + titleCells.length + ' rad(er) men kunde inte läsa ut kolumndata ur någon — sidstrukturen kan ha ändrats igen, hör av dig så kollar vi.', 'err'); return; }
     // Loggar första raden i klartext så en felaktig kolumntolkning syns
     // direkt, istället för att bara upptäckas efter en tyst felimport.
     vlog('Eventlista: första tolkade raden — EN:"' + parsed[0].title_en + '" SV:"' + parsed[0].title_sv + '" datum:"' + parsed[0].start_date + '" status:"' + parsed[0].status + '" — kontrollera att det stämmer.', 'ok');
     mergeSbrCalEntries(parsed, 'synliga rader på sidan');
   }
 
-  function importSbrEventList(text) {
-    const parsed = parseSbrEventListPaste(text);
-    if (!parsed.length) { vlog('Eventlista: kunde inte tolka någon rad — kontrollera formatet.', 'err'); return; }
-    mergeSbrCalEntries(parsed, 'tolkade rader');
-  }
-
+  // Räknare (på begäran 2026-09-19) så det syns direkt, både på flikens
+  // egen badge och överst i listan, om alla sidor faktiskt hämtats — utan
+  // att behöva räkna raderna manuellt.
   function renderSbrManualCal() {
+    const countEl = document.getElementById('sbr-cal-count');
+    if (countEl) countEl.textContent = sbrManualCal.length ? '(' + sbrManualCal.length + ')' : '';
     const body = $('sbr-cal-body');
     if (!body) return;
     if (!sbrManualCal.length) {
@@ -3376,7 +3345,8 @@
       return;
     }
     const sorted = [...sbrManualCal].sort((a, b) => (a.start_date || '9999').localeCompare(b.start_date || '9999'));
-    body.innerHTML = '<div class="sbr-cal-hdr sbr-cal-row"><span>Titel (en/sv)</span><span>Startdatum</span><span>Status</span></div>' +
+    body.innerHTML = '<div class="vseh-hint" style="margin-bottom:8px;"><b>Totalt importerade: ' + sbrManualCal.length + '</b></div>' +
+      '<div class="sbr-cal-hdr sbr-cal-row"><span>Titel (en/sv)</span><span>Startdatum</span><span>Status</span></div>' +
       sorted.map(e => `
         <div class="sbr-cal-row">
           <span>${esc(e.title_en)}<br><span class="sbr-cal-sv">${esc(e.title_sv)}</span></span>
@@ -5098,14 +5068,31 @@
     };
   }
 
-  const GUIDE_TAG_RULES = GUIDE_TAG_ROWS.map(buildGuideRuleFromRow).filter(Boolean);
+  // Byggs LATT (första gången getGuideTagRules() faktiskt anropas, dvs. bara
+  // på edit-sidan) istället för som en direkt konstant vid scriptets start —
+  // bekräftat 2026-09-19 att "GuideRegel #12 (Afternoon Tea): inga villkor
+  // angivna — hoppas över"-varningen (från en rad utan kategori/nyckelord/
+  // datum, avsiktligt hoppad) annars loggades på VARJE sida scriptet laddas
+  // på, inklusive SBR-lägets sidor där guide-taggning inte ens är relevant.
+  let _guideTagRules = null;
+  function getGuideTagRules() {
+    if (!_guideTagRules) _guideTagRules = GUIDE_TAG_ROWS.map(buildGuideRuleFromRow).filter(Boolean);
+    return _guideTagRules;
+  }
 
-  // Guide-titlarnas EN/SV-motsvarighet, byggd från GUIDE_TAG_RULES-rader som
-  // har BÅDA språken definierade (rader med bara ett språk — "ENDAST
-  // SVENSKA/ENGELSKA" — saknar en riktig motsvarighet att synka mot).
-  const GUIDE_LANG_PAIR_ROWS = GUIDE_TAG_RULES
-    .filter(rule => rule.guideEn && rule.guideSv)
-    .map(rule => ({ en: rule.guideEn, sv: rule.guideSv }));
+  // Guide-titlarnas EN/SV-motsvarighet, byggd från raderna som har BÅDA
+  // språken definierade (rader med bara ett språk — "ENDAST SVENSKA/
+  // ENGELSKA" — saknar en riktig motsvarighet att synka mot). Samma
+  // lat-byggnad som ovan.
+  let _guideLangPairRows = null;
+  function getGuideLangPairRows() {
+    if (!_guideLangPairRows) {
+      _guideLangPairRows = getGuideTagRules()
+        .filter(rule => rule.guideEn && rule.guideSv)
+        .map(rule => ({ en: rule.guideEn, sv: rule.guideSv }));
+    }
+    return _guideLangPairRows;
+  }
 
   // Fuzzy jämförelse (samma princip som selectAutocompleteValue's egen
   // förslags-matchning: normalize() + startsWith/includes, inte exakt
@@ -5172,7 +5159,7 @@
   async function syncGuideLangPairs() {
     const liveTitles = currentRelatedGuideTitles();
     for (const liveTitle of liveTitles) {
-      const pairRow = GUIDE_LANG_PAIR_ROWS.find(r => titleMatches(liveTitle, r.en) || titleMatches(liveTitle, r.sv));
+      const pairRow = getGuideLangPairRows().find(r => titleMatches(liveTitle, r.en) || titleMatches(liveTitle, r.sv));
       if (!pairRow) continue;
       const counterpart = titleMatches(liveTitle, pairRow.en) ? pairRow.sv : pairRow.en;
       if (liveTitles.some(t => titleMatches(t, counterpart))) continue;
@@ -5205,7 +5192,7 @@
     guideTagRulesRunning = true;
     try {
       const ctx = buildGuideTagContext();
-      for (const rule of GUIDE_TAG_RULES) {
+      for (const rule of getGuideTagRules()) {
         if (guideTagRulesFired.has(rule.name)) continue;
         let hit;
         try { hit = rule.match(ctx); } catch (e) { vlog('GuideRegel "' + rule.name + '": fel i match() — ' + e.message, 'err'); continue; }
