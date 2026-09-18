@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.64.0
+// @version      7.65.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4646,6 +4646,79 @@
     });
   }
 
+  // VERSALRUBRIKER ("IKEA'S NEW EXHIBITION") bryter mot stilguiden — flaggar
+  // titlar som (i praktiken) är helt versala och erbjuder en Mistral-
+  // omskrivning, samma knapp-mönster som checkGuidelineIssues() (på begäran
+  // 2026-09-19). Kräver >3 bokstäver totalt (bortser från siffror/
+  // skiljetecken/apostrofer) för att inte flagga korta initialförkortningar.
+  function isAllCapsTitle(title) {
+    const letters = (title || '').replace(/[^a-zA-ZåäöÅÄÖ]/g, '');
+    return letters.length > 3 && title === title.toUpperCase() && title !== title.toLowerCase();
+  }
+
+  // Skickar bara SJÄLVA TITELN (inte hela beskrivningen) till Mistral, med en
+  // språkspecifik instruktion: engelska till Title Case (småord som "the"/
+  // "and"/"of" gemena om de inte är första ordet), svenska till ren
+  // meningscase (bara första bokstaven stor — matchar exemplet "IKEAS NYA
+  // UTSTÄLLNING" → "Ikeas nya utställning", inte "IKEAs Nya Utställning").
+  async function rewriteTitleCasing(lang) {
+    const el = document.getElementById('id_title_' + lang);
+    const title = (el?.value || '').trim();
+    if (!title) return;
+    const mistralKey = GM_getValue('mistral_key', '');
+    if (!mistralKey) { vlog('Versalrubrik: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
+    const instruction = lang === 'en'
+      ? 'Skriv om till Title Case (stor bokstav i början av varje ord), UTOM korta artiklar/konjunktioner/prepositioner ("a", "an", "the", "and", "or", "of", "in", "on", "at", "for", "to"), som ska vara gemena om de inte är första ordet.'
+      : 'Skriv om till meningscase: bara första bokstaven i titeln stor, resten gemener (behåll dock versaler mitt i ett ord om de redan är en del av ett egennamn/en förkortning, t.ex. "IKEA" i "Ikeas").';
+    try {
+      vlog('Versalrubrik: Skickar titel till Mistral (id_title_' + lang + ')…');
+      const payload = {
+        model: 'mistral-small-latest',
+        messages: [
+          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstitlar. ' + instruction +
+              ' Ändra ENDAST skiftläget — samma ord, samma ordning, samma skiljetecken. Svara ENDAST med den omskrivna titeln, ingen kommentar, inga citattecken.' },
+          { role: 'user', content: title }
+        ]
+      };
+      const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
+      const rewritten = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+      if (!rewritten) throw new Error('Tomt svar från Mistral');
+      simulateInput(el, rewritten.trim());
+      vlog('Versalrubrik: Klar (id_title_' + lang + ').', 'ok');
+    } catch (e) {
+      vlog('Versalrubrik: Fel — ' + e.message, 'err');
+    }
+  }
+
+  function checkTitleCasing() {
+    ['en', 'sv'].forEach(lang => {
+      const el = document.getElementById('id_title_' + lang);
+      const title = el?.value || '';
+      if (!isAllCapsTitle(title)) { setFieldNote(el, 'caps', ''); return; }
+      const fixDesc = lang === 'en'
+        ? 'Mistral skriver om till Title Case (småord som "the"/"and"/"of" förblir gemena).'
+        : 'Mistral skriver om till meningscase (bara första bokstaven stor).';
+      setFieldNote(el, 'caps',
+        '<div style="color:#c02626;font-weight:600;">⚠️ Versalrubrik: Rubriken är skriven i VERSALER — bryter mot stilguiden.</div>' +
+        '<div style="margin-top:6px;">' +
+        '<button type="button" class="vseh-caps-fix-btn" data-lang="' + lang + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (rättar VERSALER)</button>' +
+        '<div style="font-size:11px;color:var(--vd-txt3);margin-top:3px;">' + esc(fixDesc) + '</div>' +
+        '</div>');
+    });
+    document.querySelectorAll('.vseh-caps-fix-btn').forEach(btn => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = '1';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Anropar Mistral…';
+        await rewriteTitleCasing(btn.dataset.lang);
+        btn.disabled = false;
+        btn.textContent = orig;
+      });
+    });
+  }
+
   // Beskrivningen är Draftail (rich text) — enda sättet i det här scriptet
   // att skriva till den (updateDraftail) gör det via en total nyskriven
   // ContentState, vilket plattar ut eventuell befintlig formatering (fetstil,
@@ -5148,6 +5221,7 @@
 
   function runEditPageChecks() {
     stripEmojisFromTitles();
+    checkTitleCasing();
     stripDescriptionEmoji();
     checkGuidelineIssues();
     checkIdenticalDescriptions();
