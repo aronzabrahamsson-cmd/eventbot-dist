@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.68.0
+// @version      7.69.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4332,6 +4332,22 @@
   const DATE_IN_TEXT_RE = new RegExp(
     '\\b\\d{1,2}(\\s*[-–]\\s*\\d{1,2})?\\s+(' + MONTH_NAMES_RE + ')\\b|' +
     '\\b(' + MONTH_NAMES_RE + ')\\s+\\d{1,2}(\\s*[-–]\\s*\\d{1,2})?\\b', 'i');
+  // Länkar skrivna rakt in i löptexten ("Boka på www.example.com" /
+  // "https://...") — länkar ska fyllas i i External website url-fältet,
+  // inte i beskrivningen (samma princip som pris/tid/datum ovan).
+  const URL_IN_TEXT_RE = /\b(?:https?:\/\/|www\.)[^\s<>"']+/i;
+  // Draftails RIKTIGA hyperlänkar (skapade via länk-knappen i editorn) syns
+  // inte nödvändigtvis som URL-text i den platta text readDraftailText()
+  // extraherar — ankartexten kan vara vad som helst, t.ex. "Läs mer här" —
+  // så de måste kollas separat mot Draft.js-JSON:ens egen entityMap.
+  function draftailHasLinkEntity(fieldId) {
+    const hidden = document.getElementById(fieldId);
+    if (!hidden || !hidden.value) return false;
+    try {
+      const data = JSON.parse(hidden.value);
+      return Object.values(data.entityMap || {}).some(e => e.type === 'LINK');
+    } catch { return false; }
+  }
   const WE_US_WORDS_SV = ['vi', 'oss', 'vår', 'vårt', 'våra'];
   const WE_US_WORDS_EN = ['we', 'us', 'our'];
   // Bekräftade 2026-09-18 (+ "vänner och familj"/"kompisgänget"/"unik
@@ -4359,6 +4375,7 @@
     'Datuminfo i fält': { frag: 'tar bort datumangivelser', instruction: 'Ta bort datumangivelser (datumet fylls redan i i datumfälten).' },
     'Platsinfo i fält': { frag: 'tar bort upprepat platsnamn', instruction: 'Ta bort upprepning av platsnamnet/venue (det fylls redan i i ett eget fält).' },
     'Adressinfo i fält': { frag: 'tar bort upprepad adress', instruction: 'Ta bort upprepning av adressen (den fylls redan i i ett eget fält).' },
+    'Länk i fält': { frag: 'tar bort länkar/webbadresser', instruction: 'Ta bort webbadresser/länkar ur texten (länkar fylls redan i i länkfältet).' },
     'Vi/oss-språk': { frag: 'skriver om "vi"/"oss" till tredje person', instruction: 'Skriv om "vi"/"oss"/"vår"-formuleringar till tredje person, så det inte ser ut som Visit Stockholm är arrangören.' },
     'Säljspråk': { frag: 'tar bort säljande formuleringar', instruction: 'Ta bort säljande/hypande formuleringar — håll tonen neutral och saklig.' }
   };
@@ -4451,6 +4468,12 @@
       }
       if (addressNorm.length > 4 && normText(text).includes(addressNorm)) {
         fieldIssues.push({ label: 'Adressinfo i fält', msg: 'Adressen ("' + addressRaw + '") nämns i texten — adress fylls redan i i det fältet och behöver inte upprepas i beskrivningen.' });
+      }
+      const urlHit = text.match(URL_IN_TEXT_RE);
+      if (urlHit) {
+        fieldIssues.push({ label: 'Länk i fält', msg: 'Möjlig länk i texten ("' + urlHit[0] + '") — länkar ska fyllas i i länkfältet (External website url), inte skrivas i beskrivningen.' });
+      } else if (draftailHasLinkEntity(fieldId)) {
+        fieldIssues.push({ label: 'Länk i fält', msg: 'En hyperlänk är inbäddad i texten — länkar ska fyllas i i länkfältet (External website url), inte länkas i beskrivningen.' });
       }
       const pronounRe = wordListRe(lang === 'sv' ? WE_US_WORDS_SV : WE_US_WORDS_EN);
       if (pronounRe.test(text)) {
