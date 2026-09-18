@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.69.0
+// @version      7.70.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4938,6 +4938,29 @@
 
   const GUIDE_TAG_RULES = GUIDE_TAG_ROWS.map(buildGuideRuleFromRow).filter(Boolean);
 
+  // Guide-titlarnas EN/SV-motsvarighet, byggd från GUIDE_TAG_RULES-rader som
+  // har BÅDA språken definierade (rader med bara ett språk — "ENDAST
+  // SVENSKA/ENGELSKA" — saknar en riktig motsvarighet att synka mot).
+  // Nycklarna är årtalsokänsliga (stripTrailingYear, samma som redan
+  // används vid sökning) eftersom den FAKTISKT taggade guidens titel kan ha
+  // ett annat/nyare årtal än det som råkar stå hårdkodat i GUIDE_TAG_ROWS.
+  const GUIDE_LANG_PAIRS = new Map();
+  GUIDE_TAG_RULES.forEach(rule => {
+    if (rule.guideEn && rule.guideSv) {
+      GUIDE_LANG_PAIRS.set(rule.guideEn.toLowerCase(), rule.guideSv);
+      GUIDE_LANG_PAIRS.set(rule.guideSv.toLowerCase(), rule.guideEn);
+    }
+  });
+
+  // related_guides-fältets dolda JSON följer samma [{"pk":…,"title":"…"}]-
+  // mönster som categories (bekräftat via fältkartläggningen 2026-09-19).
+  function currentRelatedGuideTitles() {
+    try {
+      const raw = JSON.parse(document.querySelector('input[name="related_guides"]')?.value || 'null');
+      return Array.isArray(raw) ? raw.map(g => g.title).filter(Boolean) : [];
+    } catch { return []; }
+  }
+
   const guideTagRulesFired = new Set();
   const guidesAlreadyTagged = new Set();
   // Fältets sök filtrerar redan bra på bara de första orden av guidetiteln —
@@ -4948,6 +4971,32 @@
   function guideSearchPrefix(title) {
     return title.split(/\s+/).slice(0, 2).join(' ');
   }
+
+  // Om EN av två guider som hör ihop som språkpar (t.ex. "Stockholm on a
+  // Budget"/"En budgetsemester i Stockholm") är taggad — oavsett om det var
+  // en GUIDE_TAG_RULES-träff eller ett manuellt val i fältet — taggas den
+  // andra automatiskt också (på begäran 2026-09-19). Körs som en del av
+  // runGuideTagRules() (samma spärr, se kommentaren nedan) så den aldrig
+  // skriver in i related_guides-fältet samtidigt som huvudloopen.
+  async function syncGuideLangPairs() {
+    const liveTitles = currentRelatedGuideTitles();
+    const liveKeys = new Set(liveTitles.map(t => stripTrailingYear(t).toLowerCase()));
+    for (const liveTitle of liveTitles) {
+      const counterpart = GUIDE_LANG_PAIRS.get(stripTrailingYear(liveTitle).toLowerCase());
+      if (!counterpart) continue;
+      const counterpartKey = counterpart.toLowerCase();
+      if (liveKeys.has(counterpartKey)) continue;
+      guidesAlreadyTagged.add(counterpartKey);
+      const ok = await selectAutocompleteValue('id_related_guides', counterpart, guideSearchPrefix(counterpart));
+      if (ok) {
+        vlog('EventEdit: Taggade "' + counterpart + '" automatiskt (språkpar till "' + liveTitle + '").', 'ok');
+        liveKeys.add(counterpartKey);
+      } else {
+        guidesAlreadyTagged.delete(counterpartKey);
+      }
+    }
+  }
+
   // runEditPageChecks() (och därmed denna funktion) körs var 1.5:e sekund
   // via setInterval — men en enda selectAutocompleteValue-inskrivning tar
   // flera sekunder (tecken-för-tecken-skrivning + upp till 4s väntan på
@@ -4989,6 +5038,7 @@
         }
         if (applied.length) vlog('EventEdit: Guideregel "' + rule.name + '" taggade ' + applied.map(g => '"' + g + '"').join('/') + '.', 'ok');
       }
+      await syncGuideLangPairs();
     } finally {
       guideTagRulesRunning = false;
       // Guide-autocompleten fokuserar/scrollar upprepade gånger ner mot
