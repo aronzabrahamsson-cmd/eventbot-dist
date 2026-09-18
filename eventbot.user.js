@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.65.0
+// @version      7.65.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -98,6 +98,12 @@
   const TM_BASE = 'https://app.ticketmaster.com/discovery/v2/events.json';
   const MISTRAL_CONV = 'https://api.mistral.ai/v1/conversations';
   const MISTRAL_CHAT = 'https://api.mistral.ai/v1/chat/completions';
+  // Delas av alla raka MISTRAL_CHAT-anrop som skriver om ETT fälts text
+  // (rewriteGuidelineIssues/rewriteTitleCasing/translateDescription) — sätts
+  // ALLTID som ett explicit "svara på X"-krav i systemprompten, inte bara
+  // underförstått via "behåll språket", så Mistral aldrig råkar lägga
+  // svensk text i det engelska fältet eller tvärtom (på begäran 2026-09-19).
+  function mistralLangName(lang) { return lang === 'en' ? 'engelska' : 'svenska'; }
   const STHLM = { lat: 59.3293, lng: 18.0686 };
   const DEFAULT_RADIUS = 25;
   // (SED_BASE definieras nedan, vid buildDedupIndex.)
@@ -4607,7 +4613,7 @@
       const payload = {
         model: 'mistral-small-latest',
         messages: [
-          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstexter. Skriv om texten användaren ger EXAKT enligt instruktionerna nedan, men ändra INGET annat — behåll språket, tonen och all annan sakinformation orörd. Svara ENDAST med den omskrivna texten — ingen kommentar, inga citattecken, ingen extra formatering.\n\n' +
+          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstexter. Skriv om texten användaren ger EXAKT enligt instruktionerna nedan, men ändra INGET annat — behåll tonen och all annan sakinformation orörd. Texten är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den omskrivna texten — ingen kommentar, inga citattecken, ingen extra formatering.\n\n' +
               instructions.map(i => '- ' + i).join('\n') },
           { role: 'user', content: text }
         ]
@@ -4676,7 +4682,7 @@
         model: 'mistral-small-latest',
         messages: [
           { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstitlar. ' + instruction +
-              ' Ändra ENDAST skiftläget — samma ord, samma ordning, samma skiljetecken. Svara ENDAST med den omskrivna titeln, ingen kommentar, inga citattecken.' },
+              ' Ändra ENDAST skiftläget — samma ord, samma ordning, samma skiljetecken. Titeln är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den omskrivna titeln, ingen kommentar, inga citattecken.' },
           { role: 'user', content: title }
         ]
       };
@@ -5133,13 +5139,13 @@
     const sourceText = readDraftailText('id_description_' + (targetLang === 'en' ? 'sv' : 'en'));
     const mistralKey = GM_getValue('mistral_key', '');
     if (!mistralKey) { vlog('Översättning: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
-    const targetName = targetLang === 'en' ? 'engelska' : 'svenska';
+    const targetName = mistralLangName(targetLang);
     try {
       vlog('Översättning: Skickar text till Mistral (→ ' + targetName + ')…');
       const payload = {
         model: 'mistral-small-latest',
         messages: [
-          { role: 'system', content: 'Du är en professionell översättare. Översätt EXAKT texten användaren ger till ' + targetName + '. Svara ENDAST med den översatta texten — ingen kommentar, inga citattecken, ingen extra formatering.' },
+          { role: 'system', content: 'Du är en professionell översättare. Översätt EXAKT texten användaren ger till ' + targetName + '. Svara UTESLUTANDE på ' + targetName + ', oavsett vad källtexten är skriven på. Svara ENDAST med den översatta texten — ingen kommentar, inga citattecken, ingen extra formatering.' },
           { role: 'user', content: sourceText }
         ]
       };
