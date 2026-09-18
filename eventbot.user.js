@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.57.3
+// @version      7.57.4
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1191,14 +1191,30 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  function setSearchValue(input, value) {
+  // 2026-09-18: bekräftat via loggen att en engångs-bulksättning av värdet
+  // (en `value =`-tilldelning + ett enda input/keyup) inte utlöste någon
+  // filtrering alls på related_guides — samma ofiltrerade lista dök upp för
+  // två helt olika söktexter. Troligen kräver den widgetens debounce/sök
+  // riktiga tecken-för-tecken-tangenttryckningar (rimligt för ett sök som
+  // går mot en verklig backend över hundratals guider, till skillnad från
+  // en liten förladdad kategorilista som kan filtrera synkront lokalt på
+  // ett enda input-event). Skriver därför in värdet tecken för tecken med
+  // riktiga keydown/input/keyup-event och en kort paus mellan varje, precis
+  // som en människa skulle skriva.
+  async function setSearchValue(input, value) {
     const proto = Object.getPrototypeOf(input);
     const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    const setVal = v => { if (setter) setter.call(input, v); else input.value = v; };
     input.focus();
-    if (setter) setter.call(input, value);
-    else input.value = value;
+    setVal("");
     input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: value.slice(-1) }));
+    for (const ch of value) {
+      setVal(input.value + ch);
+      input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: ch }));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: ch }));
+      await sleep(35);
+    }
   }
 
   function getSuggestionList(input) {
@@ -1242,7 +1258,7 @@
     if (!value) return false;
     const target = normalize(value);
     vlog('Autocomplete: skriver "' + value + '" i ' + fieldId + '…');
-    setSearchValue(input, value);
+    await setSearchValue(input, value);
     const items = await waitForSuggestions(input);
     if (!items.length) {
       vlog('Autocomplete: inga förslag dök upp för ' + fieldId + ' → "' + value + '" (väntade 4s, aria-owns hittades ' +
