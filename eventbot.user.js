@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.74.1
+// @version      7.75.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2554,7 +2554,7 @@
     p.className = mode;
     p.innerHTML = `
       <div id="vseh-head">
-        <div class="t">Eventbot — SBR-läge<span class="v">v${SCRIPT_VERSION}</span></div>
+        <div class="t">Eventbot SBR.se<span class="v">v${SCRIPT_VERSION}</span></div>
         <div id="vseh-headbtns">
           <button type="button" data-m="min" title="Minimera">▁</button>
           <button type="button" data-m="max" title="Maximera">▢</button>
@@ -2626,14 +2626,19 @@
 
         <div class="vseh-tabpane" data-pane="sbr-cal">
           <div class="vseh-fetch-h">Eventlista — manuell dedup-koll</div>
-          <div class="vseh-hint">Klistra in kopierad text direkt från SBR:s eventlista i adminet
-            (två rader per event: engelsk titel, sedan svensk titel + startdatum + ändringsdatum +
-            status). Överlappande inklistring är säker — event som redan finns i listan (samma
-            titlar + startdatum) uppdateras i stället för att dubbliceras. När du skapar ett utkast
-            via URL-fliken jämförs det automatiskt mot den här listan, med en varning i loggen om
+          <div class="vseh-hint">Står du på SBR:s eventlista just nu räcker det att klicka
+            "Hämta synliga event" — den läser tabellraderna som redan syns på sidan direkt,
+            ingen kopiering behövs. Klicka "nästa sida" i SBR:s egen paginering och klicka
+            knappen igen för varje sida. Klistra in-rutan nedan finns kvar som reserv om
+            sidstrukturen skulle se annorlunda ut någonstans (två rader per event: engelsk
+            titel, sedan svensk titel + startdatum + ändringsdatum + status). Överlappande
+            hämtning/inklistring är säker — event som redan finns i listan (samma titlar +
+            startdatum) uppdateras i stället för att dubbliceras. När du skapar ett utkast via
+            URL-fliken jämförs det automatiskt mot den här listan, med en varning i loggen om
             något liknar ett befintligt event.</div>
+          <button type="button" id="sbr-cal-fetch" style="margin-bottom:10px;">📋 Hämta synliga event</button>
           <textarea id="sbr-cal-paste" class="vseh-key" rows="5" style="width:100%; resize:vertical; font-family:inherit;"
-            placeholder="Klistra in från SBR:s eventlista…"></textarea>
+            placeholder="Eller klistra in från SBR:s eventlista…"></textarea>
           <button type="button" id="sbr-cal-import" style="margin-top:6px;">Importera inklistrad data</button>
           <div id="sbr-cal-body" style="margin-top:14px;"></div>
         </div>
@@ -2659,6 +2664,7 @@
     if (mb) mb.classList.add('on');
     document.querySelectorAll('#vseh-headbtns button[data-m]').forEach(b => b.addEventListener('click', () => setMode(b.dataset.m)));
     document.querySelectorAll('.vseh-tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+    restoreLastTab();
     $('vseh-logbtn').addEventListener('click', () => { const w = $('vseh-logwrap'); w.style.display = (w.style.display === 'none' || !w.style.display) ? 'flex' : 'none'; renderLog(); });
     { const lc = document.getElementById('vseh-logclose'); if (lc) lc.addEventListener('click', () => { $('vseh-logwrap').style.display = 'none'; }); }
     $('vseh-logcopy').addEventListener('click', async () => {
@@ -2692,6 +2698,7 @@
 
     loadSbrManualCal();
     renderSbrManualCal();
+    $('sbr-cal-fetch').addEventListener('click', fetchVisibleSbrEvents);
     $('sbr-cal-import').addEventListener('click', () => {
       const ta = $('sbr-cal-paste');
       if (!ta.value.trim()) { vlog('Eventlista: inget att importera — klistra in data först.', 'err'); return; }
@@ -2871,9 +2878,21 @@
     document.querySelectorAll('#vseh-headbtns button[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === m));
     GM_setValue('window_mode', m);
   }
+  // Sparar senast valda flik (delad nyckel för huvud-/SBR-läget, samma
+  // mönster som window_mode nedan — läges-flikarna har egna namn så det
+  // uppstår ingen förväxling) så den återställs vid omladdning istället för
+  // att alltid börja om på förstafliken (på begäran 2026-09-19).
   function switchTab(name) {
     document.querySelectorAll('.vseh-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
     document.querySelectorAll('.vseh-tabpane').forEach(pn => pn.classList.toggle('active', pn.dataset.pane === name));
+    GM_setValue('window_tab', name);
+  }
+  // Återställer senast valda flik om den finns bland de flikar som faktiskt
+  // byggdes för det aktuella läget — annars lämnas HTML-mallens egen
+  // förvalda flik orörd.
+  function restoreLastTab() {
+    const last = GM_getValue('window_tab', '');
+    if (last && document.querySelector('.vseh-tab[data-tab="' + last + '"]')) switchTab(last);
   }
   // Global status → loggen (ingen global statusrad längre).
   function setStatus(msg, kind) { vlog(msg, kind === 'err' ? 'err' : (kind === 'ok' ? 'ok' : 'info')); }
@@ -3291,9 +3310,10 @@
 
   function sbrCalKey(ev) { return normText(ev.title_en) + '@' + normText(ev.title_sv) + '@' + ev.start_date; }
 
-  function importSbrEventList(text) {
-    const parsed = parseSbrEventListPaste(text);
-    if (!parsed.length) { vlog('Eventlista: kunde inte tolka någon rad — kontrollera formatet.', 'err'); return; }
+  // Delad av både inklistrings- och DOM-hämtningsvägen (fetchVisibleSbrEvents
+  // nedan) — samma upsert-logik oavsett var raderna kom ifrån.
+  function mergeSbrCalEntries(parsed, sourceLabel) {
+    if (!parsed.length) return;
     const byKey = new Map(sbrManualCal.map(e => [sbrCalKey(e), e]));
     let added = 0, updated = 0;
     parsed.forEach(ev => {
@@ -3302,7 +3322,40 @@
       else { sbrManualCal.push(ev); byKey.set(key, ev); added++; }
     });
     saveSbrManualCal(); renderSbrManualCal();
-    vlog('Eventlista: ' + added + ' nya, ' + updated + ' uppdaterade av ' + parsed.length + ' tolkade rader (överlappande inklistring dublicerar inte).', 'ok');
+    vlog('Eventlista: ' + added + ' nya, ' + updated + ' uppdaterade av ' + parsed.length + ' ' + sourceLabel + ' (överlappande import dublicerar inte).', 'ok');
+  }
+
+  // Läser tabellraderna som redan finns i DOM:et på SBR:s eventlista-sida
+  // direkt — samma standardmarkup (tr[data-object-pk], td.field-<kolumn>)
+  // som Visit Stockholms draftlista redan använder framgångsrikt
+  // (extractRowData/runDraftvyCheck), eftersom båda sajterna körs på samma
+  // Wagtail-uppsättning för samma Event-snippet-typ. Ersätter det manuella
+  // markera+kopiera+växla-flik+klistra-in-flödet (~7-8 handgrepp per sida
+  // enligt användaren 2026-09-19) med ETT klick — kvar blir bara att klicka
+  // "nästa sida" i SBR:s egen paginering mellan varje hämtning.
+  function extractSbrRowData(row) {
+    const titleEnEl = row.querySelector('td.field-title_en .title-wrapper a, td.field-title_en a, td.field-title_en');
+    const title_en = (titleEnEl?.textContent || '').trim();
+    const title_sv = (row.querySelector('td.field-title_sv')?.textContent || '').trim();
+    if (!title_en && !title_sv) return null;
+    const start_date = parseSwedishDate((row.querySelector('td.field-start_date')?.textContent || '').trim()) || '';
+    const modified_raw = (row.querySelector('td.field-modified_at')?.textContent || '').trim();
+    const status = (row.querySelector('td.field-status')?.textContent || '').trim();
+    return { title_en, title_sv, start_date, modified_raw, status };
+  }
+
+  function fetchVisibleSbrEvents() {
+    const rows = [...document.querySelectorAll('tr[data-object-pk]')];
+    if (!rows.length) { vlog('Eventlista: hittade inga tabellrader på sidan — är du på SBR:s eventlista?', 'err'); return; }
+    const parsed = rows.map(extractSbrRowData).filter(Boolean);
+    if (!parsed.length) { vlog('Eventlista: hittade ' + rows.length + ' rad(er) men kunde inte läsa titel/datum ur någon — kolumnstrukturen kan se annorlunda ut här, klistra in manuellt istället.', 'err'); return; }
+    mergeSbrCalEntries(parsed, 'synliga rader på sidan');
+  }
+
+  function importSbrEventList(text) {
+    const parsed = parseSbrEventListPaste(text);
+    if (!parsed.length) { vlog('Eventlista: kunde inte tolka någon rad — kontrollera formatet.', 'err'); return; }
+    mergeSbrCalEntries(parsed, 'tolkade rader');
   }
 
   function renderSbrManualCal() {
@@ -3422,6 +3475,7 @@
   function wire() {
     document.querySelectorAll('#vseh-headbtns button[data-m]').forEach(b => b.addEventListener('click', () => setMode(b.dataset.m)));
     document.querySelectorAll('.vseh-tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+    restoreLastTab();
     $('vseh-logbtn').addEventListener('click', () => { const w = $('vseh-logwrap'); w.style.display = (w.style.display === 'none' || !w.style.display) ? 'flex' : 'none'; renderLog(); });
     { const lc = document.getElementById('vseh-logclose'); if (lc) lc.addEventListener('click', () => { $('vseh-logwrap').style.display = 'none'; }); }
     { const lcopy = document.getElementById('vseh-logcopy'); if (lcopy) lcopy.addEventListener('click', async () => {
