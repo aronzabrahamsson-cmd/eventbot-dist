@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.67.0
+// @version      7.68.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5024,6 +5024,27 @@
     vlog('EventEdit: Aktiverade adressfältet för geotaggning (riktig .focus()/.blur() + klick + tillfällig textändring).', 'ok');
   }
 
+  // Sätter statusfältet till "Publicerad" i stället för "Utkast" (på begäran
+  // 2026-09-19) — EN gång per sida (samma engångsmönster som
+  // linkTextAutofilled nedan), inte om och om igen varje poll-tick, så en
+  // medveten manuell återställning till Utkast inte omedelbart körs över.
+  // Matchar mot alternativets SYNLIGA TEXT ("publ...", dvs "Publicerad"/
+  // "Published") istället för ett gissat value-attribut, eftersom den
+  // faktiska lagrade strängen inte är bekräftad — bara fält-ID:t id_status
+  // är det (samma id_<fältnamn>-konvention som alla andra fält i formuläret).
+  let statusAutoPublished = false;
+  function autoPublishStatus() {
+    if (statusAutoPublished) return;
+    const el = document.getElementById('id_status');
+    if (!el || el.tagName !== 'SELECT') return;
+    const target = [...el.options].find(o => /publ/i.test(o.textContent));
+    if (!target) { vlog('EventEdit: Hittade inget "Publicerad"-alternativ i statusfältet (id_status).', 'err'); return; }
+    statusAutoPublished = true;
+    if (el.value === target.value) return;
+    simulateInput(el, target.value);
+    vlog('EventEdit: Ändrade status till "' + target.textContent.trim() + '".', 'ok');
+  }
+
   // Om description_en och description_sv är identiska (samma text i båda
   // fälten, dvs bara en översättning saknas) visas en översätt-knapp vid
   // VARDERA fältet. Fältets EGET språk antas vara MÅLSPRÅKET — knappen vid
@@ -5149,6 +5170,7 @@
 
   function runEditPageChecks() {
     activateAddressGeotag();
+    autoPublishStatus();
     stripEmojisFromTitles();
     checkTitleCasing();
     stripDescriptionEmoji();
