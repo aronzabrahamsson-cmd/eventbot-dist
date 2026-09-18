@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.72.0
+// @version      7.73.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4396,6 +4396,22 @@
     'Säljspråk': { frag: 'tar bort säljande formuleringar', instruction: 'Ta bort säljande/hypande formuleringar — håll tonen neutral och saklig.' }
   };
 
+  // En typspecifik emoji per avvikelse istället för samma ⚠️ upprepad på
+  // varje rad (på begäran 2026-09-19) — gör det lättare att skanna VILKEN
+  // sorts fel det är utan att läsa hela raden.
+  const GUIDELINE_ISSUE_EMOJI = {
+    'Prisinfo': '💰',
+    'Tidsinfo i fält': '🕐',
+    'Datuminfo i fält': '🕐',
+    'Platsinfo i fält': '📍',
+    'Adressinfo i fält': '📍',
+    'Länk i fält': '🔗',
+    'Kontaktuppgift i fält': '📞',
+    'Vi/oss-språk': '🗣️',
+    'Säljspråk': '📢',
+    'Möjlig otillåten eventtyp': '🚫'
+  };
+
   function fieldWrapper(el) {
     return (el && (el.closest('.w-field, .w-panel, [data-field]') || el.parentElement)) || null;
   }
@@ -4515,16 +4531,33 @@
       }
 
       const fixLabels = fieldIssues.map(i => i.label).filter(l => GUIDELINE_FIXES[l]);
-      let html = fieldIssues.map(i => '<div style="color:#c02626;font-weight:600;">⚠️ ' + esc(i.label) + ': ' + esc(i.msg) + '</div>').join('');
-      if (fixLabels.length) {
-        const frags = [...new Set(fixLabels.map(l => GUIDELINE_FIXES[l].frag))];
-        const fragText = frags.length > 1
-          ? frags.slice(0, -1).join(', ') + ' och ' + frags[frags.length - 1]
-          : frags[0];
-        html += '<div style="margin-top:6px;">' +
-          '<button type="button" class="vseh-guideline-fix-btn" data-lang="' + lang + '" data-fix="' + esc(fixLabels.join('|')) + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (åtgärdar riktlinjer)</button>' +
-          '<div style="font-size:11px;color:var(--vd-txt3);margin-top:3px;">Mistral ' + esc(fragText) + '.</div>' +
-          '</div>';
+      let html = '';
+      if (fieldIssues.length) {
+        // Samma paneltema som listen högst upp (var(--vd-*)) istället för
+        // röd text — svårläst enligt feedback — med en tunn klarröd ram
+        // runt hela rutan som varningssignal istället (på begäran
+        // 2026-09-19). Rubrik + en rad per fel, med en typspecifik emoji
+        // (GUIDELINE_ISSUE_EMOJI) och etiketten i fetstil, följt av
+        // förklaringen på egen rad i vanlig vikt (utan kolon).
+        html += '<div style="background:var(--vd-bg2);border:1px solid #ff3b3b;border-radius:7px;padding:8px 10px;color:var(--vd-txt);">' +
+          '<div style="font-weight:700;margin-bottom:6px;">⚠️ Åtgärder</div>' +
+          fieldIssues.map(i =>
+            '<div style="margin-bottom:6px;">' +
+            '<div style="font-weight:700;">' + (GUIDELINE_ISSUE_EMOJI[i.label] || '⚠️') + ' ' + esc(i.label) + '</div>' +
+            '<div>' + esc(i.msg) + '</div>' +
+            '</div>'
+          ).join('');
+        if (fixLabels.length) {
+          const frags = [...new Set(fixLabels.map(l => GUIDELINE_FIXES[l].frag))];
+          const fragText = frags.length > 1
+            ? frags.slice(0, -1).join(', ') + ' och ' + frags[frags.length - 1]
+            : frags[0];
+          html += '<div style="margin-top:6px;">' +
+            '<button type="button" class="vseh-guideline-fix-btn" data-lang="' + lang + '" data-fix="' + esc(fixLabels.join('|')) + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (åtgärdar riktlinjer)</button>' +
+            '<div style="font-size:11px;color:var(--vd-txt3);margin-top:3px;">Mistral ' + esc(fragText) + '.</div>' +
+            '</div>';
+        }
+        html += '</div>';
       }
       setFieldNote(el, 'guideline', html);
       allIssues.push(...fieldIssues);
