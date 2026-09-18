@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.73.1
+// @version      7.74.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -707,9 +707,37 @@
   // blir korrekt även om occurrence_count blir en underskattning.
   function parseNorticListPage(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
+    // OBS (2026-09-19): misstänkt orsak till att Nortic-hämtningen bara gav
+    // ~15 event (en enda sidas värde) trots att sajten har fler — hela
+    // sidräkningen hängde på EN specifik text ("Sida X av Y") i ETT
+    // specifikt element. Om Nortic bytt markup/formulering sedan detta
+    // bekräftades senast slår regexen fel och totalPages föll TYST
+    // tillbaka till 1, vilket stoppar hämtningen efter första sidan utan
+    // något synligt fel. Lägger nu till en reservlösning (högsta sidnumret
+    // bland ?page=N-länkar/paginerings-element) OCH loggar tydligt om
+    // båda sätten misslyckas, så framtida sajtändringar syns direkt i
+    // loggen istället för att bara ge ett för lågt antal event utan förklaring.
+    let totalPages = 1;
     const pagText = doc.querySelector('.BasePagination-condensed')?.textContent || '';
-    const pm = pagText.match(/Sida\s+\d+\s+av\s+(\d+)/);
-    const totalPages = pm ? parseInt(pm[1], 10) : 1;
+    const pm = pagText.match(/Sida\s+\d+\s+av\s+(\d+)/i);
+    if (pm) {
+      totalPages = parseInt(pm[1], 10);
+    } else {
+      const pageNums = [...doc.querySelectorAll('a[href*="page="], [class*="agination"] a, [class*="agination"] button')]
+        .map(el => {
+          const hrefMatch = (el.getAttribute('href') || '').match(/[?&]page=(\d+)/);
+          if (hrefMatch) return parseInt(hrefMatch[1], 10);
+          const n = parseInt((el.textContent || '').trim(), 10);
+          return Number.isFinite(n) ? n : null;
+        })
+        .filter(n => n && n > 0);
+      if (pageNums.length) {
+        totalPages = Math.max(...pageNums);
+        vlog('Nortic: kunde inte läsa "Sida X av Y" (troligen ändrad markup/text hos Nortic) — gissar ' + totalPages + ' sidor från paginerings-länkarna istället.', 'err');
+      } else {
+        vlog('Nortic: hittade ingen sidräknare alls (.BasePagination-condensed saknas och inga paginerings-länkar hittades) — hämtar bara sida 1. Nortic har troligen ändrat sin sid-markup, dubbelkolla mot sajten.', 'err');
+      }
+    }
     const now = new Date();
     const items = [];
     doc.querySelectorAll('a.BaseEventCard').forEach(a => {
@@ -2293,7 +2321,19 @@
       border-radius:12px; box-shadow:0 10px 40px rgba(0,0,0,.5);
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--vd-txt);
       display:flex; flex-direction:column; overflow:hidden; }
-    #vseh-panel.min { bottom:18px; right:18px; width:300px; }
+    /* Minimerat läge kollapsar till en smal, vertikal flik mot höger
+       fönsterkant (istället för en kort/bred remsa nertill) — på begäran
+       2026-09-19. Rubriktexten får inte plats i 46px bredd och döljs;
+       knapparna staplas vertikalt istället för i rad. */
+    #vseh-panel.min { top:50%; right:0; bottom:auto; width:46px; max-height:80vh;
+      transform:translateY(-50%); border-radius:10px 0 0 10px; }
+    #vseh-panel.min #vseh-head { flex-direction:column; padding:12px 6px; }
+    #vseh-panel.min #vseh-head .t { display:none; }
+    #vseh-panel.min #vseh-headbtns { flex-direction:column; }
+    #vseh-panel.min #vseh-headbtns .vseh-btn-gap { width:auto; height:10px; }
+    /* Minimera-knappens ikon roterad 90° i minimerat läge — visar att
+       panelen nu kollapsar åt sidan istället för nedåt. */
+    #vseh-panel.min #vseh-headbtns button[data-m="min"] { transform:rotate(90deg); }
     #vseh-panel.max { top:18px; bottom:18px; right:18px; width:440px; }
     #vseh-panel * { box-sizing:border-box; }
     #vseh-head { padding:11px 14px; background:var(--vd-bg3); color:var(--vd-txt); display:flex; align-items:center; justify-content:space-between; gap:8px; flex-shrink:0; border-bottom:1px solid var(--vd-line); }
