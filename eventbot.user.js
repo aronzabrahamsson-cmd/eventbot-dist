@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.70.0
+// @version      7.70.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4972,6 +4972,26 @@
     return title.split(/\s+/).slice(0, 2).join(' ');
   }
 
+  // window.scrollTo() räcker bara om DOKUMENTET/fönstret själv är det som
+  // scrollar — bekräftat 2026-09-19 att det INTE räckte (funktionen
+  // efterfrågades igen trots att window.scrollTo redan fanns), troligen för
+  // att Wagtails admin-skal har en EGEN scrollbar container runt huvud-
+  // innehållet (vanligt i moderna admin-gränssnitt med fast sidopanel),
+  // vilket window.scrollTo aldrig når. Går därför i stället uppåt i DOM:et
+  // från ett känt referenselement (fältet som faktiskt scrollas ner till
+  // under guide-inskrivningen) och nollställer VARJE förfader som just nu
+  // faktiskt ÄR scrollad (scrollTop > 0), oavsett vad den heter — löser
+  // både fallet "window scrollar" och "en inre div scrollar" utan att
+  // behöva gissa Wagtail-skalets specifika klass-/id-namn.
+  function scrollAllToTop(fromEl) {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    let node = fromEl;
+    while (node && node !== document.documentElement) {
+      if (node.scrollTop > 0) node.scrollTo({ top: 0, behavior: 'smooth' });
+      node = node.parentElement;
+    }
+  }
+
   // Om EN av två guider som hör ihop som språkpar (t.ex. "Stockholm on a
   // Budget"/"En budgetsemester i Stockholm") är taggad — oavsett om det var
   // en GUIDE_TAG_RULES-träff eller ett manuellt val i fältet — taggas den
@@ -5050,7 +5070,7 @@
       // långt innan det RIKTIGA pågående anropet faktiskt är klart.
       if (!autoScrolledAfterGuideTagging) {
         autoScrolledAfterGuideTagging = true;
-        window.scrollTo({ top: 0, behavior: 'smooth' });
+        scrollAllToTop(document.getElementById('id_related_guides') || document.body);
       }
     }
   }
