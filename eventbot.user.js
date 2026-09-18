@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.74.0
+// @version      7.74.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1049,21 +1049,20 @@
     // Adressbaserade kandidater LÄGGS TILL separat — fångar fall där titlarna
     // delar NOLL gemensamma ord (t.ex. helt olika språk: "Öl & Sprit..." vs
     // "Beer & Spirits...", där "Stockholm" är stoppord och inget annat delas).
-    // Sådana par hittar aldrig en kandidat via titel-tokens alls. AVSTÄNGD i
-    // strict-läge (draftvyn) — bekräftat 2026-09-19 (Sergels Torg/Kulturhuset
-    // Stadsteatern): en stor kulturbyggnad på en generisk adress kan ha FLERA
-    // helt orelaterade event samma dag, så exakt adress+datum UTAN NÅGOT
-    // titelstöd alls räcker inte som bevis där. Fallbacken finns egentligen
-    // för översättningspar från EXTERNA källor (Ticketmaster/Billetto mot
-    // kalendern på ett annat språk) — ett utkast skrivs redan på samma språk
-    // som kalendern, så en äkta dublett borde dela riktiga titel-ord ändå.
+    // HELT AVSTÄNGD (2026-09-19, gällde tidigare bara strict-läge/draftvyn,
+    // nu överallt) — bekräftat i BÅDA lägen att adress+datum utan NÅGOT
+    // titelstöd ger falska träffar för adresser med hög omsättning av helt
+    // orelaterade event (Sergels Torg/Kulturhuset Stadsteatern i draftvyn;
+    // Hornstulls strand 4/Debaser Nova, Styckmästargatan 10/Hus 7 i
+    // huvudflödet mot Nortic — "The Lemon Twigs" och "The Magic Numbers"
+    // matchade var sin HELT ANNAN spelning samma kväll på Debaser Nova).
+    // En falsk träff här är värre än en missad: den GÖMMER ett genuint nytt
+    // event ur "ej inlagda"-listan, medan en missad översättningsträff (den
+    // ursprungliga tanken med fallbacken) bara innebär att en människa
+    // snabbt känner igen dubbletten manuellt istället. addrOnlyCand hålls
+    // kvar (tom) hellre än att ta bort hela grenen nedan, ifall en säkrare
+    // variant (t.ex. även kräva matchande klockslag) läggs till senare.
     const addrOnlyCand = new Set();
-    if (!strict) {
-      const evAddrKey = normAddr(ev.address);
-      if (evAddrKey && dedupIndex.byAddr && dedupIndex.byAddr.has(evAddrKey)) {
-        dedupIndex.byAddr.get(evAddrKey).forEach(i => { if (!cand.has(i)) addrOnlyCand.add(i); });
-      }
-    }
 
     // STRIKTARE: BÅDE titel OCH plats måste likna, och paret ej avmarkerat —
     // UTOM när källan inte gav någon platsdata alls (t.ex. Billetto utan
