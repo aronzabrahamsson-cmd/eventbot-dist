@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.63.1
+// @version      7.64.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4436,6 +4436,22 @@
   const INELIGIBLE_EVENT_WORDS = ['happy hour', 'aw', 'rea', 'rabatt', 'erbjudande',
     'årsmöte', 'medlemsmöte', 'endast medlemmar', 'valmöte', 'torgmöte', 'partimöte'];
 
+  // De riktlinjeavvikelser som faktiskt går att ÅTGÄRDA med en textomskrivning
+  // (till skillnad från "Möjlig otillåten eventtyp"/"mässa", som är en
+  // redaktionell bedömningsfråga om eventet överhuvudtaget ska publiceras —
+  // ingen omskrivning kan lösa det). `frag` är den korta beskrivningen under
+  // knappen ("Mistral " + fragment + ", " + fragment + ..."), `instruction`
+  // är raden som faktiskt skickas till Mistral som redigeringsinstruktion.
+  const GUIDELINE_FIXES = {
+    'Prisinfo': { frag: 'tar bort prisuppgifter', instruction: 'Ta bort alla prisuppgifter/kronbelopp.' },
+    'Tidsinfo i fält': { frag: 'tar bort klockslag', instruction: 'Ta bort klockslag/tidsangivelser (tiden fylls redan i i datumfälten).' },
+    'Datuminfo i fält': { frag: 'tar bort datumangivelser', instruction: 'Ta bort datumangivelser (datumet fylls redan i i datumfälten).' },
+    'Platsinfo i fält': { frag: 'tar bort upprepat platsnamn', instruction: 'Ta bort upprepning av platsnamnet/venue (det fylls redan i i ett eget fält).' },
+    'Adressinfo i fält': { frag: 'tar bort upprepad adress', instruction: 'Ta bort upprepning av adressen (den fylls redan i i ett eget fält).' },
+    'Vi/oss-språk': { frag: 'skriver om "vi"/"oss" till tredje person', instruction: 'Skriv om "vi"/"oss"/"vår"-formuleringar till tredje person, så det inte ser ut som Visit Stockholm är arrangören.' },
+    'Säljspråk': { frag: 'tar bort säljande formuleringar', instruction: 'Ta bort säljande/hypande formuleringar — håll tonen neutral och saklig.' }
+  };
+
   function fieldWrapper(el) {
     return (el && (el.closest('.w-field, .w-panel, [data-field]') || el.parentElement)) || null;
   }
@@ -4543,12 +4559,67 @@
         }
       }
 
-      setFieldNote(el, 'guideline', fieldIssues.length
-        ? fieldIssues.map(i => '<div style="color:#c02626;font-weight:600;">⚠️ ' + esc(i.label) + ': ' + esc(i.msg) + '</div>').join('')
-        : '');
+      const fixLabels = fieldIssues.map(i => i.label).filter(l => GUIDELINE_FIXES[l]);
+      let html = fieldIssues.map(i => '<div style="color:#c02626;font-weight:600;">⚠️ ' + esc(i.label) + ': ' + esc(i.msg) + '</div>').join('');
+      if (fixLabels.length) {
+        const frags = [...new Set(fixLabels.map(l => GUIDELINE_FIXES[l].frag))];
+        const fragText = frags.length > 1
+          ? frags.slice(0, -1).join(', ') + ' och ' + frags[frags.length - 1]
+          : frags[0];
+        html += '<div style="margin-top:6px;">' +
+          '<button type="button" class="vseh-guideline-fix-btn" data-lang="' + lang + '" data-fix="' + esc(fixLabels.join('|')) + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (åtgärdar riktlinjer)</button>' +
+          '<div style="font-size:11px;color:var(--vd-txt3);margin-top:3px;">Mistral ' + esc(fragText) + '.</div>' +
+          '</div>';
+      }
+      setFieldNote(el, 'guideline', html);
       allIssues.push(...fieldIssues);
     });
     renderGuidelineSummary(allIssues);
+    document.querySelectorAll('.vseh-guideline-fix-btn').forEach(btn => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = '1';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Anropar Mistral…';
+        await rewriteGuidelineIssues(btn.dataset.lang, btn.dataset.fix.split('|'));
+        btn.disabled = false;
+        btn.textContent = orig;
+      });
+    });
+  }
+
+  // Skickar EXAKT de riktlinjeavvikelser som upptäckts (GUIDELINE_FIXES) som
+  // redigeringsinstruktioner till Mistral — samma raka chat/completions-anrop
+  // som translateDescription() redan använder, inte den JSON-baserade
+  // agenten (rewriteWithAgent), eftersom detta bara ska ändra EXAKT det som
+  // flaggats och inget annat.
+  async function rewriteGuidelineIssues(lang, fixLabels) {
+    const fieldId = 'id_description_' + lang;
+    const text = readDraftailText(fieldId);
+    if (!text) return;
+    const mistralKey = GM_getValue('mistral_key', '');
+    if (!mistralKey) { vlog('Riktlinje-omskrivning: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
+    const instructions = fixLabels.map(l => GUIDELINE_FIXES[l]?.instruction).filter(Boolean);
+    if (!instructions.length) return;
+    try {
+      vlog('Riktlinje-omskrivning: Skickar text till Mistral (' + fieldId + ')…');
+      const payload = {
+        model: 'mistral-small-latest',
+        messages: [
+          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstexter. Skriv om texten användaren ger EXAKT enligt instruktionerna nedan, men ändra INGET annat — behåll språket, tonen och all annan sakinformation orörd. Svara ENDAST med den omskrivna texten — ingen kommentar, inga citattecken, ingen extra formatering.\n\n' +
+              instructions.map(i => '- ' + i).join('\n') },
+          { role: 'user', content: text }
+        ]
+      };
+      const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
+      const rewritten = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+      if (!rewritten) throw new Error('Tomt svar från Mistral');
+      await updateDraftail(fieldId, rewritten.trim());
+      vlog('Riktlinje-omskrivning: Klar (' + fieldId + ').', 'ok');
+    } catch (e) {
+      vlog('Riktlinje-omskrivning: Fel — ' + e.message, 'err');
+    }
   }
 
   // Sammanfattningsrad i listen: "Prisinfo, tidsinfo i fält och 2 avvikelser
