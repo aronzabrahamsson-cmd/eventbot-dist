@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.59.0
+// @version      7.60.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4219,7 +4219,8 @@
         const bar = document.createElement('div');
         bar.id = 'vseh-edit-bar';
         bar.innerHTML = `
-          <button id="vseh-rewrite-btn" type="button">Omskriv med Mistral</button>
+          <span id="vseh-issues-summary" style="color:#e0a052;font-weight:600;"></span>
+          <button id="vseh-rewrite-btn" type="button">Skriv om 🤖 (mistral)</button>
           <span id="vseh-rewrite-status"></span>
           <button type="button" id="vseh-edit-logbtn" title="Visa logg">📋 Logg</button>
         `;
@@ -4262,7 +4263,7 @@
     const resultEl = document.getElementById('vseh-rewrite-result');
     const btn = document.getElementById('vseh-rewrite-btn');
     if (btn) btn.disabled = true;
-    if (statusEl) statusEl.textContent = 'Hämtar fältdata…';
+    if (statusEl) statusEl.textContent = 'Anropar Mistral…';
     if (resultEl) resultEl.style.display = 'none';
 
     try {
@@ -4352,6 +4353,23 @@
   // exakt samma värde den läste.
   const PRICE_WORD_RE = /\b(sek|kr|eur)\b|€/gi;
   const EMOJI_RE = /\p{Extended_Pictographic}/gu;
+  // Klockslag i löptext ("18:00", "kl 19", "kl. 19", "klockan 20") — tid ska
+  // stå i datumfälten, inte i beskrivningen.
+  const TIME_IN_TEXT_RE = /\b\d{1,2}[:.]\d{2}\b|\bkl\.?\s?\d{1,2}\b|\bklockan\b/i;
+  const WE_US_WORDS_SV = ['vi', 'oss', 'vår', 'vårt', 'våra'];
+  const WE_US_WORDS_EN = ['we', 'us', 'our'];
+  // Bekräftade 2026-09-18 (+ "vänner och familj"/"kompisgänget"/"unik
+  // upplevelse"/"missa inte chansen" tillagda på begäran).
+  const HYPE_WORDS = ['fantastisk', 'magisk', 'underbar', 'vänner och familj',
+    'kompisgänget', 'unik upplevelse', 'missa inte chansen'];
+  // Nyckelord för "Vi publicerar inte"-kategorier ur riktlinjerna — bara de
+  // som bedömdes tillräckligt träffsäkra att flagga med enkla nyckelord
+  // (privata boka-själv-upplägg och "utanför Stockholmsregionen" är för
+  // otillförlitliga att fånga så här, och hoppas därför över helt).
+  // "mässa" hanteras separat (se checkGuidelineIssues) eftersom ordet också
+  // är helt legitimt för kategorin Fairs.
+  const INELIGIBLE_EVENT_WORDS = ['happy hour', 'aw', 'rea', 'rabatt', 'erbjudande',
+    'årsmöte', 'medlemsmöte', 'endast medlemmar', 'valmöte', 'torgmöte', 'partimöte'];
 
   function fieldWrapper(el) {
     return (el && (el.closest('.w-field, .w-panel, [data-field]') || el.parentElement)) || null;
@@ -4381,18 +4399,71 @@
     note.innerHTML = html;
   }
 
-  // Flaggar (bara läser, ändrar inget) om "sek"/"kr"/"eur" (som egna ord) eller
-  // "€" syns i beskrivningen — enligt riktlinjerna ska priser inte stå där.
-  function checkPriceMentions() {
-    ['id_description_en', 'id_description_sv'].forEach(fieldId => {
-      const hidden = document.getElementById(fieldId);
-      const hits = readDraftailText(fieldId).match(PRICE_WORD_RE);
-      const words = hits ? [...new Set(hits.map(h => h.toLowerCase()))] : [];
-      setFieldNote(hidden, 'price', words.length
-        ? '<span style="color:#c02626;font-weight:600;">⚠️ Möjlig prisuppgift i texten (' + esc(words.join(', ')) +
-          ') — priser ska enligt riktlinjerna inte stå i beskrivningen.</span>'
+  // Ordgräns-regex av en lista fraser (kan innehålla mellanslag) — bygger
+  // en enda regex av typen /\b(fras1|fras2|...)\b/i, escapead för specialtecken.
+  function wordListRe(words) {
+    return new RegExp('\\b(' + words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')\\b', 'i');
+  }
+
+  // Läsande granskning enligt riktlinjerna, bara nyckelordsbaserad (inga
+  // språkbedömningar) för att hålla sig träffsäker och billig att köra i en
+  // poll. Sätter röd text vid respektive fält (setFieldNote, key='guideline')
+  // OCH returnerar en samlad lista för listens sammanfattningsrad.
+  function checkGuidelineIssues() {
+    const categoriesLower = currentCategoryTitles().map(c => c.toLowerCase());
+    const allIssues = [];
+    ['en', 'sv'].forEach(lang => {
+      const fieldId = 'id_description_' + lang;
+      const el = document.getElementById(fieldId);
+      const text = readDraftailText(fieldId);
+      if (!text) { setFieldNote(el, 'guideline', ''); return; }
+      const lower = text.toLowerCase();
+      const fieldIssues = [];
+
+      const priceHits = text.match(PRICE_WORD_RE);
+      if (priceHits && priceHits.length) {
+        fieldIssues.push({ label: 'Prisinfo', msg: 'Möjlig prisuppgift (' + [...new Set(priceHits.map(h => h.toLowerCase()))].join(', ') + ') — hänvisa till arrangörens sida istället.' });
+      }
+      if (TIME_IN_TEXT_RE.test(text)) {
+        fieldIssues.push({ label: 'Tidsinfo i fält', msg: 'Möjlig tidsangivelse i texten — tid ska fyllas i i datumfälten, inte skrivas i beskrivningen.' });
+      }
+      const pronounRe = wordListRe(lang === 'sv' ? WE_US_WORDS_SV : WE_US_WORDS_EN);
+      if (pronounRe.test(text)) {
+        fieldIssues.push({ label: 'Vi/oss-språk', msg: 'Undvik "vi"/"oss" — skriv i tredje person så det inte ser ut som Visit Stockholm är arrangören.' });
+      }
+      if (lang === 'sv') {
+        const hypeHit = HYPE_WORDS.find(w => lower.includes(w.toLowerCase()));
+        if (hypeHit) {
+          fieldIssues.push({ label: 'Säljspråk', msg: 'Säljande formulering ("' + hypeHit + '") — håll beskrivningen neutral och saklig.' });
+        }
+        const ineligibleHit = INELIGIBLE_EVENT_WORDS.find(w => wordListRe([w]).test(text));
+        if (ineligibleHit) {
+          fieldIssues.push({ label: 'Möjlig otillåten eventtyp', msg: '"' + ineligibleHit + '" kan tyda på en eventtyp vi inte publicerar (rabatt/erbjudande, förenings- eller partimöte) — dubbelkolla mot riktlinjerna.' });
+        }
+        if (/\bmässa\b/i.test(text) && !categoriesLower.includes('fairs')) {
+          fieldIssues.push({ label: 'Möjlig otillåten eventtyp', msg: '"mässa" utan kategorin Fairs kan syfta på en religiös gudstjänst, vilket vi inte publicerar.' });
+        }
+      }
+
+      setFieldNote(el, 'guideline', fieldIssues.length
+        ? fieldIssues.map(i => '<div style="color:#c02626;font-weight:600;">⚠️ ' + esc(i.label) + ': ' + esc(i.msg) + '</div>').join('')
         : '');
+      allIssues.push(...fieldIssues);
     });
+    renderGuidelineSummary(allIssues);
+  }
+
+  // Sammanfattningsrad i listen: "Prisinfo, tidsinfo i fält och 2 avvikelser
+  // till." — unika etiketter (samma flagga på båda språken räknas en gång),
+  // full mening bara för de två första, resten som en räknad klump.
+  function renderGuidelineSummary(issues) {
+    const el = document.getElementById('vseh-issues-summary');
+    if (!el) return;
+    const labels = [...new Set(issues.map(i => i.label))];
+    if (!labels.length) { el.textContent = ''; return; }
+    const shown = labels.slice(0, 2).map((l, i) => i === 0 ? l : l.charAt(0).toLowerCase() + l.slice(1));
+    const rest = labels.length - shown.length;
+    el.textContent = '⚠️ ' + shown.join(', ') + (rest > 0 ? ' och ' + rest + ' avvikelser till.' : '.');
   }
 
   // Tar bort emojis direkt ur title_en/title_sv (vanliga textfält — säkert
@@ -4624,7 +4695,6 @@
     ['Eat & Drink+Fairs', null, null, 'Delicious events in Stockholm', 'Smakfulla evenemang i Stockholm'],
     [null, 'slaktkyrkan, fållan, slaktis, slakthusområdet', null, 'Sunrise over Slakthusområdet', 'Solen går upp över Slakthusområdet'],
     [null, 'Golf', null, 'Tee Up On Your Vacation', 'Spela golf på semestern'],
-    [null, 'music', null, 'Stockholm ❤️ Music', 'Stockholm ❤️ musik'],
     [null, 'nörd, "tv-spel", rollspel, fantasy, "sci-fi", "cosplay"', null, 'Stockholm ❤️ Nerds', 'Stockholm ❤️ Nördar'],
     [null, 'teenager', null, "The Teenager's Guide to Stockholm", 'Stockholm för tonårsfamiljen'],
     ['Guided tours & Lectures', 'Film', null, 'Stockholm in the Movies', 'Stockholm i filmens värld'],
@@ -4697,28 +4767,151 @@
     }
   }
 
-  // Geotaggning aktiveras tydligen av något som lyssnar på interaktion med
-  // adressfältet (bekräftat manuellt arbetssätt: klicka i fältet, skriv ett
-  // mellanslag, radera det). Återskapar exakt det med simulateInput — sätter
-  // ett tillfälligt värde (utlöser input/change), sätter sedan tillbaka det
-  // URSPRUNGLIGA värdet (utlöser input/change igen) — adressen ändras aldrig
-  // på riktigt, bara de händelser sidan lyssnar på.
+  // Geotaggning aktiveras av något som lyssnar på INTERAKTION med
+  // adressfältet — bekräftat 2026-09-18 att bara simulerad textändring
+  // (utan riktiga musklick) inte räcker (kartan aktiverades aldrig).
+  // Skickar därför riktiga mousedown/mouseup/click-event innan samma
+  // fokus+tillfällig textändring+återställning som förut.
   let addressActivated = false;
   function activateAddressGeotag() {
     if (addressActivated) return;
     const el = document.getElementById('id_address');
     if (!el || !el.value) return;
     addressActivated = true;
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     const original = el.value;
     simulateInput(el, original + ' ');
     simulateInput(el, original);
-    vlog('EventEdit: Aktiverade adressfältet för geotaggning.', 'ok');
+    vlog('EventEdit: Aktiverade adressfältet för geotaggning (klick + tillfällig textändring).', 'ok');
+  }
+
+  // Om description_en och description_sv är identiska (samma text i båda
+  // fälten, dvs bara en översättning saknas) visas en översätt-knapp vid
+  // VARDERA fältet. Fältets EGET språk antas vara MÅLSPRÅKET — knappen vid
+  // engelska fältet antar alltså att den delade texten egentligen är
+  // svenska och översätter den till engelska (och tvärtom), eftersom
+  // scriptet inte kan veta vilket av de två identiska fälten som "är fel".
+  function checkIdenticalDescriptions() {
+    const enText = readDraftailText('id_description_en').trim();
+    const svText = readDraftailText('id_description_sv').trim();
+    const identical = !!enText && !!svText && enText.toLowerCase() === svText.toLowerCase();
+    ['en', 'sv'].forEach(lang => {
+      const el = document.getElementById('id_description_' + lang);
+      if (!identical) { setFieldNote(el, 'translate', ''); return; }
+      const label = lang === 'en' ? 'engelska' : 'svenska';
+      setFieldNote(el, 'translate',
+        '<span style="color:#4a9fe0;">🌐 Samma text i båda fälten — </span>' +
+        '<button type="button" class="vseh-translate-btn" data-lang="' + lang + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Översätt till ' + label + '</button>');
+    });
+    document.querySelectorAll('.vseh-translate-btn').forEach(btn => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = '1';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true; btn.textContent = 'Översätter…';
+        await translateDescription(btn.dataset.lang);
+      });
+    });
+  }
+
+  // Mistral har ingen egen "översättnings-endpoint" — det är samma
+  // chat/completions-anrop som resten av scriptet redan använder (MISTRAL_CHAT),
+  // bara med en översättningsprompt istället för agentens egna instruktioner
+  // (agenten är byggd för att skriva om/skapa event, inte för ren översättning,
+  // så vi går förbi den och kör en enkel, fristående modell direkt).
+  async function translateDescription(targetLang) {
+    const sourceText = readDraftailText('id_description_' + (targetLang === 'en' ? 'sv' : 'en'));
+    const mistralKey = GM_getValue('mistral_key', '');
+    if (!mistralKey) { vlog('Översättning: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
+    const targetName = targetLang === 'en' ? 'engelska' : 'svenska';
+    try {
+      vlog('Översättning: Skickar text till Mistral (→ ' + targetName + ')…');
+      const payload = {
+        model: 'mistral-small-latest',
+        messages: [
+          { role: 'system', content: 'Du är en professionell översättare. Översätt EXAKT texten användaren ger till ' + targetName + '. Svara ENDAST med den översatta texten — ingen kommentar, inga citattecken, ingen extra formatering.' },
+          { role: 'user', content: sourceText }
+        ]
+      };
+      const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
+      const translated = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+      if (!translated) throw new Error('Tomt svar från Mistral');
+      await updateDraftail('id_description_' + targetLang, translated.trim());
+      vlog('Översättning: Klar (' + targetName + ').', 'ok');
+    } catch (e) {
+      vlog('Översättning: Fel — ' + e.message, 'err');
+    }
+  }
+
+  // Andrahandssajter för biljetter (sekundärmarknad) — vi länkar bara till
+  // arrangörens EGEN officiella försäljning enligt riktlinjerna. Sparande
+  // spärras (submit-guard nedan) tills länken ändras ELLER "URL granskad"
+  // klickas för just den URL:en (manuell överstyrning av en falsk positiv).
+  const RESALE_DOMAINS = ['viagogo', 'evenemangsbiljetter.se', 'stubhub', 'biljett24', 'biljettnu', 'biljettshop'];
+  let resaleReviewedUrl = null;
+  let resaleBlocked = false;
+  function checkResaleUrl() {
+    const el = document.getElementById('id_external_website_url');
+    if (!el) return;
+    const url = (el.value || '').toLowerCase();
+    const hit = RESALE_DOMAINS.find(d => url.includes(d));
+    if (!hit) { resaleBlocked = false; setFieldNote(el, 'resale', ''); return; }
+    if (url === resaleReviewedUrl) {
+      resaleBlocked = false;
+      setFieldNote(el, 'resale', '<span style="color:#1f7a4d;font-weight:600;">✅ URL granskad och godkänd trots träff på "' + esc(hit) + '".</span>');
+      return;
+    }
+    resaleBlocked = true;
+    setFieldNote(el, 'resale',
+      '<div style="color:#c02626;font-weight:600;">🚫 Möjlig andrahandssajt (biljettåterförsäljare) i länken: "' + esc(hit) + '". ' +
+      'Vi länkar bara till arrangörens officiella biljettförsäljning — sparande är spärrat. ' +
+      '<button type="button" id="vseh-resale-ok-btn" style="font-size:12px;padding:2px 8px;cursor:pointer;">URL granskad ✅</button></div>');
+    const btn = document.getElementById('vseh-resale-ok-btn');
+    if (btn) btn.onclick = () => { resaleReviewedUrl = url; checkResaleUrl(); };
+  }
+  function installResaleSubmitGuard() {
+    const form = document.querySelector('form');
+    if (!form || form.dataset.resaleGuardInstalled) return;
+    form.dataset.resaleGuardInstalled = '1';
+    form.addEventListener('submit', e => {
+      if (!resaleBlocked) return;
+      e.preventDefault();
+      e.stopPropagation();
+      vlog('EventEdit: Sparande blockerat — möjlig andrahandssajt i länken. Ändra URL:en eller klicka "URL granskad".', 'err');
+      alert('Länken pekar mot en möjlig andrahandssajt för biljetter. Ändra länken eller klicka "URL granskad" bredvid fältet innan du sparar.');
+    }, true);
+  }
+
+  // Fyller bara i om fältet är tomt (rör aldrig text du redan skrivit).
+  // "Biljetter / Tickets" om länken går till en känd biljettleverantör ELLER
+  // kategorin är Stage & Film — annars "Mer information / More information"
+  // om en länk finns men fältet står tomt.
+  const TICKET_VENDOR_DOMAINS = ['ticketmaster.se', 'axs.com', 'eventim.se', 'nortic.se', 'tickster.com',
+    'kulturbiljetter.se', 'billetto.se', 'tixly.com', 'kulturcentralen.nu', 'showtic.se', 'wannado.se',
+    'ticketco.se', 'eventix.io', 'stockholmlive.se', 'gotevent.se'];
+  let linkTextAutofilled = false;
+  function autofillLinkText() {
+    if (linkTextAutofilled) return;
+    const urlEl = document.getElementById('id_external_website_url');
+    const textEl = document.getElementById('id_external_website_url_text');
+    if (!urlEl || !textEl || textEl.value.trim() || !urlEl.value.trim()) return;
+    const url = urlEl.value.toLowerCase();
+    const isTicketVendor = TICKET_VENDOR_DOMAINS.some(d => url.includes(d));
+    const isStageFilm = currentCategoryTitles().map(c => c.toLowerCase()).includes('stage & film');
+    linkTextAutofilled = true;
+    const text = (isTicketVendor || isStageFilm) ? 'Biljetter / Tickets' : 'Mer information / More information';
+    simulateInput(textEl, text);
+    vlog('EventEdit: Fyllde i länktext "' + text + '".', 'ok');
   }
 
   function runEditPageChecks() {
     stripEmojisFromTitles();
     stripDescriptionEmoji();
-    checkPriceMentions();
+    checkGuidelineIssues();
+    checkIdenticalDescriptions();
+    checkResaleUrl();
+    autofillLinkText();
     runGuideTagRules().catch(() => {});
   }
 
@@ -4726,6 +4919,7 @@
     vlog('EventEdit: Initierar automatiska kontroller på edit-sidan');
     activateAddressGeotag();
     initEventChecker();
+    installResaleSubmitGuard();
     runEditPageChecks();
     // Formuläret uppdaterar sina dolda fält utan DOM-mutationer vi enkelt kan
     // observera (Draftails onChange, autocompletens val-klick) — en enkel
