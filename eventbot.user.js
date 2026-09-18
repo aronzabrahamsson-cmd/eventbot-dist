@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.62.0
+// @version      7.62.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1061,14 +1061,22 @@
     // Adress+datum-baserad match: fångar par där titlarna delar NOLL ord
     // (olika språk) och därför aldrig blev kandidater via titel-tokens.
     // Kräver nästan perfekt adressmatchning (vSim≥0.9) OCH att minst ett av
-    // källans datum träffar kalenderradens datum/spann — starkt oberoende
+    // källans datum träffar kalenderradens datum EXAKT — starkt oberoende
     // bevis som inte är beroende av titelspråket alls.
+    // Spann-rader (row.isSpan) räknas MEDVETET INTE som datumträff här —
+    // bekräftat 2026-09-19 (Hötorget 13-15/"Haymarket by Scandic"): en
+    // byggnad med flera fristående venues på samma gatuadress kan ha egna,
+    // helt orelaterade flermånaderslånga spann (t.ex. en löpande
+    // "Jazz Session"-serie och en separat "An Oyster Affair"-serie) som då
+    // skulle träffa NÄSTAN VILKET DATUM SOM HELST för ett helt tredje,
+    // orelaterat event på samma adress. Utan något titelstöd alls är ett
+    // brett spann för svagt som ensamt bevis — exakt dag mot dag krävs.
     addrOnlyCand.forEach(i => {
       const row = dedupIndex.rows[i];
       if (isDismissed(ev, row)) return;
       const vSim = placeSim(ev.venue_name, ev.address, row.venue_name, row.address);
       if (vSim < 0.9) return;
-      const dateHit = evDates.some(d => (!row.isSpan && row.start === d) || (row.isSpan && inRange(d, row.start, row.end)));
+      const dateHit = evDates.some(d => !row.isSpan && row.start === d);
       if (!dateHit) return;
       if (!tvRows.includes(row)) {
         tvRows.push(row);
