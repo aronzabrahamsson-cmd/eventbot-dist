@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.70.1
+// @version      7.71.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4348,6 +4348,14 @@
       return Object.values(data.entityMap || {}).some(e => e.type === 'LINK');
     } catch { return false; }
   }
+  // Kontaktuppgifter (telefon/mejl) i löptext — riktlinjerna kräver att man
+  // hänvisar till arrangörens egen sida istället för att skriva ut direkt
+  // kontaktväg (samma princip som pris/länk ovan). Telefonregexen kräver
+  // ledande "+46"/"0" (svenskt riktnummer/landsnummer) och minst 7 siffror
+  // totalt (mellanslag/bindestreck tillåtna som separatorer) för att inte
+  // träffa datum ("23-24 oktober"), tider ("09:00-17:00") eller postnummer.
+  const PHONE_IN_TEXT_RE = /(?:\+?46[\s-]?|\b0)\d(?:[\s-]?\d){6,9}\b/;
+  const EMAIL_IN_TEXT_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
   const WE_US_WORDS_SV = ['vi', 'oss', 'vår', 'vårt', 'våra'];
   const WE_US_WORDS_EN = ['we', 'us', 'our'];
   // Bekräftade 2026-09-18 (+ "vänner och familj"/"kompisgänget"/"unik
@@ -4376,6 +4384,7 @@
     'Platsinfo i fält': { frag: 'tar bort upprepat platsnamn', instruction: 'Ta bort upprepning av platsnamnet/venue (det fylls redan i i ett eget fält).' },
     'Adressinfo i fält': { frag: 'tar bort upprepad adress', instruction: 'Ta bort upprepning av adressen (den fylls redan i i ett eget fält).' },
     'Länk i fält': { frag: 'tar bort länkar/webbadresser', instruction: 'Ta bort webbadresser/länkar ur texten (länkar fylls redan i i länkfältet).' },
+    'Kontaktuppgift i fält': { frag: 'tar bort telefonnummer/mejladresser', instruction: 'Ta bort telefonnummer och mejladresser ur texten — hänvisa till arrangörens egen sida istället.' },
     'Vi/oss-språk': { frag: 'skriver om "vi"/"oss" till tredje person', instruction: 'Skriv om "vi"/"oss"/"vår"-formuleringar till tredje person, så det inte ser ut som Visit Stockholm är arrangören.' },
     'Säljspråk': { frag: 'tar bort säljande formuleringar', instruction: 'Ta bort säljande/hypande formuleringar — håll tonen neutral och saklig.' }
   };
@@ -4474,6 +4483,11 @@
         fieldIssues.push({ label: 'Länk i fält', msg: 'Möjlig länk i texten ("' + urlHit[0] + '") — länkar ska fyllas i i länkfältet (External website url), inte skrivas i beskrivningen.' });
       } else if (draftailHasLinkEntity(fieldId)) {
         fieldIssues.push({ label: 'Länk i fält', msg: 'En hyperlänk är inbäddad i texten — länkar ska fyllas i i länkfältet (External website url), inte länkas i beskrivningen.' });
+      }
+      const phoneHit = text.match(PHONE_IN_TEXT_RE);
+      const emailHit = text.match(EMAIL_IN_TEXT_RE);
+      if (phoneHit || emailHit) {
+        fieldIssues.push({ label: 'Kontaktuppgift i fält', msg: 'Möjlig kontaktuppgift i texten ("' + (phoneHit || emailHit)[0] + '") — hänvisa till arrangörens sida istället för telefonnummer/mejladress i beskrivningen.' });
       }
       const pronounRe = wordListRe(lang === 'sv' ? WE_US_WORDS_SV : WE_US_WORDS_EN);
       if (pronounRe.test(text)) {
@@ -4873,6 +4887,11 @@
     ['Exhibitions', 'historia', null, 'Museums for History Buffs in Stockholm', 'Museer för historieintresserade i Stockholm'],
     ['Exhibitions', 'forskning, vetenskap, tech', null, 'Science Museums in Stockholm', 'Museer för vetgiriga'],
     [null, 'film festival, filmfestival', null, 'At the Movies: Cinemas and Film Festivals Stockholm', 'Mysiga biografer och filmfestivaler i Stockholm'],
+    // Extra rad (2026-09-19, på begäran): kategori Festivals + subcategory
+    // Film ska tagga samma guide som ovan, oavsett nyckelord i text/venue.
+    // "+" = AND inom en OR-grupp — kräver BÅDA (categoriesLower innehåller
+    // numera även subcategory, se currentCategoryTitles()).
+    ['Festivals+Film', null, null, 'At the Movies: Cinemas and Film Festivals Stockholm', 'Mysiga biografer och filmfestivaler i Stockholm'],
     ['Guided tours & Lectures', 'Natur', null, "Enjoy Allemansrätten – Sweden's Right to Roam", 'Njut av allemansrätten i Stockholms natur'],
     ['Music', 'dirigent, orkester, kvartett, kvintett, stråk, kammarkör', null, 'An Evening With Classical Music in Stockholm', 'Njut av klassisk musik i Stockholm'],
     ['Sports & Wellbeing', 'Spa', null, 'Enjoy a Spa Weekend in Stockholm City', 'Njut av spa i Stockholm'],
@@ -4941,16 +4960,22 @@
   // Guide-titlarnas EN/SV-motsvarighet, byggd från GUIDE_TAG_RULES-rader som
   // har BÅDA språken definierade (rader med bara ett språk — "ENDAST
   // SVENSKA/ENGELSKA" — saknar en riktig motsvarighet att synka mot).
-  // Nycklarna är årtalsokänsliga (stripTrailingYear, samma som redan
-  // används vid sökning) eftersom den FAKTISKT taggade guidens titel kan ha
-  // ett annat/nyare årtal än det som råkar stå hårdkodat i GUIDE_TAG_ROWS.
-  const GUIDE_LANG_PAIRS = new Map();
-  GUIDE_TAG_RULES.forEach(rule => {
-    if (rule.guideEn && rule.guideSv) {
-      GUIDE_LANG_PAIRS.set(rule.guideEn.toLowerCase(), rule.guideSv);
-      GUIDE_LANG_PAIRS.set(rule.guideSv.toLowerCase(), rule.guideEn);
-    }
-  });
+  const GUIDE_LANG_PAIR_ROWS = GUIDE_TAG_RULES
+    .filter(rule => rule.guideEn && rule.guideSv)
+    .map(rule => ({ en: rule.guideEn, sv: rule.guideSv }));
+
+  // Fuzzy jämförelse (samma princip som selectAutocompleteValue's egen
+  // förslags-matchning: normalize() + startsWith/includes, inte exakt
+  // likhet) — bekräftat 2026-09-19 att en EXAKT (om än normaliserad)
+  // strängjämförelse missade ett riktigt par ("Mysiga biografer och
+  // filmfestivaler i Stockholm" ↔ "At the Movies: Cinemas and Film
+  // Festivals Stockholm") troligen för att den FAKTISKT taggade guidens
+  // titel skiljer sig något från vad som råkar stå hårdkodat i
+  // GUIDE_TAG_ROWS (transkriberat för hand från ett kalkylark).
+  function titleMatches(a, b) {
+    const na = normalize(stripTrailingYear(a)), nb = normalize(stripTrailingYear(b));
+    return !!na && !!nb && (na === nb || na.includes(nb) || nb.includes(na));
+  }
 
   // related_guides-fältets dolda JSON följer samma [{"pk":…,"title":"…"}]-
   // mönster som categories (bekräftat via fältkartläggningen 2026-09-19).
@@ -5000,17 +5025,17 @@
   // skriver in i related_guides-fältet samtidigt som huvudloopen.
   async function syncGuideLangPairs() {
     const liveTitles = currentRelatedGuideTitles();
-    const liveKeys = new Set(liveTitles.map(t => stripTrailingYear(t).toLowerCase()));
     for (const liveTitle of liveTitles) {
-      const counterpart = GUIDE_LANG_PAIRS.get(stripTrailingYear(liveTitle).toLowerCase());
-      if (!counterpart) continue;
+      const pairRow = GUIDE_LANG_PAIR_ROWS.find(r => titleMatches(liveTitle, r.en) || titleMatches(liveTitle, r.sv));
+      if (!pairRow) continue;
+      const counterpart = titleMatches(liveTitle, pairRow.en) ? pairRow.sv : pairRow.en;
+      if (liveTitles.some(t => titleMatches(t, counterpart))) continue;
       const counterpartKey = counterpart.toLowerCase();
-      if (liveKeys.has(counterpartKey)) continue;
       guidesAlreadyTagged.add(counterpartKey);
       const ok = await selectAutocompleteValue('id_related_guides', counterpart, guideSearchPrefix(counterpart));
       if (ok) {
         vlog('EventEdit: Taggade "' + counterpart + '" automatiskt (språkpar till "' + liveTitle + '").', 'ok');
-        liveKeys.add(counterpartKey);
+        liveTitles.push(counterpart);
       } else {
         guidesAlreadyTagged.delete(counterpartKey);
       }
