@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.60.0
+// @version      7.62.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -994,13 +994,21 @@
   // Billetto utan venue_name/adress) — då kan vi inte kräva platslikhet
   // (den blir alltid 0), så vi litar på en säkrare titelmatchning istället.
   const NO_PLACE_TITLE_THRESHOLD = 0.75;
+  // Draftvyns dubblettkoll (matchStatus(ev, {strict:true})) använder denna
+  // istället för SIM_THRESHOLD — bekräftat 2026-09-19 att 0.5 (bara hälften
+  // av det kortaste ordsetet gemensamt) gav dubbletter mellan utkast vars
+  // titlar uppenbart INTE var relaterade, bara för att de delade venue och
+  // något enstaka vanligt ord. Fortfarande löst nog för riktiga
+  // översättningspar (sv/en), men kräver mer överlapp än hälften.
+  const DRAFT_SIM_THRESHOLD = 0.7;
   const inRange = (d, s, e) => s && e && d >= s && d <= e;
   // Spärr så DEDUP-NÄRMISS-loggning inte upprepas varje gång listan ritas om.
   const loggedNearMisses = new Set();
 
-  function matchStatus(ev) {
+  function matchStatus(ev, { strict = false } = {}) {
     if (!dedupIndex) return { key: 'unknown', detail: '', matches: [] };
     if (isManualIn(ev)) return { key: 'in', detail: 'manuellt hanterat', matches: [] };
+    const simThreshold = strict ? DRAFT_SIM_THRESHOLD : SIM_THRESHOLD;
     const cand = new Set();
     new Set(tokens(ev.title)).forEach(tok => { const s = dedupIndex.byToken.get(tok); if (s) s.forEach(i => cand.add(i)); });
 
@@ -1026,8 +1034,8 @@
       const tSim = titleSim(ev.title, row.title);
       const vSim = placeSim(ev.venue_name, ev.address, row.venue_name, row.address);
       const match = evHasPlace
-        ? (tSim >= SIM_THRESHOLD && vSim >= VENUE_THRESHOLD)
-        : (tSim >= NO_PLACE_TITLE_THRESHOLD);
+        ? (tSim >= simThreshold && vSim >= VENUE_THRESHOLD)
+        : (tSim >= Math.max(simThreshold, NO_PLACE_TITLE_THRESHOLD));
       if (match) tvRows.push(row);
       else nearMisses.push({ row, tSim, vSim });
     });
@@ -1044,7 +1052,7 @@
           ') mot kalenderrad "' + top.row.title + '" (venue="' + (top.row.venue_name || '(tomt)') +
           '", adress="' + (top.row.address || '(tomt)') + '") — tSim=' + top.tSim.toFixed(2) +
           ', vSim=' + top.vSim.toFixed(2) + ', krav: ' +
-          (evHasPlace ? ('tSim≥' + SIM_THRESHOLD + ' OCH vSim≥' + VENUE_THRESHOLD) : ('tSim≥' + NO_PLACE_TITLE_THRESHOLD)), 'err');
+          (evHasPlace ? ('tSim≥' + simThreshold + ' OCH vSim≥' + VENUE_THRESHOLD) : ('tSim≥' + Math.max(simThreshold, NO_PLACE_TITLE_THRESHOLD))), 'err');
       }
     }
 
@@ -1208,8 +1216,17 @@
     input.focus();
     setVal("");
     input.dispatchEvent(new Event("input", { bubbles: true }));
+    // Bygger den inskrivna strängen från en egen lokal variabel istället för
+    // att läsa tillbaka input.value mellan varje tecken — bekräftat
+    // 2026-09-19 att widgeten ibland hinner skriva om/normalisera fältets
+    // värde mellan våra tangenttryckningar, vilket annars smyger in
+    // felstavningar när nästa tecken byggs vidare på ett redan ändrat värde.
+    // Med en egen "sanning" rättar varje tecken automatiskt till eventuell
+    // sådan drift istället för att ärva den.
+    let typed = "";
     for (const ch of value) {
-      setVal(input.value + ch);
+      typed += ch;
+      setVal(typed);
       input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: ch }));
       input.dispatchEvent(new Event("input", { bubbles: true }));
       input.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: ch }));
@@ -1252,13 +1269,19 @@
     });
   }
 
-  async function selectAutocompleteValue(fieldId, value) {
+  // `searchText` (default: samma som `value`) är vad som faktiskt SKRIVS in —
+  // `value` förblir facit för vilket förslag som väljs ur listan. Låter
+  // anropare skriva in en kortare, mer träffsäker söktext (t.ex. bara de
+  // första orden av en lång guidetitel) utan att ändra vilken post som
+  // faktiskt räknas som "rätt" val.
+  async function selectAutocompleteValue(fieldId, value, searchText) {
     const input = document.getElementById(fieldId);
     if (!input) { vlog('Autocomplete: fältet ' + fieldId + ' hittades inte.', 'err'); return false; }
     if (!value) return false;
     const target = normalize(value);
-    vlog('Autocomplete: skriver "' + value + '" i ' + fieldId + '…');
-    await setSearchValue(input, value);
+    const toType = searchText || value;
+    vlog('Autocomplete: skriver "' + toType + '" i ' + fieldId + ' (mål: "' + value + '")…');
+    await setSearchValue(input, toType);
     const items = await waitForSuggestions(input);
     if (!items.length) {
       vlog('Autocomplete: inga förslag dök upp för ' + fieldId + ' → "' + value + '" (väntade 4s, aria-owns hittades ' +
@@ -4067,7 +4090,7 @@
       const rowData = extractRowData(row);
       if (!rowData || !rowData.title) return;
       checked++;
-      const st = matchStatus(rowData);
+      const st = matchStatus(rowData, { strict: true });
       const info = draftBadgeInfo(st);
       if (!info) return;
       counts[info.label] = (counts[info.label] || 0) + 1;
@@ -4122,6 +4145,18 @@
       const arrow = el.querySelector('.dp-arrow');
       if (arrow) arrow.textContent = open ? '▸' : '▾';
     }));
+    // Samma par-specifika avmarkering (dismissPair/isDismissed) som huvud-
+    // panelens "✔️ Ej samma"-knapp redan använder — matchStatus() hoppar
+    // sedan automatiskt över det paret nästa gång (körs om via
+    // runDraftvyCheck() nedan, som ritar om hela raden med uppdaterad status).
+    tr.querySelectorAll('.vseh-draft-notdup').forEach(btn => btn.addEventListener('click', () => {
+      const mi = parseInt(btn.dataset.mi, 10);
+      const match = st.matches[mi];
+      if (!match) return;
+      dismissPair(rowData, match);
+      vlog('Draftvy: Avmarkerade felmatchning: "' + rowData.title + '" ≠ "' + match.title + '"', 'ok');
+      runDraftvyCheck();
+    }));
   }
 
   // Jämförelsevy för draft-listan — samma visuella mönster som huvud-
@@ -4147,7 +4182,10 @@
       calSide = `<div class="vseh-cmp-col"><h5>Visit-kalendern (${st.matches.length} post${st.matches.length > 1 ? 'er' : ''})</h5>` +
         st.matches.map((m, mi) => `
           <div class="vseh-item">
-            ${m.href ? `<div class="vseh-item-btns"><a class="vseh-edit" href="${esc(m.href)}" target="_blank" rel="noopener">🔍 Granska</a></div>` : ''}
+            <div class="vseh-item-btns">
+              <button class="vseh-dismiss vseh-draft-notdup" data-mi="${mi}" type="button" title="Detta är inte samma event">✅ Ej dublett</button>
+              ${m.href ? `<a class="vseh-edit" href="${esc(m.href)}" target="_blank" rel="noopener">🔍 Granska</a>` : ''}
+            </div>
             <div class="vseh-item-title">${esc(m.title)}</div>
             <div class="vseh-item-row"><span class="lab">Plats</span> ${esc(m.venue_name || m.address) || '–'}</div>
             <div class="vseh-item-row"><span class="lab">Datum</span> ${datePresent('cal', m.isSpan ? null : [m.start], m.isSpan, m.start, m.end, 'draftcal-' + pk + '-' + mi)}</div>
@@ -4356,6 +4394,16 @@
   // Klockslag i löptext ("18:00", "kl 19", "kl. 19", "klockan 20") — tid ska
   // stå i datumfälten, inte i beskrivningen.
   const TIME_IN_TEXT_RE = /\b\d{1,2}[:.]\d{2}\b|\bkl\.?\s?\d{1,2}\b|\bklockan\b/i;
+  // Kalenderdatum i löptext ("Den 23–24 oktober", "On 23–24 October") —
+  // samma princip som TIME_IN_TEXT_RE ovan, fast för datum: ska fyllas i i
+  // datumfälten, inte skrivas i beskrivningen. Kräver ett tal intill
+  // månadsnamnet (inte bara "i mars" eller "oktoberfest") för att undvika
+  // falska positiver på månadsnamn som förekommer i annan betydelse.
+  const MONTH_NAMES_RE = 'januari|februari|mars|april|maj|juni|juli|augusti|september|oktober|november|december|' +
+    'january|february|march|may|june|july|august|october';
+  const DATE_IN_TEXT_RE = new RegExp(
+    '\\b\\d{1,2}(\\s*[-–]\\s*\\d{1,2})?\\s+(' + MONTH_NAMES_RE + ')\\b|' +
+    '\\b(' + MONTH_NAMES_RE + ')\\s+\\d{1,2}(\\s*[-–]\\s*\\d{1,2})?\\b', 'i');
   const WE_US_WORDS_SV = ['vi', 'oss', 'vår', 'vårt', 'våra'];
   const WE_US_WORDS_EN = ['we', 'us', 'our'];
   // Bekräftade 2026-09-18 (+ "vänner och familj"/"kompisgänget"/"unik
@@ -4399,10 +4447,22 @@
     note.innerHTML = html;
   }
 
+  // JS \b räknar å/ä/ö som "icke-ordtecken", vilket gör vanliga \b-gränser
+  // opålitliga för svenska ord: "öl"/"årsmöte"/"äventyr" (ord som börjar/
+  // slutar på å/ä/ö) matchar aldrig som fristående ord, samtidigt som t.ex.
+  // "snö" felaktigt matchar inuti "snöar" (ö→a ser ut som en ordgräns för
+  // \b). Bygger därför gränserna själva med lookaround mot en explicit
+  // teckenklass som inkluderar å/ä/ö, istället för att lita på \b.
+  const WORD_CHAR_CLASS = 'a-zA-ZåäöÅÄÖ0-9_';
+  function wordBoundaryPattern(word) {
+    const esc = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return '(?<![' + WORD_CHAR_CLASS + '])' + esc + '(?![' + WORD_CHAR_CLASS + '])';
+  }
+
   // Ordgräns-regex av en lista fraser (kan innehålla mellanslag) — bygger
-  // en enda regex av typen /\b(fras1|fras2|...)\b/i, escapead för specialtecken.
+  // en enda regex som matchar valfri fras i listan, var för sig ordgränsad.
   function wordListRe(words) {
-    return new RegExp('\\b(' + words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')\\b', 'i');
+    return new RegExp(words.map(wordBoundaryPattern).join('|'), 'i');
   }
 
   // Läsande granskning enligt riktlinjerna, bara nyckelordsbaserad (inga
@@ -4411,6 +4471,10 @@
   // OCH returnerar en samlad lista för listens sammanfattningsrad.
   function checkGuidelineIssues() {
     const categoriesLower = currentCategoryTitles().map(c => c.toLowerCase());
+    // Plats-/venuenamnet är redan ett eget fält — nämns det ordagrant i
+    // löptexten också är det onödig dubblering (samma princip som pris/tid).
+    const venueNames = [document.getElementById('id_venue_name_en')?.value, document.getElementById('id_venue_name_sv')?.value]
+      .map(v => (v || '').trim()).filter(v => v.length > 2);
     const allIssues = [];
     ['en', 'sv'].forEach(lang => {
       const fieldId = 'id_description_' + lang;
@@ -4426,6 +4490,14 @@
       }
       if (TIME_IN_TEXT_RE.test(text)) {
         fieldIssues.push({ label: 'Tidsinfo i fält', msg: 'Möjlig tidsangivelse i texten — tid ska fyllas i i datumfälten, inte skrivas i beskrivningen.' });
+      }
+      const dateHit = text.match(DATE_IN_TEXT_RE);
+      if (dateHit) {
+        fieldIssues.push({ label: 'Datuminfo i fält', msg: 'Möjlig datumangivelse i texten ("' + dateHit[0].trim() + '") — datum ska fyllas i i datumfälten, inte skrivas i beskrivningen.' });
+      }
+      const venueHit = venueNames.find(v => new RegExp(wordBoundaryPattern(v), 'i').test(text));
+      if (venueHit) {
+        fieldIssues.push({ label: 'Platsinfo i fält', msg: 'Platsnamnet ("' + venueHit + '") nämns i texten — plats/venue fylls redan i i det fältet och behöver inte upprepas i beskrivningen.' });
       }
       const pronounRe = wordListRe(lang === 'sv' ? WE_US_WORDS_SV : WE_US_WORDS_EN);
       if (pronounRe.test(text)) {
@@ -4564,14 +4636,20 @@
   }
 
   // null = inget villkor angivet. Uteslutningar (`-term`) vinner alltid,
-  // oavsett om det finns några OR-grupper eller inte.
+  // oavsett om det finns några OR-grupper eller inte. Ordgränsad matchning
+  // (samma lookaround-baserade gräns som wordListRe) så att t.ex. "hund"
+  // inte träffar inuti "hundra" — ren substrängsmatchning gav falska
+  // positiver för alla korta nyckelord som råkar ingå i längre ord.
   function buildKeywordTest(cell) {
     const { orGroups, exclude } = parseOrAndCell(cell);
     if (!orGroups.length && !exclude.length) return null;
+    const termRe = term => new RegExp(wordBoundaryPattern(term), 'i');
+    const excludeRe = exclude.map(termRe);
+    const orGroupsRe = orGroups.map(group => group.map(termRe));
     return text => {
-      if (exclude.some(term => text.includes(term))) return false;
-      if (!orGroups.length) return true;
-      return orGroups.some(group => group.every(term => text.includes(term)));
+      if (excludeRe.some(re => re.test(text))) return false;
+      if (!orGroupsRe.length) return true;
+      return orGroupsRe.some(group => group.every(re => re.test(text)));
     };
   }
 
@@ -4612,10 +4690,12 @@
 
   // [kategori, nyckelord, datumvillkor, guide (EN), guide (SV)] — en rad per
   // post i "autofiltrering_guider.xlsx" (granskad + rättad 2026-09-18), plus
-  // en extra rad (sist) för Avicii/Friends Arena-regeln som fanns innan
-  // kalkylarket. En rad utan NÅGOT villkor (kategori+nyckelord+datum alla
-  // tomma) hoppas över helt av buildGuideRuleFromRow — den ska INTE tagga
-  // sin guide ovillkorligen (bekräftat 2026-09-18).
+  // några extra rader (sist) som inte kommer från kalkylarket: Avicii/Friends
+  // Arena-regeln som fanns innan kalkylarket, och Nalen/Debaser (2026-09-19,
+  // på begäran) — matchar mot venue-namnet, som ingår i buildGuideTagContext's
+  // `text`. En rad utan NÅGOT villkor (kategori+nyckelord+datum alla tomma)
+  // hoppas över helt av buildGuideRuleFromRow — den ska INTE tagga sin guide
+  // ovillkorligen (bekräftat 2026-09-18).
   const GUIDE_TAG_ROWS = [
     [null, 'adrenalin, uthållig, sport, svettas, ansträng', null, 'Have an Active Vacation', 'Aktiv semester i Stockholm'],
     [null, 'äventyr, adrenalin', null, 'ENDAST SVENSKA', 'Aktiviteter för den äventyrlige'],
@@ -4713,7 +4793,8 @@
     [null, 'pulka', null, 'Fun Sled Slopes in Stockholm', 'Åk pulka i Stockholm'],
     [null, 'skridskor', null, 'Ice Skating in Stockholm', 'Åk skridskor i Stockholm'],
     [null, 'halloween', null, 'Halloween and Fall break in Stockholm', null],
-    ['Music', 'avicii arena, friends arena', null, 'The biggest Stockholm events', 'De största evenemangen i Stockholm']
+    ['Music', 'avicii arena, friends arena', null, 'The biggest Stockholm events', 'De största evenemangen i Stockholm'],
+    ['Music', 'nalen, debaser', null, 'Upcoming concerts and music festivals', 'Kommande konserter & festivaler']
   ];
 
   function buildGuideRuleFromRow(row, idx) {
@@ -4746,32 +4827,84 @@
 
   const guideTagRulesFired = new Set();
   const guidesAlreadyTagged = new Set();
+  // Fältets sök filtrerar redan bra på bara de första orden av guidetiteln —
+  // ingen anledning att skriva in HELA (ofta långa) titeln tecken för tecken
+  // (på begäran 2026-09-19: kortare inskrivning = snabbare och mindre yta
+  // för ev. skrivfel). Den FULLA titeln används fortfarande som facit när
+  // rätt förslag ska väljas ur listan (selectAutocompleteValue's `value`).
+  function guideSearchPrefix(title) {
+    return title.split(/\s+/).slice(0, 2).join(' ');
+  }
+  // runEditPageChecks() (och därmed denna funktion) körs var 1.5:e sekund
+  // via setInterval — men en enda selectAutocompleteValue-inskrivning tar
+  // flera sekunder (tecken-för-tecken-skrivning + upp till 4s väntan på
+  // förslag), så utan spärr hann flera anrop av runGuideTagRules() vara
+  // igång SAMTIDIGT. Varje anrop skriver då sin egen guidetitel in i SAMMA
+  // id_related_guides-fält parallellt, och tangenttryckningarna interfolieras
+  // till rent nonsens (bekräftat 2026-09-19: "SSttoocckkhhoollmms" —
+  // "Stockholms" skrivet två gånger samtidigt, tecken för tecken). Enkel
+  // spärrflagga: ett nytt anrop avbryts direkt om ett tidigare fortfarande
+  // pågår, istället för att köra parallellt.
+  let guideTagRulesRunning = false;
+  let autoScrolledAfterGuideTagging = false;
   async function runGuideTagRules() {
-    const ctx = buildGuideTagContext();
-    for (const rule of GUIDE_TAG_RULES) {
-      if (guideTagRulesFired.has(rule.name)) continue;
-      let hit;
-      try { hit = rule.match(ctx); } catch (e) { vlog('GuideRegel "' + rule.name + '": fel i match() — ' + e.message, 'err'); continue; }
-      if (!hit) continue;
-      guideTagRulesFired.add(rule.name);
-      const applied = [];
-      for (const g of [rule.guideEn, rule.guideSv]) {
-        if (!g) continue;
-        const key = g.toLowerCase();
-        if (guidesAlreadyTagged.has(key)) continue;
-        guidesAlreadyTagged.add(key);
-        await selectAutocompleteValue('id_related_guides', g);
-        applied.push(g);
+    if (guideTagRulesRunning) return;
+    guideTagRulesRunning = true;
+    try {
+      const ctx = buildGuideTagContext();
+      for (const rule of GUIDE_TAG_RULES) {
+        if (guideTagRulesFired.has(rule.name)) continue;
+        let hit;
+        try { hit = rule.match(ctx); } catch (e) { vlog('GuideRegel "' + rule.name + '": fel i match() — ' + e.message, 'err'); continue; }
+        if (!hit) continue;
+        guideTagRulesFired.add(rule.name);
+        const applied = [];
+        for (const g of [rule.guideEn, rule.guideSv]) {
+          if (!g) continue;
+          const key = g.toLowerCase();
+          if (guidesAlreadyTagged.has(key)) continue;
+          // Märks som taggad/loggas bara vid FAKTISK träff — tidigare
+          // markerades och loggades den som klar oavsett resultat, så ett
+          // misslyckat/avbrutet val (t.ex. korrupt text från race-buggen
+          // ovan) rapporterades som lyckat i loggen trots att inget
+          // faktiskt valdes i fältet.
+          const ok = await selectAutocompleteValue('id_related_guides', g, guideSearchPrefix(g));
+          if (ok) {
+            guidesAlreadyTagged.add(key);
+            applied.push(g);
+          }
+        }
+        if (applied.length) vlog('EventEdit: Guideregel "' + rule.name + '" taggade ' + applied.map(g => '"' + g + '"').join('/') + '.', 'ok');
       }
-      if (applied.length) vlog('EventEdit: Guideregel "' + rule.name + '" taggade ' + applied.map(g => '"' + g + '"').join('/') + '.', 'ok');
+    } finally {
+      guideTagRulesRunning = false;
+      // Guide-autocompleten fokuserar/scrollar upprepade gånger ner mot
+      // related_guides-fältet under inskrivningen och lämnar sidan mitt i
+      // efteråt — rullar tillbaka till toppen EN gång när den första
+      // kompletta taggningsomgången är klar (på begäran 2026-09-19). Görs
+      // här i finally, INTE i ett .then() på anropet i runEditPageChecks(),
+      // eftersom ett spärrat (no-op) anrop annars skulle trigga det direkt,
+      // långt innan det RIKTIGA pågående anropet faktiskt är klart.
+      if (!autoScrolledAfterGuideTagging) {
+        autoScrolledAfterGuideTagging = true;
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
     }
   }
 
   // Geotaggning aktiveras av något som lyssnar på INTERAKTION med
   // adressfältet — bekräftat 2026-09-18 att bara simulerad textändring
-  // (utan riktiga musklick) inte räcker (kartan aktiverades aldrig).
-  // Skickar därför riktiga mousedown/mouseup/click-event innan samma
-  // fokus+tillfällig textändring+återställning som förut.
+  // (utan riktiga musklick) inte räcker (kartan aktiverades aldrig), och
+  // 2026-09-19 att mousedown/mouseup/click INTE heller räcker (fortfarande
+  // ingen karta). Troliga orsaken: syntetiska (script-dispatchade) mus-event
+  // flyttar ALDRIG webbläsarens fokus — det gör bara riktiga, betrodda
+  // användarklick. Om widgeten aktiverar kartan via en focus/focusin-lyssnare
+  // på fältet har den alltså aldrig sett något fokus alls hittills. Anropar
+  // därför den RIKTIGA .focus()-metoden (till skillnad från en syntetisk
+  // FocusEvent, som av samma anledning inte heller flyttar fokus) och håller
+  // fältet fokuserat genom hela sekvensen — simulateInput() blurrar annars
+  // fältet mellan varje anrop, vilket skulle bryta av precis den
+  // fokus-hållning vi nu försöker åstadkomma.
   let addressActivated = false;
   function activateAddressGeotag() {
     if (addressActivated) return;
@@ -4779,12 +4912,17 @@
     if (!el || !el.value) return;
     addressActivated = true;
     el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    el.focus();
     el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     const original = el.value;
-    simulateInput(el, original + ' ');
-    simulateInput(el, original);
-    vlog('EventEdit: Aktiverade adressfältet för geotaggning (klick + tillfällig textändring).', 'ok');
+    el.value = original + ' ';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.value = original;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.blur();
+    vlog('EventEdit: Aktiverade adressfältet för geotaggning (riktig .focus()/.blur() + klick + tillfällig textändring).', 'ok');
   }
 
   // Om description_en och description_sv är identiska (samma text i båda
@@ -4887,7 +5025,12 @@
   // "Biljetter / Tickets" om länken går till en känd biljettleverantör ELLER
   // kategorin är Stage & Film — annars "Mer information / More information"
   // om en länk finns men fältet står tomt.
-  const TICKET_VENDOR_DOMAINS = ['ticketmaster.se', 'axs.com', 'eventim.se', 'nortic.se', 'tickster.com',
+  // OBS (2026-09-19): "nortic.se" togs bort härifrån — norticItemToOccurrences()
+  // sätter external_website_url till Nortic-eventets EGEN listningssida (den
+  // skrapade aggregator-sidan), inte en biljettköp-länk. Eftersom Nortic är en
+  // av de stora importkällorna fick nästan ALLA importerade utkast "Biljetter"
+  // istället för "Mer information" så länge domänen stod kvar i listan.
+  const TICKET_VENDOR_DOMAINS = ['ticketmaster.se', 'axs.com', 'eventim.se', 'tickster.com',
     'kulturbiljetter.se', 'billetto.se', 'tixly.com', 'kulturcentralen.nu', 'showtic.se', 'wannado.se',
     'ticketco.se', 'eventix.io', 'stockholmlive.se', 'gotevent.se'];
   let linkTextAutofilled = false;
