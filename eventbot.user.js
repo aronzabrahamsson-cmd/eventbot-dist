@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.57.4
+// @version      7.58.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4419,12 +4419,16 @@
     });
   }
 
-  // Kategorierna nedan är den bekräftade fullständiga listan (2026-09-17) —
-  // exakt jämförelse mot main_category/categories-titeln (engelska, som är
-  // vad JSON-fälten faktiskt lagrar) istället för en löst gissad regex.
-  const CATEGORY_MUSIC = 'Music';
-  const CATEGORY_EXHIBITIONS = 'Exhibitions';
+  // ---- Guide-auto-taggning: generell regelmotor -----------------------------
+  // Varje regel i GUIDE_TAG_RULES matchar mot en "kontext" (kategori, venue,
+  // titel/beskrivning, eventdatum) och taggar related_guides om den träffar.
+  // Lägga till en ny regel = lägga till ett objekt i listan, ingen ny
+  // funktion behövs. Ett villkor som utelämnas (t.ex. ingen `keywords`)
+  // räknas som "kravlöst" — bara de villkor som faktiskt anges måste stämma.
 
+  // Kategorierna är den bekräftade fullständiga listan (2026-09-17) — exakt
+  // jämförelse mot main_category/categories-titeln (engelska, som är vad
+  // JSON-fälten faktiskt lagrar) istället för en löst gissad regex.
   function currentCategoryTitles() {
     try {
       const main = JSON.parse(document.querySelector('input[name="main_category"]')?.value || 'null');
@@ -4433,42 +4437,65 @@
     } catch { return []; }
   }
 
-  // Guide-titlarna nedan är verifierade (2026-09-17) mot en riktig export ur
-  // guide-list-verktyget — inte gissade. De ursprungliga gissningarna
-  // ("Biggest events"/"Största evenemangen", "Ongoing exhibitions"/
-  // "Utställningar just nu") fanns inte i den riktiga listan.
-  const GUIDE_ARENA_EN = 'The biggest Stockholm events in 2026';
-  const GUIDE_ARENA_SV = 'De största evenemangen i Stockholm 2026';
-  const GUIDE_EXHIBITIONS_EN = 'Current and Upcoming Exhibitions in Stockholm';
-  const GUIDE_EXHIBITIONS_SV = 'Utställningar i Stockholm - Aktuella och kommande';
-
-  // Musikevent på Avicii Arena/Friends Arena → taggar related_guides mot
-  // "The biggest Stockholm events in 2026"/"De största evenemangen i
-  // Stockholm 2026".
-  let arenaGuideTagged = false;
-  async function autoTagArenaGuide() {
-    if (arenaGuideTagged) return;
-    const venue = ((document.getElementById('id_venue_name_en')?.value || '') + ' ' +
-      (document.getElementById('id_venue_name_sv')?.value || '')).toLowerCase();
-    if (!/avicii arena|friends arena/.test(venue)) return;
-    if (!currentCategoryTitles().includes(CATEGORY_MUSIC)) return;
-    arenaGuideTagged = true;
-    await selectAutocompleteValue('id_related_guides', GUIDE_ARENA_EN);
-    await selectAutocompleteValue('id_related_guides', GUIDE_ARENA_SV);
-    vlog('EventEdit: Taggade "' + GUIDE_ARENA_EN + '"/"' + GUIDE_ARENA_SV + '" (Music-event på arena).', 'ok');
+  // Alla ifyllda datum för eventet (date_admin-0, -1, … — samma fältmönster
+  // som findDateAdminAddButton/insertAndFillDateBlock ovan använder), som
+  // rena 'YYYY-MM-DD'-strängar.
+  function currentEventDates() {
+    return [...document.querySelectorAll('input[name^="date_admin-"][name$="-value-date"]')]
+      .map(el => el.value).filter(Boolean);
   }
 
-  // Utställningsevent → taggar related_guides mot "Current and Upcoming
-  // Exhibitions in Stockholm"/"Utställningar i Stockholm - Aktuella och
-  // kommande".
-  let exhibitionGuideTagged = false;
-  async function autoTagExhibitionGuide() {
-    if (exhibitionGuideTagged) return;
-    if (!currentCategoryTitles().includes(CATEGORY_EXHIBITIONS)) return;
-    exhibitionGuideTagged = true;
-    await selectAutocompleteValue('id_related_guides', GUIDE_EXHIBITIONS_EN);
-    await selectAutocompleteValue('id_related_guides', GUIDE_EXHIBITIONS_SV);
-    vlog('EventEdit: Taggade "' + GUIDE_EXHIBITIONS_EN + '"/"' + GUIDE_EXHIBITIONS_SV + '" (Exhibitions-kategori).', 'ok');
+  // Bygger den kontext varje regels `match`-funktion får att titta på.
+  function buildGuideTagContext() {
+    const categories = currentCategoryTitles();
+    const venue = ((document.getElementById('id_venue_name_en')?.value || '') + ' ' +
+      (document.getElementById('id_venue_name_sv')?.value || '')).toLowerCase();
+    const text = ((document.getElementById('id_title_en')?.value || '') + ' ' +
+      (document.getElementById('id_title_sv')?.value || '') + ' ' +
+      readDraftailText('id_description_en') + ' ' + readDraftailText('id_description_sv') + ' ' + venue).toLowerCase();
+    const dates = currentEventDates();
+    const months = dates.map(d => parseInt(d.slice(5, 7), 10));
+    return { categories, venue, text, dates, months };
+  }
+
+  // Hjälpare för regeldefinitionerna nedan.
+  const hasCategory = name => ctx => ctx.categories.includes(name);
+  const hasKeyword = (...words) => ctx => words.some(w => ctx.text.includes(w.toLowerCase()));
+  const inMonths = (...nums) => ctx => ctx.months.some(m => nums.includes(m));
+
+  // Guide-titlarna är verifierade (2026-09-17) mot en riktig export ur
+  // guide-list-verktyget — inte gissade. Lägg till fler rader här (kategori/
+  // nyckelord/månad, valfri kombination — alla angivna villkor måste stämma
+  // samtidigt för att regeln ska träffa; `match` kan också vara en egen
+  // funktion som kombinerar flera av hjälparna ovan med && / ||).
+  const GUIDE_TAG_RULES = [
+    {
+      name: 'arena-music',
+      match: ctx => hasKeyword('avicii arena', 'friends arena')(ctx) && hasCategory('Music')(ctx),
+      guideEn: 'The biggest Stockholm events in 2026',
+      guideSv: 'De största evenemangen i Stockholm 2026'
+    },
+    {
+      name: 'exhibitions',
+      match: hasCategory('Exhibitions'),
+      guideEn: 'Current and Upcoming Exhibitions in Stockholm',
+      guideSv: 'Utställningar i Stockholm - Aktuella och kommande'
+    }
+  ];
+
+  const guideTagRulesFired = new Set();
+  async function runGuideTagRules() {
+    const ctx = buildGuideTagContext();
+    for (const rule of GUIDE_TAG_RULES) {
+      if (guideTagRulesFired.has(rule.name)) continue;
+      let hit;
+      try { hit = rule.match(ctx); } catch (e) { vlog('GuideRegel "' + rule.name + '": fel i match() — ' + e.message, 'err'); continue; }
+      if (!hit) continue;
+      guideTagRulesFired.add(rule.name);
+      await selectAutocompleteValue('id_related_guides', rule.guideEn);
+      await selectAutocompleteValue('id_related_guides', rule.guideSv);
+      vlog('EventEdit: Guideregel "' + rule.name + '" taggade "' + rule.guideEn + '"/"' + rule.guideSv + '".', 'ok');
+    }
   }
 
   // Geotaggning aktiveras tydligen av något som lyssnar på interaktion med
@@ -4493,8 +4520,7 @@
     stripEmojisFromTitles();
     stripDescriptionEmoji();
     checkPriceMentions();
-    autoTagArenaGuide().catch(() => {});
-    autoTagExhibitionGuide().catch(() => {});
+    runGuideTagRules().catch(() => {});
   }
 
   function initEventEditAutomation() {
