@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.58.1
+// @version      7.59.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4448,42 +4448,234 @@
   // Bygger den kontext varje regels `match`-funktion får att titta på.
   function buildGuideTagContext() {
     const categories = currentCategoryTitles();
+    const categoriesLower = categories.map(c => c.toLowerCase());
     const venue = ((document.getElementById('id_venue_name_en')?.value || '') + ' ' +
       (document.getElementById('id_venue_name_sv')?.value || '')).toLowerCase();
     const text = ((document.getElementById('id_title_en')?.value || '') + ' ' +
       (document.getElementById('id_title_sv')?.value || '') + ' ' +
       readDraftailText('id_description_en') + ' ' + readDraftailText('id_description_sv') + ' ' + venue).toLowerCase();
     const dates = currentEventDates();
-    const months = dates.map(d => parseInt(d.slice(5, 7), 10));
-    return { categories, venue, text, dates, months };
+    return { categories, categoriesLower, venue, text, dates };
   }
 
-  // Hjälpare för regeldefinitionerna nedan.
-  const hasCategory = name => ctx => ctx.categories.includes(name);
-  const hasKeyword = (...words) => ctx => words.some(w => ctx.text.includes(w.toLowerCase()));
-  const inMonths = (...nums) => ctx => ctx.months.some(m => nums.includes(m));
+  // Tar bort omslutande citattecken runt en term ("free admission" → free admission).
+  function stripQuotes(s) {
+    s = s.trim();
+    if (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"') s = s.slice(1, -1);
+    return s.trim();
+  }
 
-  // Guide-titlarna är verifierade (2026-09-17) mot en riktig export ur
-  // guide-list-verktyget — inte gissade. Lägg till fler rader här (kategori/
-  // nyckelord/månad, valfri kombination — alla angivna villkor måste stämma
-  // samtidigt för att regeln ska träffa; `match` kan också vara en egen
-  // funktion som kombinerar flera av hjälparna ovan med && / ||).
-  const GUIDE_TAG_RULES = [
-    {
-      name: 'arena-music',
-      match: ctx => hasKeyword('avicii arena', 'friends arena')(ctx) && hasCategory('Music')(ctx),
-      guideEn: 'The biggest Stockholm events',
-      guideSv: 'De största evenemangen i Stockholm'
-    },
-    {
-      name: 'exhibitions',
-      match: hasCategory('Exhibitions'),
-      guideEn: 'Current and Upcoming Exhibitions in Stockholm',
-      guideSv: 'Utställningar i Stockholm - Aktuella och kommande'
-    }
+  // Tolkar en kategori- eller nyckelordscell från kalkylarket: komma = ELLER
+  // mellan grupper, plus = OCH inom en grupp, citattecken runt en flerords-
+  // fras tas bort. Ett "-" framför en term (bara meningsfullt för nyckelord)
+  // gör den till ett globalt uteslutningsvillkor — måste INTE finnas, oavsett
+  // vilken OR-grupp som annars träffade (t.ex. "slott, -\"kungliga slottet\"").
+  function parseOrAndCell(cellRaw) {
+    const orGroups = [];
+    const exclude = [];
+    (cellRaw || '').split(',').map(s => s.trim()).filter(Boolean).forEach(tok => {
+      if (tok.startsWith('-')) {
+        const t = stripQuotes(tok.slice(1)).toLowerCase();
+        if (t) exclude.push(t);
+      } else {
+        const group = tok.split('+').map(t => stripQuotes(t).toLowerCase()).filter(Boolean);
+        if (group.length) orGroups.push(group);
+      }
+    });
+    return { orGroups, exclude };
+  }
+
+  // null = inget villkor angivet (raden bryr sig inte om kategori).
+  function buildCategoryTest(cell) {
+    const { orGroups } = parseOrAndCell(cell);
+    if (!orGroups.length) return null;
+    return categoriesLower => orGroups.some(group => group.every(term => categoriesLower.includes(term)));
+  }
+
+  // null = inget villkor angivet. Uteslutningar (`-term`) vinner alltid,
+  // oavsett om det finns några OR-grupper eller inte.
+  function buildKeywordTest(cell) {
+    const { orGroups, exclude } = parseOrAndCell(cell);
+    if (!orGroups.length && !exclude.length) return null;
+    return text => {
+      if (exclude.some(term => text.includes(term))) return false;
+      if (!orGroups.length) return true;
+      return orGroups.some(group => group.every(term => text.includes(term)));
+    };
+  }
+
+  // Tolkar "[YYYY-MM-DD-YYYY-MM-DD]" till ett test mot eventets datum —
+  // bara månad+dag jämförs (årtal ignoreras helt), och intervall som går
+  // över årsskiftet (start > slut, t.ex. dec→jan) hanteras också.
+  function buildDateTest(cellRaw) {
+    const m = /^\[YYYY-(\d{2})-(\d{2})-YYYY-(\d{2})-(\d{2})\]$/.exec((cellRaw || '').trim());
+    if (!m) return null;
+    const start = parseInt(m[1], 10) * 100 + parseInt(m[2], 10);
+    const end = parseInt(m[3], 10) * 100 + parseInt(m[4], 10);
+    return dates => dates.some(d => {
+      const dm = /^\d{4}-(\d{2})-(\d{2})$/.exec(d);
+      if (!dm) return false;
+      const val = parseInt(dm[1], 10) * 100 + parseInt(dm[2], 10);
+      return start <= end ? (val >= start && val <= end) : (val >= start || val <= end);
+    });
+  }
+
+  // Ett guide-fält kan vara tomt eller "ENDAST SVENSKA"/"ENDAST ENGELSKA" —
+  // båda betyder "tagga inte det här språket alls" för raden.
+  function resolveGuideTitle(cellRaw) {
+    const v = (cellRaw || '').trim();
+    if (!v || /^ENDAST (SVENSKA|ENGELSKA)$/i.test(v)) return null;
+    return v;
+  }
+
+  // Guide-titlar innehåller ofta innevarande/kommande år ("...i Stockholm
+  // 2026") som byts ut när sidan uppdateras nästa år. selectAutocompleteValue
+  // matchar redan på startsWith/includes mot den riktiga sökningen, så vi
+  // stryker ett avslutande årtal (med eller utan föregående "in ") innan vi
+  // skriver in texten — regeln fortsätter då träffa rätt guide oavsett
+  // vilket år som råkar stå i dess titel just nu, utan att kalkylarkets
+  // egen (människoläsbara) text behöver hållas årtalsfri.
+  function stripTrailingYear(title) {
+    return title.replace(/\s+(in\s+)?\d{4}\s*$/i, '').trim();
+  }
+
+  // [kategori, nyckelord, datumvillkor, guide (EN), guide (SV)] — en rad per
+  // post i "autofiltrering_guider.xlsx" (granskad + rättad 2026-09-18), plus
+  // en extra rad (sist) för Avicii/Friends Arena-regeln som fanns innan
+  // kalkylarket. En rad utan NÅGOT villkor (kategori+nyckelord+datum alla
+  // tomma) hoppas över helt av buildGuideRuleFromRow — den ska INTE tagga
+  // sin guide ovillkorligen (bekräftat 2026-09-18).
+  const GUIDE_TAG_ROWS = [
+    [null, 'adrenalin, uthållig, sport, svettas, ansträng', null, 'Have an Active Vacation', 'Aktiv semester i Stockholm'],
+    [null, 'äventyr, adrenalin', null, 'ENDAST SVENSKA', 'Aktiviteter för den äventyrlige'],
+    ['Family+Stage & Film, Family+Exhibitions', null, null, 'Stockholm for Kids', 'Aktiviteter med barn i Stockholm'],
+    [null, 'sauna, bastu', null, 'Sauna in Stockholm', 'Bada bastu i Stockholm'],
+    [null, 'läsa, bok, författar', null, 'Find a good read: Bookshops in Stockholm', 'Bibliotek och bokaffärer i Stockholm – hitta läslust'],
+    [null, 'kräftor, crayfish', null, "It's time for crayfish!", 'Dags för kräftor!'],
+    [null, 'vegan, vegetarian, plant-based, växtbaserad', null, 'Plant-based and vegetarian restaurants in Stockholm 2026', 'De bästa veganska och vegetariska restaurangerna i Stockholm 2026'],
+    ['Festivals', null, null, 'The biggest Stockholm events', 'De största evenemangen i Stockholm'],
+    ['Exhibitions, Music, Stage & Film', '"free admission", "fritt inträde", "gratis", "free of charge"', null, 'Stockholm on a Budget', 'En budgetsemester i Stockholm'],
+    [null, 'Rain, regn', null, 'Stockholm on a Rainy Day', 'En regnig dag i Stockholm'],
+    ['Eat & Drink', '"nobel"', null, 'Have a bite of Nobel cuisine', 'En smak av Nobelmiddagen'],
+    [null, 'gamer, gaming, arcade', null, 'Late night gaming in Stockholm', 'En utekväll med arkadspel'],
+    [null, null, null, 'Afternoon Tea', 'ENDAST ENGELSKA'],
+    ['Exhibitions', 'alkohol, öl, beer', null, 'Alcohol in Sweden - understanding the swedish drinking mentality', 'ENDAST ENGELSKA'],
+    [null, 'kanelbulle, "cinnamon bun", princesstårta, "swedish fika"', null, 'Cinnamon Bun & Princess Cake: Swedish Fika in Stockholm', 'ENDAST ENGELSKA'],
+    ['Networking & Community', null, null, 'Find a community of friends', 'ENDAST ENGELSKA'],
+    [null, '"design week"', null, 'Guide: Stockholm Design Week', 'ENDAST ENGELSKA'],
+    [null, 'ramadan', null, 'How to celebrate Ramadan in Stockholm as a visitor', 'ENDAST ENGELSKA'],
+    [null, 'jobbmässa, arbetssökande', null, "How to find work when you're new in Stockholm", 'ENDAST ENGELSKA'],
+    ['Careers & Leadership', null, null, 'How to kickstart your career in Stockholm', 'ENDAST ENGELSKA'],
+    ['Family, Guided tours & Lectures', 'djur, animals', null, 'Meet the Animals of Stockholm', 'ENDAST ENGELSKA'],
+    ['Clubs & Parties', null, null, 'Stockholm nightlife', 'ENDAST ENGELSKA'],
+    ['Guided tours & Lectures', 'Subway, tunnelbana', null, 'Transportation', 'ENDAST ENGELSKA'],
+    [null, 'parkour, climb, klätt', null, 'Urban Play in Stockholm', 'ENDAST ENGELSKA'],
+    [null, 'cykel, bike, bicycle', null, 'Vacation on Two Wheels', 'ENDAST ENGELSKA'],
+    [null, 'afternoon tea', null, 'Where to go for Afternoon Tea in Stockholm', 'ENDAST ENGELSKA'],
+    ['Careers & Leadership+Networking & Community', null, null, 'Where to network in Stockholm', 'ENDAST ENGELSKA'],
+    [null, 'naturvin, "natural wine", "orange wine"', null, 'Five bars to drink natural wines in Stockholm', 'Fem bra naturvinshak i Stockholm'],
+    ['Festivals', null, '[YYYY-05-24-YYYY-09-03]', 'Festival Summer in Stockholm', 'Festivalsommar i Stockholm'],
+    [null, 'halloween, ghost, spök, horror', null, 'The Haunting of Stockholm – Find the Spookiest Places in Town', 'Fira Halloween i kusliga Stockholm'],
+    [null, 'valborg', null, 'Walpurgis Night in Stockholm', 'Fira valborg i Stockholm 2026'],
+    [null, 'slaktkyrkan, fållan, slaktis, slakthusområdet', null, 'Things to do in Slakthusområdet', 'Få en fantastisk dag i Slakthusområdet'],
+    [null, '"greta garbo"', null, "Greta Garbo's Stockholm", 'Greta Garbos Stockholm'],
+    ['Guided tours & Lectures', 'Annorlunda, oväntad, adrenalin, twist', null, 'Guided Tours With a Twist', 'Guidade turer med en tvist'],
+    [null, 'fiska, fisketur', null, 'Go Fish! – Fishing in Stockholm', 'Gå och fiska'],
+    ['Family', null, '[YYYY-02-15-YYYY-03-10]', 'Have a Fun Winter Break in Stockholm', 'Ha ett härligt sportlov i Stockholm'],
+    [null, 'sportlov, skidor, pulka', '[YYYY-02-15-YYYY-03-10]', 'Have a Fun Winter Break in Stockholm', 'Ha ett härligt sportlov i Stockholm'],
+    ['Music, Clubs & Parties', 'gay, queer', null, 'LGBTQ+ Events & Clubs', 'HBTQI-evenemang och klubbar'],
+    [null, 'loppis, loppmarknad, flea market', null, 'Weekend Markets & Flea Markets in Stockholm', 'Hitta fynden på Stockholms helgmarknader och loppisar'],
+    [null, 'hund, "människans bästa vän"', null, 'Dog-friendly Stockholm — a guide for you and your dog', 'Hundvänliga Stockholm — en guide för dig med hund'],
+    [null, 'cykel, bike, bicycle', null, 'By bike in Stockholm', 'Hyr cykel i Stockholm – Semester på två hjul'],
+    [null, 'mixolog, cocktail', null, 'The best drinks in Stockholm: creative cocktail bars', 'Här dricker du Stockholms bästa drinkar'],
+    [null, '"Stockholm pride", "prideveckan"', null, 'Celebrate Stockholm Pride 2026', 'Här kan du fira Stockholm Pride 2026'],
+    [null, '"nationaldag"', null, "Celebrate Sweden's National Day in Stockholm", 'Här kan du fira Sveriges nationaldag i Stockholm 2026'],
+    [null, 'höstlov, läslov', null, null, 'Höstlov i Stockholm 2026'],
+    [null, 'ingmar bergman', null, "Ingmar Bergman's Stockholm", 'Ingmar Bergmans Stockholm'],
+    [null, 'julbord', null, 'Christmas dinner in Stockholm 2026', 'Julbord i Stockholm 2026'],
+    ['Music', 'jul', null, 'Christmas Concerts and Events in Stockholm 2026', 'Julkonserter och julshower i Stockholm 2026'],
+    [null, 'jullov', null, 'Have a Great Christmas Holiday in Stockholm', 'Jullov i Stockholm 2026 för hela familjen'],
+    [null, 'julmarknad', null, 'Christmas markets in Stockholm 2026', 'Julmarknader i Stockholm 2026'],
+    [null, 'kajak', null, 'Kayak Adventures in Stockholm', 'Kajakäventyr i Stockholm'],
+    [null, 'Stjärna, fans', null, 'Upcoming concerts and music festivals', 'Kommande konserter & festivaler'],
+    ['Music+Festivals', null, null, 'Upcoming concerts and music festivals', 'Kommande konserter & festivaler'],
+    ['Guided tours & Lectures', 'Tunnelbana', null, 'Art in the Subway: Explore 14 Beautiful Stations', 'Konst i tunnelbanan: Upptäck 14 vackra stationer'],
+    [null, 'Arkitektur, "offentlig konst", jugend, brutalism', null, 'ENDAST SVENSKA', 'Konst och arkitektur i Stockholm'],
+    [null, 'kulturnatt', null, 'Stockholm Culture Night 2026', 'Kulturnatt Stockholm 2026'],
+    ['Exhibitions', 'kväll', null, 'Night at the Museum – Evening-open Attractions in Stockholm', 'Kvällsöppna museer i Stockholm'],
+    [null, 'Lucia', null, 'Lucia in Stockholm 2026', 'Lucia i Stockholm 2026'],
+    ['Sports & Wellbeing', 'lopp, mil, stafett', null, 'Stockholm for Runners: Long-Distance Races and Competitions', 'Löparens Stockholm: lopp och tävlingar i huvudstaden'],
+    [null, '"Drive-in", veteranbil, bilmässa, "car meet"', null, 'By car in Stockholm', 'Med bil i Stockholm'],
+    [null, 'midsommar', null, 'Midsummer in Stockholm 2026', 'Midsommar i Stockholm 2026'],
+    ['Exhibitions', 'historia', null, 'Museums for History Buffs in Stockholm', 'Museer för historieintresserade i Stockholm'],
+    ['Exhibitions', 'forskning, vetenskap, tech', null, 'Science Museums in Stockholm', 'Museer för vetgiriga'],
+    [null, 'film festival, filmfestival', null, 'At the Movies: Cinemas and Film Festivals Stockholm', 'Mysiga biografer och filmfestivaler i Stockholm'],
+    ['Guided tours & Lectures', 'Natur', null, "Enjoy Allemansrätten – Sweden's Right to Roam", 'Njut av allemansrätten i Stockholms natur'],
+    ['Music', 'dirigent, orkester, kvartett, kvintett, stråk, kammarkör', null, 'An Evening With Classical Music in Stockholm', 'Njut av klassisk musik i Stockholm'],
+    ['Sports & Wellbeing', 'Spa', null, 'Enjoy a Spa Weekend in Stockholm City', 'Njut av spa i Stockholm'],
+    [null, 'Semla', null, 'Fat Tuesday – the day of the Semla 2026', 'Njut av Stockholms bästa semlor 2027'],
+    ["Christmas & New Year's", 'Nyår', null, "New Year's Eve in Stockholm 2026", 'Nyår i Stockholm 2026'],
+    [null, 'påsk, easter', null, 'Easter in Stockholm', 'Påsk i Stockholm 2026'],
+    [null, 'Quiz, frågesport', null, 'Quiz night in Stockholm', 'Quizkväll i Stockholm'],
+    [null, 'ridtur, häst', null, 'Saddle up: Horseback Riding in Stockholm', 'Sadla upp: Se Stockholm från hästryggen'],
+    ['Eat & Drink', 'skärgård', null, 'Gastronomic archipelago', 'Skärgårdssmaker'],
+    [null, 'skärgård+spännande, skärgård+äventyr', null, 'Be Adventurous in the Stockholm archipelago', 'Skärgårdsäventyr'],
+    [null, '"slow fashion"', null, 'Slow Fashion District – second hand and vintage in Stockholm', 'Slow Fashion District – second hand och vintage på Södermalm'],
+    ['Eat & Drink+Fairs', null, null, 'Delicious events in Stockholm', 'Smakfulla evenemang i Stockholm'],
+    [null, 'slaktkyrkan, fållan, slaktis, slakthusområdet', null, 'Sunrise over Slakthusområdet', 'Solen går upp över Slakthusområdet'],
+    [null, 'Golf', null, 'Tee Up On Your Vacation', 'Spela golf på semestern'],
+    [null, 'music', null, 'Stockholm ❤️ Music', 'Stockholm ❤️ musik'],
+    [null, 'nörd, "tv-spel", rollspel, fantasy, "sci-fi", "cosplay"', null, 'Stockholm ❤️ Nerds', 'Stockholm ❤️ Nördar'],
+    [null, 'teenager', null, "The Teenager's Guide to Stockholm", 'Stockholm för tonårsfamiljen'],
+    ['Guided tours & Lectures', 'Film', null, 'Stockholm in the Movies', 'Stockholm i filmens värld'],
+    [null, 'brunch', null, 'The best brunch in Stockholm', 'Stockholms bästa brunch'],
+    [null, 'kräftor, surströmming, mårten gås, "inlagd sill", senapssill, knäckebröd, "västerbottens"', null, 'Traditional Swedish food in Stockholm', 'Svensk husmanskost i Stockholm'],
+    [null, 'fashion, mode', null, 'Swedish Fashion', 'Svenskt mode'],
+    [null, 'takbar, "rooftop bar", skybar', null, 'Fantastic rooftop bars in Stockholm', 'Takbarer i Stockholm'],
+    ['Guided tours & Lectures', 'Arkitektur, "offentlig konst", jugend, brutalism', null, 'Architecture Highlights in Stockholm', 'Upptäck Stockholms arkitektur'],
+    [null, 'slott, -"kungliga slottet"', null, 'Day-trips to the Historic Castles of Stockholm', 'Utflyktstips: fantastiska slott i Stockholm'],
+    [null, '"offentlig konst"', null, 'Public Art in Stockholm', 'Utomhuskonst i Stockholm'],
+    ['Exhibitions', null, null, 'Current and Upcoming Exhibitions in Stockholm', 'Utställningar i Stockholm - Aktuella och kommande'],
+    [null, '"viking"', null, 'Follow in the Footsteps of the Vikings in Stockholm', 'Vikingar i Stockholm'],
+    [null, 'vinprovning, vin+provning', null, 'Wine bars in Stockholm', 'Vinbarer i Stockholm'],
+    [null, '"snö", "skidor", pulka, skridsko, vinterbad', null, 'Winter Activities in Stockholm', 'Vinteraktiviteter i Stockholm'],
+    [null, 'vinterbad', null, 'Brave the Cold: A Winter Swim in Stockholm', 'Vinterbada i Stockholm'],
+    [null, 'pulka', null, 'Fun Sled Slopes in Stockholm', 'Åk pulka i Stockholm'],
+    [null, 'skridskor', null, 'Ice Skating in Stockholm', 'Åk skridskor i Stockholm'],
+    [null, 'halloween', null, 'Halloween and Fall break in Stockholm', null],
+    ['Music', 'avicii arena, friends arena', null, 'The biggest Stockholm events', 'De största evenemangen i Stockholm']
   ];
 
+  function buildGuideRuleFromRow(row, idx) {
+    const [category, keyword, dateRange, guideEnRaw, guideSvRaw] = row;
+    const categoryTest = buildCategoryTest(category);
+    const keywordTest = buildKeywordTest(keyword);
+    const dateTest = buildDateTest(dateRange);
+    const guideEn = resolveGuideTitle(guideEnRaw);
+    const guideSv = resolveGuideTitle(guideSvRaw);
+    if (!categoryTest && !keywordTest && !dateTest) {
+      vlog('GuideRegel #' + idx + ' (' + (guideEn || guideSv || '?') + '): inga villkor angivna — hoppas över.', 'err');
+      return null;
+    }
+    if (!guideEn && !guideSv) {
+      vlog('GuideRegel #' + idx + ': ingen guide angiven på något språk — hoppas över.', 'err');
+      return null;
+    }
+    return {
+      name: 'row' + idx,
+      match: ctx =>
+        (!categoryTest || categoryTest(ctx.categoriesLower)) &&
+        (!keywordTest || keywordTest(ctx.text)) &&
+        (!dateTest || dateTest(ctx.dates)),
+      guideEn: guideEn ? stripTrailingYear(guideEn) : null,
+      guideSv: guideSv ? stripTrailingYear(guideSv) : null
+    };
+  }
+
+  const GUIDE_TAG_RULES = GUIDE_TAG_ROWS.map(buildGuideRuleFromRow).filter(Boolean);
+
   const guideTagRulesFired = new Set();
+  const guidesAlreadyTagged = new Set();
   async function runGuideTagRules() {
     const ctx = buildGuideTagContext();
     for (const rule of GUIDE_TAG_RULES) {
@@ -4492,9 +4684,16 @@
       try { hit = rule.match(ctx); } catch (e) { vlog('GuideRegel "' + rule.name + '": fel i match() — ' + e.message, 'err'); continue; }
       if (!hit) continue;
       guideTagRulesFired.add(rule.name);
-      await selectAutocompleteValue('id_related_guides', rule.guideEn);
-      await selectAutocompleteValue('id_related_guides', rule.guideSv);
-      vlog('EventEdit: Guideregel "' + rule.name + '" taggade "' + rule.guideEn + '"/"' + rule.guideSv + '".', 'ok');
+      const applied = [];
+      for (const g of [rule.guideEn, rule.guideSv]) {
+        if (!g) continue;
+        const key = g.toLowerCase();
+        if (guidesAlreadyTagged.has(key)) continue;
+        guidesAlreadyTagged.add(key);
+        await selectAutocompleteValue('id_related_guides', g);
+        applied.push(g);
+      }
+      if (applied.length) vlog('EventEdit: Guideregel "' + rule.name + '" taggade ' + applied.map(g => '"' + g + '"').join('/') + '.', 'ok');
     }
   }
 
