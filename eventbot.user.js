@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.57.2
+// @version      7.57.3
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1214,10 +1214,18 @@
       .toLowerCase();
   }
 
-  function waitForSuggestions(list, timeout = 4000) {
+  // OBS (2026-09-17): tar emot `input`, inte en färdig `list` — aria-owns
+  // slås upp PÅ VARJE POLL-tick istället för en gång innan väntan börjar.
+  // Vissa autocomplete-fält (bekräftat: related_guides) sätter aria-owns
+  // lat, först när widgeten faktiskt bestämmer sig för att visa en lista
+  // (t.ex. efter ett asynkront sök-svar) — slogs den upp EN gång direkt
+  // efter att vi skrivit in texten var den ofta fortfarande null, och hela
+  // väntan pollade då null för evigt även om listan dök upp en stund senare.
+  function waitForSuggestions(input, timeout = 4000) {
     return new Promise((resolve) => {
       const start = Date.now();
       const check = () => {
+        const list = getSuggestionList(input);
         const items = list ? Array.from(list.querySelectorAll('li[role="option"]')) : [];
         const visible = list && getComputedStyle(list).display !== "none" && items.length > 0;
         if (visible) return resolve(items);
@@ -1230,22 +1238,28 @@
 
   async function selectAutocompleteValue(fieldId, value) {
     const input = document.getElementById(fieldId);
-    if (!input) { console.warn(`Autocomplete field not found: ${fieldId}`); return false; }
+    if (!input) { vlog('Autocomplete: fältet ' + fieldId + ' hittades inte.', 'err'); return false; }
     if (!value) return false;
     const target = normalize(value);
+    vlog('Autocomplete: skriver "' + value + '" i ' + fieldId + '…');
     setSearchValue(input, value);
-    const list = getSuggestionList(input);
-    const items = await waitForSuggestions(list);
-    if (!items.length) { console.warn(`No suggestions appeared for ${fieldId} → "${value}"`); return false; }
+    const items = await waitForSuggestions(input);
+    if (!items.length) {
+      vlog('Autocomplete: inga förslag dök upp för ' + fieldId + ' → "' + value + '" (väntade 4s, aria-owns hittades ' +
+        (getSuggestionList(input) ? 'till slut men utan alternativ' : 'aldrig') + ').', 'err');
+      return false;
+    }
     const textOf = (li) => normalize(li.querySelector("span")?.textContent || li.textContent);
     let match =
       items.find((li) => textOf(li) === target) ||
       items.find((li) => textOf(li).startsWith(target)) ||
       items.find((li) => textOf(li).includes(target));
     if (!match) {
-      console.warn(`No matching option for ${fieldId} → "${value}". Options:`, items.map(textOf));
+      vlog('Autocomplete: inget förslag matchade ' + fieldId + ' → "' + value + '". Alternativ: ' +
+        items.map(textOf).join(' | '), 'err');
       return false;
     }
+    vlog('Autocomplete: valde "' + textOf(match) + '" i ' + fieldId + '.', 'ok');
     match.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     match.click();
     console.log(`Selected ${fieldId} → ${value}`);
@@ -4175,7 +4189,9 @@
     if (document.getElementById('vseh-edit-css')) return;
     const s = document.createElement('style');
     s.id = 'vseh-edit-css';
-    s.textContent = EDIT_BAR_CSS;
+    // PANEL_CSS ger :root-variablerna (--vd-*) och de färdiga
+    // #vseh-logwrap/#vseh-log-reglerna som loggfönstret nedan återanvänder.
+    s.textContent = PANEL_CSS + EDIT_BAR_CSS;
     document.head.appendChild(s);
   }
   function initEventChecker() {
@@ -4189,13 +4205,38 @@
         bar.innerHTML = `
           <button id="vseh-rewrite-btn" type="button">Omskriv med Mistral</button>
           <span id="vseh-rewrite-status"></span>
+          <button type="button" id="vseh-edit-logbtn" title="Visa logg">📋 Logg</button>
         `;
         anchor.parentNode.insertBefore(bar, anchor.nextSibling);
         const result = document.createElement('div');
         result.id = 'vseh-rewrite-result';
         result.style.display = 'none';
         bar.insertAdjacentElement('afterend', result);
+        const logWrap = document.createElement('div');
+        logWrap.id = 'vseh-logwrap';
+        logWrap.style.display = 'none';
+        logWrap.innerHTML = `
+          <div class="vseh-loghdr">Diagnostiklogg <span style="display:flex;gap:5px;">
+            <button type="button" id="vseh-logcopy" title="Kopiera loggen">📋 Kopiera</button>
+            <button type="button" id="vseh-logclose" title="Stäng">✕</button></span></div>
+          <div id="vseh-log"></div>
+        `;
+        document.body.appendChild(logWrap);
         document.getElementById('vseh-rewrite-btn').addEventListener('click', rewriteWithAgent);
+        document.getElementById('vseh-edit-logbtn').addEventListener('click', () => {
+          const w = document.getElementById('vseh-logwrap');
+          w.style.display = (w.style.display === 'none' || !w.style.display) ? 'flex' : 'none';
+          renderLog();
+        });
+        document.getElementById('vseh-logclose').addEventListener('click', () => {
+          document.getElementById('vseh-logwrap').style.display = 'none';
+        });
+        document.getElementById('vseh-logcopy').addEventListener('click', async () => {
+          const btn = document.getElementById('vseh-logcopy');
+          const text = VLOG.map(e => e.line).join('\n');
+          try { await navigator.clipboard.writeText(text); btn.textContent = '✓ Kopierat'; setTimeout(() => btn.textContent = '📋 Kopiera', 1200); }
+          catch { btn.textContent = 'Fel'; setTimeout(() => btn.textContent = '📋 Kopiera', 1200); }
+        });
       }
     }
   }
