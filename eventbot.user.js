@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.66.0
+// @version      7.67.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4243,13 +4243,14 @@
     };
   }
 
-  // ---- EventChecker (Rewrite-agent, edit-sida) -----------------------------
-  // Ny sidtyp: edit-sidan (KNOWN_EDIT_URL). Läser ifyllda formulärfält, skickar
-  // dem till samma Mistral-agent (mistral_key/mistral_agent) för omskrivning,
-  // och visar resultatet — separat från huvudflödet, rör inte create-panelen.
-  // Återinförd 2026-09-17 som en sticky bar högst upp (samma mönster som
-  // draft-vyns #vseh-draft-bar) istället för den gamla inrutade boxen mitt i
-  // formuläret, som "visade sig konstigt".
+  // ---- EventChecker (sticky bar, edit-sida) --------------------------------
+  // Ny sidtyp: edit-sidan (KNOWN_EDIT_URL). Sticky bar högst upp (samma
+  // mönster som draft-vyns #vseh-draft-bar) med avvikelsesammanfattningen
+  // och diagnostikloggen. Hade tidigare även en egen "Skriv om 🤖"-knapp som
+  // skickade HELA formuläret till en Mistral-agent för omskrivning — borttagen
+  // 2026-09-19 (på begäran) eftersom de per-fält-knapparna som redan sitter
+  // bredvid respektive fält (checkGuidelineIssues/checkTitleCasing) gör
+  // samma jobb mer träffsäkert.
   const EDIT_BAR_CSS = `
     #vseh-edit-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
       flex-wrap:wrap; gap:10px; background:#2f3542; color:#e8eaee; padding:10px 14px;
@@ -4258,9 +4259,6 @@
     #vseh-edit-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer;
       font-size:13px; font-weight:600; background:#4a9fe0; color:#fff; }
     #vseh-edit-bar button:disabled { opacity:.6; cursor:not-allowed; }
-    #vseh-rewrite-status { font-size:12px; color:#c3c8d1; }
-    #vseh-rewrite-result { max-height:200px; overflow-y:auto; background:#1b1f27; color:#e8eaee;
-      border-radius:6px; padding:10px; margin:0 0 14px; font-size:12px; }
   `;
   function ensureEditBarStyle() {
     if (document.getElementById('vseh-edit-css')) return;
@@ -4281,15 +4279,9 @@
         bar.id = 'vseh-edit-bar';
         bar.innerHTML = `
           <span id="vseh-issues-summary" style="color:#e0a052;font-weight:600;"></span>
-          <button id="vseh-rewrite-btn" type="button">Skriv om 🤖 (mistral)</button>
-          <span id="vseh-rewrite-status"></span>
           <button type="button" id="vseh-edit-logbtn" title="Visa logg">📋 Logg</button>
         `;
         anchor.parentNode.insertBefore(bar, anchor.nextSibling);
-        const result = document.createElement('div');
-        result.id = 'vseh-rewrite-result';
-        result.style.display = 'none';
-        bar.insertAdjacentElement('afterend', result);
         const logWrap = document.createElement('div');
         logWrap.id = 'vseh-logwrap';
         logWrap.style.display = 'none';
@@ -4300,7 +4292,6 @@
           <div id="vseh-log"></div>
         `;
         document.body.appendChild(logWrap);
-        document.getElementById('vseh-rewrite-btn').addEventListener('click', rewriteWithAgent);
         document.getElementById('vseh-edit-logbtn').addEventListener('click', () => {
           const w = document.getElementById('vseh-logwrap');
           w.style.display = (w.style.display === 'none' || !w.style.display) ? 'flex' : 'none';
@@ -4317,92 +4308,6 @@
         });
       }
     }
-  }
-
-  async function rewriteWithAgent() {
-    const statusEl = document.getElementById('vseh-rewrite-status');
-    const resultEl = document.getElementById('vseh-rewrite-result');
-    const btn = document.getElementById('vseh-rewrite-btn');
-    if (btn) btn.disabled = true;
-    if (statusEl) statusEl.textContent = 'Anropar Mistral…';
-    if (resultEl) resultEl.style.display = 'none';
-
-    try {
-      const form = document.querySelector('form');
-      if (!form) throw new Error('Inget formulär funnet');
-      const formData = new FormData(form);
-      const fieldData = {};
-      for (const [name, value] of formData.entries()) {
-        if (typeof value === 'string' && value.trim()) fieldData[name] = value;
-      }
-      form.querySelectorAll('textarea').forEach(ta => {
-        if (ta.name && ta.value.trim()) fieldData[ta.name] = ta.value;
-      });
-      if (Object.keys(fieldData).length === 0) throw new Error('Inga fältdata hittades');
-      if (statusEl) statusEl.textContent = 'Skickar till Mistral…';
-
-      const mistralKey = GM_getValue('mistral_key', '');
-      const mistralAgent = GM_getValue('mistral_agent', '');
-      if (!mistralKey || !mistralAgent) throw new Error('Mistral API-nyckel och/eller agent-ID saknas');
-
-      const payload = {
-        agent_id: mistralAgent,
-        messages: [{
-          role: 'user',
-          content: `Omskriv följande event-data till bättre format för Visit Stockholm CMS:\n\n${JSON.stringify(fieldData, null, 2)}`
-        }]
-      };
-
-      vlog('EventChecker: Skickar data till Mistral');
-      const response = await gmPost(MISTRAL_CONV, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
-
-      if (statusEl) statusEl.textContent = 'Tolkning av svar…';
-      let rewritten = null;
-      if (response && response.choices && response.choices.length > 0) {
-        const lastChoice = response.choices[response.choices.length - 1];
-        if (lastChoice.message && lastChoice.message.content) {
-          rewritten = extractRewriteJSON(lastChoice.message.content);
-        }
-      }
-      if (!rewritten && response && response.output) {
-        rewritten = extractRewriteJSON(response.output);
-      }
-      if (!rewritten) throw new Error('Kunde inte tolka svaret');
-
-      if (statusEl) {
-        statusEl.textContent = 'Klar! Resultat:';
-        statusEl.style.color = '#1f7a4d';
-      }
-      if (resultEl) {
-        if (typeof rewritten === 'object') {
-          resultEl.innerHTML = '<pre>' + esc(JSON.stringify(rewritten, null, 2)) + '</pre>';
-        } else {
-          resultEl.textContent = rewritten;
-        }
-        resultEl.style.display = 'block';
-      }
-      vlog('EventChecker: Omskrivning klar!', 'ok');
-    } catch (error) {
-      if (statusEl) {
-        statusEl.textContent = 'Fel: ' + error.message;
-        statusEl.style.color = '#c02626';
-      }
-      vlog('EventChecker: Fel - ' + error.message, 'err');
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  }
-
-  // Döpt om från "extractAgentText" (som redan används av URL/kalender-flödet
-  // för ett helt annat syfte: plocka text ur ett Conversations API-svar) för
-  // att undvika en dubbeldefinition/namnkrock i samma IIFE-scope.
-  function extractRewriteJSON(fullText) {
-    const jsonStart = fullText.indexOf('{');
-    const jsonEnd = fullText.lastIndexOf('}') + 1;
-    if (jsonStart >= 0 && jsonEnd > jsonStart) {
-      try { return JSON.parse(fullText.slice(jsonStart, jsonEnd)); } catch {}
-    }
-    return null;
   }
 
   // ---- Edit-sidans automatiska kontroller (v7.56.0) -------------------------
@@ -4597,9 +4502,8 @@
 
   // Skickar EXAKT de riktlinjeavvikelser som upptäckts (GUIDELINE_FIXES) som
   // redigeringsinstruktioner till Mistral — samma raka chat/completions-anrop
-  // som translateDescription() redan använder, inte den JSON-baserade
-  // agenten (rewriteWithAgent), eftersom detta bara ska ändra EXAKT det som
-  // flaggats och inget annat.
+  // som translateDescription() redan använder, eftersom detta bara ska
+  // ändra EXAKT det som flaggats och inget annat.
   async function rewriteGuidelineIssues(lang, fixLabels) {
     const fieldId = 'id_description_' + lang;
     const text = readDraftailText(fieldId);
@@ -5082,7 +4986,16 @@
   // adressfältet — bekräftat 2026-09-18 att bara simulerad textändring
   // (utan riktiga musklick) inte räcker (kartan aktiverades aldrig), och
   // 2026-09-19 att mousedown/mouseup/click INTE heller räcker (fortfarande
-  // ingen karta). Troliga orsaken: syntetiska (script-dispatchade) mus-event
+  // ingen karta), och (samma dag) att funktionen "ibland" inte aktiverade
+  // fältet alls — den kördes tidigare BARA en gång, synkront, direkt vid
+  // initEventEditAutomation() (utanför 1.5s-polling-loopen alla andra
+  // kontroller får), så om adressfältet råkade vara TOMT i just det ögon-
+  // blicket (t.ex. ett nytt utkast vars adress fylls i asynkront en stund
+  // efter sidladdning) gav `!el.value`-kollen upp permanent, utan någon
+  // ny chans. Anropas därför nu från runEditPageChecks() istället, så den
+  // försöker igen var 1.5:e sekund tills fältet faktiskt har ett värde
+  // (addressActivated-flaggan ser ändå till att den bara KÖR en gång).
+  // Troliga orsaken till att synkrona musevent inte hjälper: syntetiska (script-dispatchade) mus-event
   // flyttar ALDRIG webbläsarens fokus — det gör bara riktiga, betrodda
   // användarklick. Om widgeten aktiverar kartan via en focus/focusin-lyssnare
   // på fältet har den alltså aldrig sett något fokus alls hittills. Anropar
@@ -5235,6 +5148,7 @@
   }
 
   function runEditPageChecks() {
+    activateAddressGeotag();
     stripEmojisFromTitles();
     checkTitleCasing();
     stripDescriptionEmoji();
@@ -5247,7 +5161,6 @@
 
   function initEventEditAutomation() {
     vlog('EventEdit: Initierar automatiska kontroller på edit-sidan');
-    activateAddressGeotag();
     initEventChecker();
     installResaleSubmitGuard();
     runEditPageChecks();
