@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.75.0
+// @version      7.75.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3326,29 +3326,39 @@
   }
 
   // Läser tabellraderna som redan finns i DOM:et på SBR:s eventlista-sida
-  // direkt — samma standardmarkup (tr[data-object-pk], td.field-<kolumn>)
-  // som Visit Stockholms draftlista redan använder framgångsrikt
-  // (extractRowData/runDraftvyCheck), eftersom båda sajterna körs på samma
-  // Wagtail-uppsättning för samma Event-snippet-typ. Ersätter det manuella
-  // markera+kopiera+växla-flik+klistra-in-flödet (~7-8 handgrepp per sida
-  // enligt användaren 2026-09-19) med ETT klick — kvar blir bara att klicka
-  // "nästa sida" i SBR:s egen paginering mellan varje hämtning.
+  // direkt, istället för att kräva manuell markera+kopiera+växla-flik+
+  // klistra-in (~7-8 handgrepp per sida enligt användaren 2026-09-19).
+  // FÖRSTA försöket antog samma markup som Visit Stockholms draftlista
+  // (tr[data-object-pk], td.field-<kolumn>) — det stämde INTE. SBR:s
+  // eventlista är byggd på Wagtails nyare SnippetViewSet-listmall, som
+  // saknar semantiska kolumnklasser helt utom på checkbox- och titel-
+  // cellerna. Bekräftat via en riktig rads kolumner (konsol-dump
+  // 2026-09-19): [0] kryssruta (klass "bulk-action-checkbox-cell"),
+  // [1] td.title (engelsk titel, länkad), [2] (ingen klass) svensk
+  // titel, [3] (ingen klass) startdatum ("27 maj 2026"), [4] (ingen
+  // klass) ändrad-tidsstämpel, [5] (ingen klass) status ("Publicerad").
+  // Läser därför cellerna POSITIONELLT via td.title's syskonindex istället
+  // för klassnamn, eftersom inga finns att träffa för kolumn 2-5.
   function extractSbrRowData(row) {
-    const titleEnEl = row.querySelector('td.field-title_en .title-wrapper a, td.field-title_en a, td.field-title_en');
-    const title_en = (titleEnEl?.textContent || '').trim();
-    const title_sv = (row.querySelector('td.field-title_sv')?.textContent || '').trim();
+    const cells = row.children;
+    if (!cells || cells.length < 6) return null;
+    const title_en = (cells[1]?.textContent || '').trim();
+    const title_sv = (cells[2]?.textContent || '').trim();
     if (!title_en && !title_sv) return null;
-    const start_date = parseSwedishDate((row.querySelector('td.field-start_date')?.textContent || '').trim()) || '';
-    const modified_raw = (row.querySelector('td.field-modified_at')?.textContent || '').trim();
-    const status = (row.querySelector('td.field-status')?.textContent || '').trim();
+    const start_date = parseSwedishDate((cells[3]?.textContent || '').trim()) || '';
+    const modified_raw = (cells[4]?.textContent || '').trim();
+    const status = (cells[5]?.textContent || '').trim();
     return { title_en, title_sv, start_date, modified_raw, status };
   }
 
   function fetchVisibleSbrEvents() {
-    const rows = [...document.querySelectorAll('tr[data-object-pk]')];
-    if (!rows.length) { vlog('Eventlista: hittade inga tabellrader på sidan — är du på SBR:s eventlista?', 'err'); return; }
-    const parsed = rows.map(extractSbrRowData).filter(Boolean);
-    if (!parsed.length) { vlog('Eventlista: hittade ' + rows.length + ' rad(er) men kunde inte läsa titel/datum ur någon — kolumnstrukturen kan se annorlunda ut här, klistra in manuellt istället.', 'err'); return; }
+    const titleCells = [...document.querySelectorAll('td.title')];
+    if (!titleCells.length) { vlog('Eventlista: hittade inga rader (ingen td.title) på sidan — är du på SBR:s eventlista?', 'err'); return; }
+    const parsed = titleCells.map(td => extractSbrRowData(td.closest('tr'))).filter(Boolean);
+    if (!parsed.length) { vlog('Eventlista: hittade ' + titleCells.length + ' rad(er) men kunde inte läsa ut kolumndata ur någon — sidstrukturen kan ha ändrats igen, klistra in manuellt istället.', 'err'); return; }
+    // Loggar första raden i klartext så en felaktig kolumntolkning syns
+    // direkt, istället för att bara upptäckas efter en tyst felimport.
+    vlog('Eventlista: första tolkade raden — EN:"' + parsed[0].title_en + '" SV:"' + parsed[0].title_sv + '" datum:"' + parsed[0].start_date + '" status:"' + parsed[0].status + '" — kontrollera att det stämmer.', 'ok');
     mergeSbrCalEntries(parsed, 'synliga rader på sidan');
   }
 
