@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.65.1
+// @version      7.66.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4746,13 +4746,19 @@
   // räknas som "kravlöst" — bara de villkor som faktiskt anges måste stämma.
 
   // Kategorierna är den bekräftade fullständiga listan (2026-09-17) — exakt
-  // jämförelse mot main_category/categories-titeln (engelska, som är vad
-  // JSON-fälten faktiskt lagrar) istället för en löst gissad regex.
+  // jämförelse mot main_category/categories/subcategory-titeln (engelska,
+  // som är vad JSON-fälten faktiskt lagrar, t.ex. "Theater" — bekräftad
+  // stavning från befintlig kod, se isPerformance-checken vid rad ~2009)
+  // istället för en löst gissad regex. Subcategory togs med 2026-09-19 så
+  // guide-taggningsraderna kan matcha mot den (samma `category`-cell/
+  // buildCategoryTest som redan finns — ingen ny kolumn behövs).
   function currentCategoryTitles() {
+    let sub = null;
+    try { sub = JSON.parse(document.querySelector('input[name="subcategory"]')?.value || 'null'); } catch {}
     try {
       const main = JSON.parse(document.querySelector('input[name="main_category"]')?.value || 'null');
       const cats = JSON.parse(document.querySelector('input[name="categories"]')?.value || 'null');
-      return [main?.title, ...(Array.isArray(cats) ? cats.map(c => c.title) : [])].filter(Boolean);
+      return [main?.title, ...(Array.isArray(cats) ? cats.map(c => c.title) : []), sub?.title].filter(Boolean);
     } catch { return []; }
   }
 
@@ -4867,12 +4873,14 @@
   // [kategori, nyckelord, datumvillkor, guide (EN), guide (SV)] — en rad per
   // post i "autofiltrering_guider.xlsx" (granskad + rättad 2026-09-18), plus
   // några extra rader (sist) som inte kommer från kalkylarket: Avicii/Friends
-  // Arena-regeln som fanns innan kalkylarket, och Nalen/Debaser/Kollektivet
-  // Livet (2026-09-19, på begäran) — matchar mot venue-namnet, som ingår i
-  // buildGuideTagContext's `text`. En rad utan NÅGOT villkor (kategori+
-  // nyckelord+datum alla tomma)
-  // hoppas över helt av buildGuideRuleFromRow — den ska INTE tagga sin guide
-  // ovillkorligen (bekräftat 2026-09-18).
+  // Arena-regeln som fanns innan kalkylarket, Nalen/Debaser/Kollektivet Livet
+  // (2026-09-19, på begäran) — matchar mot venue-namnet, som ingår i
+  // buildGuideTagContext's `text` — samt Theater-subcategoryn (2026-09-19,
+  // på begäran) — kategori-cellen matchar numera även mot subcategory, inte
+  // bara main_category/categories (se currentCategoryTitles()). En rad utan
+  // NÅGOT villkor (kategori+nyckelord+datum alla tomma) hoppas över helt av
+  // buildGuideRuleFromRow — den ska INTE tagga sin guide ovillkorligen
+  // (bekräftat 2026-09-18).
   const GUIDE_TAG_ROWS = [
     [null, 'adrenalin, uthållig, sport, svettas, ansträng', null, 'Have an Active Vacation', 'Aktiv semester i Stockholm'],
     [null, 'äventyr, adrenalin', null, 'ENDAST SVENSKA', 'Aktiviteter för den äventyrlige'],
@@ -4971,7 +4979,8 @@
     [null, 'skridskor', null, 'Ice Skating in Stockholm', 'Åk skridskor i Stockholm'],
     [null, 'halloween', null, 'Halloween and Fall break in Stockholm', null],
     ['Music', 'avicii arena, friends arena', null, 'The biggest Stockholm events', 'De största evenemangen i Stockholm'],
-    ['Music', 'nalen, debaser, kollektivet livet', null, 'Upcoming concerts and music festivals', 'Kommande konserter & festivaler']
+    ['Music', 'nalen, debaser, kollektivet livet', null, 'Upcoming concerts and music festivals', 'Kommande konserter & festivaler'],
+    ['Theater', null, null, null, 'Teater i Stockholm – anrika tiljor och nyskapande drama']
   ];
 
   function buildGuideRuleFromRow(row, idx) {
