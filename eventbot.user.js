@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.76.1
+// @version      7.77.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2622,6 +2622,7 @@
             <button type="button" class="crm-f" data-f="in_sbr">SBR (<span id="crm-count-in_sbr">0</span>)</button>
             <button type="button" class="crm-f" data-f="not_in_cal">Ej inlagt (<span id="crm-count-not_in_cal">0</span>)</button>
             <button type="button" class="crm-f" data-f="passed">Passerat (<span id="crm-count-passed">0</span>)</button>
+            <button type="button" class="crm-f" data-f="handled">Hanterat (<span id="crm-count-handled">0</span>)</button>
           </div>
           <div id="sbr-crm-monthfilter" style="margin-top:6px;">
             <select id="sbr-crm-month-select">
@@ -2716,6 +2717,7 @@
 
     // ---- CRM-import ----
     loadSbrCrmEvents();
+    loadCrmHandled();
     renderCrmEvents();
     $('sbr-crm-import').addEventListener('click', () => {
       const ta = $('sbr-crm-paste');
@@ -2973,6 +2975,32 @@
   }
   function saveSbrCrmEvents() { GM_setValue(SBR_CRM_KEY, JSON.stringify(sbrCrmEvents)); }
 
+  // ---- "Hanterat" (manuell flagga, CRM-vyn) --------------------------------
+  // Samma mönster som huvudpanelens manualIn/isManualIn, men egen nyckelrymd
+  // (CRM-rader har title+venue+start_date, inte venue_name/address). Ett event
+  // räknas som hanterat om det är manuellt flaggat ELLER redan passerat datum
+  // — passerade event kräver inget klick för att hamna i "Hanterat"-vyn.
+  const SBR_CRM_HANDLED_KEY = 'sbr_crm_handled';
+  let crmHandled = new Set();
+  function loadCrmHandled() {
+    try { const raw = GM_getValue(SBR_CRM_HANDLED_KEY, ''); if (raw) crmHandled = new Set(JSON.parse(raw)); } catch {}
+  }
+  function saveCrmHandled() {
+    try { GM_setValue(SBR_CRM_HANDLED_KEY, JSON.stringify(Array.from(crmHandled))); } catch {}
+  }
+  function crmKey(ev) { return normText(ev.title) + '@' + normText(ev.venue || '') + '@' + (ev.start_date || ''); }
+  function isCrmManuallyHandled(ev) { return crmHandled.has(crmKey(ev)); }
+  function isCrmPassed(ev) {
+    const today = new Date().toISOString().split('T')[0];
+    return ev.status === 'passed' || (ev.end_date && ev.end_date < today);
+  }
+  function isCrmHandled(ev) { return isCrmManuallyHandled(ev) || isCrmPassed(ev); }
+  function toggleCrmHandled(ev) {
+    const k = crmKey(ev);
+    if (crmHandled.has(k)) crmHandled.delete(k); else crmHandled.add(k);
+    saveCrmHandled();
+  }
+
   // Kolumnordning (tab-separerat från Excel):
   // Affärstyp, Startdatum, Slutdatum, Affärsnamn, Kortnamn, Antal deltagare, Vald plats, Webb
   function parseCrmData(text) {
@@ -3079,45 +3107,59 @@
       if (crmFilter === 'in_visit') return ev.status === 'in_visit' || ev.status === 'both';
       if (crmFilter === 'in_sbr') return ev.status === 'in_sbr' || ev.status === 'both';
       if (crmFilter === 'not_in_cal') return ev.status === 'not_in_cal';
+      if (crmFilter === 'handled') return isCrmHandled(ev);
       return true;
     }).sort((a, b) => (a.start_date || '9999').localeCompare(b.start_date || '9999'));
 
     // räknare
-    const counts = { all: sbrCrmEvents.length, in_visit: 0, in_sbr: 0, passed: 0, not_in_cal: 0 };
+    const counts = { all: sbrCrmEvents.length, in_visit: 0, in_sbr: 0, passed: 0, not_in_cal: 0, handled: 0 };
     sbrCrmEvents.forEach(ev => {
       if (ev.status === 'passed' || (ev.end_date && ev.end_date < today)) counts.passed++;
       else if (ev.status === 'in_visit' || ev.status === 'both') counts.in_visit++;
       if (ev.status === 'in_sbr' || ev.status === 'both') counts.in_sbr++;
       if (ev.status === 'not_in_cal') counts.not_in_cal++;
+      if (isCrmHandled(ev)) counts.handled++;
     });
-    ['all','in_visit','in_sbr','passed','not_in_cal'].forEach(k => {
+    ['all','in_visit','in_sbr','passed','not_in_cal','handled'].forEach(k => {
       const el = $('crm-count-' + k); if (el) el.textContent = counts[k];
     });
 
     if (!shown.length) { body.innerHTML = '<div class="vseh-empty">Inga CRM-event i denna vy.</div>'; return; }
 
-    body.innerHTML = shown.map(ev => {
+    body.innerHTML = shown.map((ev, i) => {
       const st = CRM_STATUS[ev.status] || CRM_STATUS.not_in_cal;
-      const passed = ev.status === 'passed' || (ev.end_date && ev.end_date < today);
+      const passed = isCrmPassed(ev);
+      const manHan = isCrmManuallyHandled(ev);
+      const handled = manHan || passed;
       const dateRange = ev.start_date
         ? (ev.end_date && ev.end_date !== ev.start_date ? ev.start_date + ' – ' + ev.end_date : ev.start_date)
         : '–';
       const badge = '<span class="vseh-badge" style="background:' + st.bg + ';color:' + st.fg + '">' + esc(st.label) + '</span>';
       const createBtn = (!passed && ev.url && ev.status === 'not_in_cal')
-        ? '<div class="vseh-create"><button type="button" class="vseh-crm-create" data-url="' + esc(ev.url) + '">✏️ Skapa utkast</button></div>' : '';
-      return '<div class="vseh-ev" style="border-left-color:' + st.bar + ';' + (passed ? 'opacity:.6;' : '') + '">' +
+        ? '<button type="button" class="vseh-crm-create" data-url="' + esc(ev.url) + '">✏️ Skapa utkast</button>' : '';
+      // Passerade event räknas som hanterade automatiskt — ingen knapp behövs för dem.
+      const handledBtn = !passed
+        ? '<button type="button" class="vseh-manin ' + (manHan ? 'on' : '') + '" data-si="' + i + '">' +
+          (manHan ? '↩︎ Ångra hanterat' : '✓ Hanterat') + '</button>' : '';
+      const actionsRow = (createBtn || handledBtn) ? '<div class="vseh-create">' + createBtn + handledBtn + '</div>' : '';
+      return '<div class="vseh-ev" style="border-left-color:' + st.bar + ';' + (handled ? 'opacity:.6;' : '') + '">' +
         '<h4><span>' + esc(ev.title) + '</span>' + badge + '</h4>' +
         '<div class="m"><span class="v">' + esc(ev.venue || '–') + '</span>' +
           (ev.business_type ? ' · ' + esc(ev.business_type) : '') + '</div>' +
         '<div class="dates"><b>' + esc(dateRange) + '</b>' +
           (ev.participants ? ' · ' + ev.participants + ' deltagare' : '') + '</div>' +
         (ev.url ? '<div class="m"><a class="vseh-edit" href="' + esc(ev.url) + '" target="_blank" rel="noopener">🔗 Länk</a></div>' : '') +
-        createBtn +
+        actionsRow +
       '</div>';
     }).join('');
 
     body.querySelectorAll('.vseh-crm-create').forEach(b => b.addEventListener('click', () => {
-      createEventFromUrl(b.dataset.url);   // återanvänder befintliga URL-flödet (SBR-läget väljer rätt agent självt)
+      createEventFromUrl(b.dataset.url);   // återanvänder befintliga URL-flödet (SBR-läget väljer rätt agent själv)
+    }));
+    body.querySelectorAll('.vseh-manin').forEach(b => b.addEventListener('click', () => {
+      const i = parseInt(b.dataset.si, 10);
+      toggleCrmHandled(shown[i]);
+      renderCrmEvents();
     }));
   }
 
