@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.76.0
+// @version      7.76.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2001,7 +2001,8 @@
         throw new Error('Kunde inte tolka agentens svar som JSON. Se loggrutan (📋) för råsvaret.');
       }
       vlog('JSON tolkad OK. Fält (' + Object.keys(data).length + '): ' + Object.keys(data).join(', '), 'ok');
-      vlog('Kontroll: title_sv="' + (data.title_sv || '(tom)') + '", main_category="' + (data.main_category || '(tom)') + '"');
+      vlog('Kontroll: title_sv="' + (data.title_sv || '(tom)') + '", main_category="' + (data.main_category || '(tom)') + '", notes="' + (data.notes || '(inga)') + '"');
+      try { vlog('Rådata (JSON): ' + JSON.stringify(data).slice(0, 6000)); } catch {}
 
       // Skriv ALLTID över occurrences med scriptets auktoritativa datumlista.
       // API-datumen är kompletta; agentens kan vara ofullständiga.
@@ -2088,10 +2089,25 @@
       }
     }
 
+    // Bekräftat 2026-09-21: detta hoppade tyst över HELA formulärifyllningen
+    // — även när agenten FAKTISKT gav ett fullt, användbart svar (28 fält,
+    // riktig titel/beskrivning) — och loggade bara via setEventStatus (en
+    // liten statusruta vid knappen), ALDRIG via vlog. Loggen såg alltså ut
+    // att sluta i "Bildrättighet utgår: …" utan förklaring, medan fälten
+    // förblev tomma. Fyller nu ändå i om det finns en riktig titel att gå
+    // på (bättre en ifylld-men-flaggad draft att granska än en helt tom),
+    // och avbryter bara om svaret verkligen saknar användbart innehåll.
+    // Notisen syns ändå i slutstatusen nedan (warn-listan byggs av HELA
+    // data.notes) och i vlog-raderna ovan (Kontroll/Rådata).
     if (data.notes && (data.notes.includes('could_not_fetch_url') || data.notes.includes('content_insufficient'))) {
       const why = data.notes.includes('could_not_fetch_url') ? 'kunde inte läsa sidan' : 'sidan saknade tillräckligt eventinnehåll';
-      setEventStatus(idx, 'Mistral ' + why + '. Prova igen eller lägg in manuellt.', 'err');
-      return;
+      vlog('Mistral flaggade: ' + why + ' (notes="' + data.notes + '").', 'err');
+      if (!data.title_sv && !data.title_en) {
+        vlog('Ingen titel i svaret — fyller inte i formuläret.', 'err');
+        setEventStatus(idx, 'Mistral ' + why + ' och gav ingen användbar data. Prova igen eller lägg in manuellt.', 'err');
+        return;
+      }
+      vlog('Svaret innehöll ändå en titel — fyller i formuläret, men dubbelkolla extra noga (se flaggan i slutstatusen).', 'err');
     }
 
     // Fyll create-formuläret PÅ PLATS i denna flik.
@@ -2291,7 +2307,11 @@
         throw new Error('Kunde inte tolka agentens svar som JSON. Se loggrutan (📋) för råsvaret.');
       }
       vlog('JSON tolkad OK. Fält (' + Object.keys(data).length + '): ' + Object.keys(data).join(', '), 'ok');
-      vlog('Kontroll: title_sv="' + (data.title_sv || '(tom)') + '", dates_uncertain="' + (data.dates_uncertain || '(ej satt)') + '"');
+      vlog('Kontroll: title_sv="' + (data.title_sv || '(tom)') + '", dates_uncertain="' + (data.dates_uncertain || '(ej satt)') + '", notes="' + (data.notes || '(inga)') + '"');
+      // Rådata alltid i loggen (på begäran 2026-09-21) — inte bara fältnamnen
+      // ovan — så ett tyst hopp-över (t.ex. notes-kollen i finishEventCreation)
+      // går att felsöka utan att gissa vad agenten faktiskt svarade.
+      try { vlog('Rådata (JSON): ' + JSON.stringify(data).slice(0, 6000)); } catch {}
       lastUrlAgentData = data;   // sparas för "Kopiera senaste URL-svar"-knappen
       checkSbrManualDuplicate(data);   // no-op utanför SBR-läget (tom lista om aldrig laddad)
 
