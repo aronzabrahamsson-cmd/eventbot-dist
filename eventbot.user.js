@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.77.0
+// @version      7.77.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1224,9 +1224,15 @@
   async function updateDraftail(fieldId, text) {
     try {
       const root = await mountDraftail(fieldId);
-      if (!root) { console.warn(`Draftail kunde inte monteras: ${fieldId}`); return; }
+      if (!root) {
+        vlog(`Beskrivning: hittade inget Draftail-fält för ${fieldId} (varken .DraftEditor-root eller en klickbar .Draftail-Editor) — fältet lämnas tomt.`, 'err');
+        return;
+      }
       const props = getDraftProps(root);
-      if (!props) { console.warn(`Draftail React-props hittades inte: ${fieldId}`); return; }
+      if (!props) {
+        vlog(`Beskrivning: hittade Draftail-fältet ${fieldId} men inte dess React-props (onChange/editorState) — fältet lämnas tomt.`, 'err');
+        return;
+      }
       const editorState = props.editorState;
       const EditorState = editorState.constructor;
       const currentContent = editorState.getCurrentContent();
@@ -1237,9 +1243,9 @@
         newState = EditorState.moveSelectionToEnd(newState);
       }
       props.onChange(newState);
-      console.log(`Draftail satt via onChange: ${fieldId} → ${String(text).slice(0, 60)}...`);
+      vlog(`Beskrivning ifylld: ${fieldId} → ${String(text).slice(0, 60)}...`, 'ok');
     } catch (err) {
-      console.warn(`Draftail-fyllning gav fel för ${fieldId} (fortsätter):`, err);
+      vlog(`Beskrivning: fel vid ifyllning av ${fieldId} (fortsätter): ${err && err.message ? err.message : err}`, 'err');
     }
   }
 
@@ -1389,10 +1395,13 @@
 
   async function insertAndFillDateBlock({ date, start_time, end_time }) {
     const addBtn = findDateAdminAddButton();
-    if (!addBtn) { console.warn("date_admin add-block button not found!"); return; }
+    if (!addBtn) {
+      vlog(`Datum: hittade ingen "lägg till datum"-knapp (#date_admin-root / [data-contentpath="date_admin"]) — hoppar över ${date} ${start_time}-${end_time}. Formuläret använder troligen ett annat fältnamn/annan widget på den här sidan.`, 'err');
+      return;
+    }
     addBtn.click();
 
-    await new Promise((resolve) => {
+    const pickedSingleDate = await new Promise((resolve) => {
       let pickerTries = 0;
       const pickerInterval = setInterval(() => {
         const opts = Array.from(document.querySelectorAll(".w-combobox__option-text"));
@@ -1402,15 +1411,18 @@
         if (singleDateOpt) {
           singleDateOpt.click();
           clearInterval(pickerInterval);
-          resolve();
+          resolve(true);
         } else if (++pickerTries > 50) {
           clearInterval(pickerInterval);
-          resolve();
+          resolve(false);
         }
       }, 100);
     });
+    if (!pickedSingleDate) {
+      vlog(`Datum: "lägg till datum"-knappen klickades, men valet "Single date" dök aldrig upp i comboboxen (väntade 5s) — fortsätter ändå, blocket kan sakna rätt typ.`, 'err');
+    }
 
-    await new Promise((resolve) => {
+    const filled = await new Promise((resolve) => {
       let fillTries = 0;
       const fillInterval = setInterval(() => {
         const dateInputs = document.querySelectorAll(
@@ -1424,15 +1436,19 @@
           simulateInput(dateInput, date);
           simulateInput(startInput, start_time);
           simulateInput(endInput, end_time);
-          console.log(`Block ${nblock}: set ${date} ${start_time} - ${end_time}`);
           clearInterval(fillInterval);
-          resolve();
+          resolve(nblock);
         } else if (++fillTries > 120) {
           clearInterval(fillInterval);
-          resolve();
+          resolve(-1);
         }
       }, 100);
     });
+    if (filled >= 0) {
+      vlog(`Datum ifyllt: block ${filled} → ${date} ${start_time}–${end_time}.`, 'ok');
+    } else {
+      vlog(`Datum: hittade inte input-fälten date_admin-N-value-{date,start_time,end_time} efter 12s väntan — blocket för ${date} ${start_time}-${end_time} lämnas tomt.`, 'err');
+    }
   }
 
   async function fillDateBlocksFromCSV(data) {
@@ -1445,21 +1461,23 @@
         };
         return keyOf(a).localeCompare(keyOf(b));
       });
-      console.log("Occurrences to process (kronologiskt, äldst först):",
-        occurrences.length, occurrences.length ? occurrences.slice(0, 3) : []);
+      vlog(`Fyller ${occurrences.length} datumtillfälle(n) (kronologiskt, äldst först)…`);
       for (const occ of occurrences) {
         const [date, start_time, , end_time] = occ
           .split(";").map((v) => v.trim().replace(/^"|"$/g, ""));
         await insertAndFillDateBlock({ date, start_time, end_time });
       }
     } else if (data.start_date && data.start_time && data.end_time) {
+      vlog('Fyller 1 datumtillfälle från start_date/start_time/end_time…');
       await insertAndFillDateBlock({
         date: data.start_date.trim(),
         start_time: data.start_time.trim(),
         end_time: data.end_time.trim(),
       });
     } else if (data.occurrences === "MANUAL_DATES_REQUIRED") {
-      console.warn("occurrences = MANUAL_DATES_REQUIRED — datumblock hoppas över, fyll i manuellt.");
+      vlog('Datum: agenten kunde inte avgöra datum ("MANUAL_DATES_REQUIRED") — inga datumblock fylls i, lägg till manuellt.', 'err');
+    } else {
+      vlog('Datum: inget occurrences/start_date-fält i svaret — inga datumblock fylls i.', 'err');
     }
   }
 
@@ -1500,21 +1518,23 @@
       console.log(`Forcerat fält ifyllt: id_${key} → ${forcedValue}`);
     }
 
-    try {
-      if (data.description_sv) await updateDraftail("id_description_sv", data.description_sv);
-    } catch (err) { console.warn("description_sv gav fel (fortsätter):", err); }
-    try {
-      if (data.description_en) await updateDraftail("id_description_en", data.description_en);
-    } catch (err) { console.warn("description_en gav fel (fortsätter):", err); }
+    if (data.description_sv) {
+      try { await updateDraftail("id_description_sv", data.description_sv); }
+      catch (err) { vlog(`Beskrivning (sv): ovänta fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
+    } else { vlog('Beskrivning (sv): inget description_sv i svaret — fältet lämnas tomt.', 'err'); }
+    if (data.description_en) {
+      try { await updateDraftail("id_description_en", data.description_en); }
+      catch (err) { vlog(`Beskrivning (en): ovänta fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
+    } else { vlog('Beskrivning (en): inget description_en i svaret — fältet lämnas tomt.', 'err'); }
 
     try { await fillCategoriesFromData(data); }
-    catch (err) { console.warn("Kategorifyllning gav fel (fortsätter):", err); }
+    catch (err) { vlog(`Kategorifyllning gav fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
 
     try { activateLocationMap(); }
-    catch (err) { console.warn("Location-aktivering gav fel (fortsätter):", err); }
+    catch (err) { vlog(`Location-aktivering gav fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
 
     try { await fillDateBlocksFromCSV(data); }
-    catch (err) { console.warn("Datumblock gav fel (fortsätter):", err); }
+    catch (err) { vlog(`Datumblock gav fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
   }
 
   function activateLocationMap() {
