@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.77.2
+// @version      7.77.3
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1164,7 +1164,24 @@
   function simulateInput(el, value) {
     if (!el) return;
     if (el.tagName === "SELECT") {
-      el.value = value;
+      // Data kommer ofta som den MÄNSKLIGA etiketten ("Engelska"), inte det
+      // interna <option value="en">-värdet — en enkel el.value = "Engelska"
+      // matchar då ingenting och lämnar tyst valet oförändrat (bekräftat på
+      // #id_language 2026-09-21: värdet var redan "en" innan scriptet körde,
+      // vilket dolde att ingen faktisk ändring skedde). Provar värde-match
+      // först (oförändrat beteende), sen textmatch mot synlig etikett.
+      const target = String(value == null ? '' : value).trim().toLowerCase();
+      const opts = Array.from(el.options || []);
+      let match = opts.find(o => o.value.toLowerCase() === target) ||
+                  opts.find(o => o.textContent.trim().toLowerCase() === target);
+      if (match) {
+        el.value = match.value;
+      } else {
+        el.value = value;
+        if (target && el.value !== value) {
+          vlog(`Select: inget alternativ i #${el.id || '(utan id)'} matchade "${value}" (varken value eller text) — lämnas oförändrat.`, 'err');
+        }
+      }
       el.dispatchEvent(new Event("change", { bubbles: true }));
     } else if (el.type === "checkbox") {
       el.checked = value === "true" || value === true || value === "1";
@@ -1519,10 +1536,44 @@
     "start_date", "start_time", "end_date", "end_time",
     "main_category", "categories", "subcategory",
     "main_subject", "subjects",   // SBR-schemats motsvarighet, se fillCategoriesFromData
+    "language",   // hanteras separat, se fillLanguageField (kräver fallback-gissning)
     // Image/credit fields are handled by the fetcher's image panel, not the form:
     "press_image_url", "alttext_sv", "alttext_en", "photographer", "notes",
     "dates_uncertain", "language_sv",
   ]);
+
+  // ---- Språkfält (select) med "international"-fallback ---------------------
+  // Agentens "language" kommer oftast som en läsbar etikett ("Engelska"/
+  // "Svenska"), vilken simulateInput() numera kan matcha mot alternativets
+  // textContent. Om inget alternativ ändå matchar (tomt/okänt svar) gissar vi
+  // istället: "international" i titel/beskrivning → engelska, annars svenska
+  // — enligt användarens egen tumregel (2026-09-21).
+  function fillLanguageField(data) {
+    const el = document.getElementById('id_language');
+    if (!el || el.tagName !== 'SELECT') { vlog('Språk: #id_language hittades inte (eller är inte en select).', 'err'); return; }
+    const opts = Array.from(el.options || []);
+    const wanted = String(data.language || '').trim().toLowerCase();
+    let match = wanted && (opts.find(o => o.value.toLowerCase() === wanted) ||
+                            opts.find(o => o.textContent.trim().toLowerCase() === wanted));
+    if (!match) {
+      const text = [data.title_en, data.title_sv, data.description_en, data.description_sv]
+        .filter(Boolean).join(' ').toLowerCase();
+      const guessEn = /international/.test(text);
+      const findEn = () => opts.find(o => /^en$/i.test(o.value) || /engelska|english/i.test(o.textContent));
+      const findSv = () => opts.find(o => /^sv$/i.test(o.value) || /svenska|swedish/i.test(o.textContent));
+      match = guessEn ? (findEn() || findSv()) : (findSv() || findEn());
+      if (match) {
+        vlog(`Språk: "${data.language || '(inget)'}" matchade inget alternativ — gissar "${match.textContent.trim()}" (${guessEn ? 'hittade "international" i titel/beskrivning' : 'standard: svenska'}).`, 'err');
+      }
+    }
+    if (match) {
+      el.value = match.value;
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      vlog(`Språk valt: ${match.textContent.trim()} (${match.value}).`, 'ok');
+    } else {
+      vlog('Språk: hittade inga alternativ i #id_language att matcha mot.', 'err');
+    }
+  }
 
   const FORCED_FIELDS = {
     submitted_by_email: "eventbot@stockholm.se",
@@ -1556,6 +1607,9 @@
       try { await updateDraftail("id_description_en", data.description_en); }
       catch (err) { vlog(`Beskrivning (en): ovänta fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
     } else { vlog('Beskrivning (en): inget description_en i svaret — fältet lämnas tomt.', 'err'); }
+
+    try { fillLanguageField(data); }
+    catch (err) { vlog(`Språkfält gav fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
 
     try { await fillCategoriesFromData(data); }
     catch (err) { vlog(`Kategorifyllning gav fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
