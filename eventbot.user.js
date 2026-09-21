@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.77.5
+// @version      7.78.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2497,11 +2497,23 @@
   }
 
   // ---- UI (dark) -----------------------------------------------------------
-  const PANEL_CSS = `
+  // Delad av alla widgets (även GUIDE, som annars inte injicerar PANEL_CSS) så
+  // att --vd-*-variablerna alltid finns, oavsett vilken vy som byggs. Ljust
+  // läge togglas via data-vseh-theme="light" på <html>, satt av
+  // applyVsehTheme()/loadVsehTheme() (delad inställning, sparad med
+  // GM_setValue('vseh_theme', …)). Attributselektorn på html vinner över
+  // :root-blocket nedan oavsett ordning, tack vare högre specificitet.
+  const VSEH_THEME_VARS_CSS = `
     :root {
       --vd-bg:#1e222b; --vd-bg2:#262b36; --vd-bg3:#2f3542; --vd-line:#3a3f4b;
       --vd-txt:#e8eaee; --vd-txt2:#a8adb8; --vd-txt3:#787e8a; --vd-accent:#4a9fe0;
     }
+    html[data-vseh-theme="light"] {
+      --vd-bg:#f4f5f7; --vd-bg2:#ffffff; --vd-bg3:#eceef2; --vd-line:#d7dbe1;
+      --vd-txt:#1b1f27; --vd-txt2:#4a5162; --vd-txt3:#767c8a; --vd-accent:#2f6fd1;
+    }
+  `;
+  const PANEL_CSS = VSEH_THEME_VARS_CSS + `
     #vseh-panel { position:fixed; z-index:999999; background:var(--vd-bg); border:1px solid var(--vd-line);
       border-radius:12px; box-shadow:0 10px 40px rgba(0,0,0,.5);
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--vd-txt);
@@ -2728,6 +2740,26 @@
   `;
   function injectStyle() { const s = document.createElement('style'); s.textContent = PANEL_CSS; document.head.appendChild(s); }
 
+  // ---- Tema (mörkt/ljust) — delad inställning för ALLA widgets -------------
+  // En enda GM-sparad preferens (vseh_theme) styr --vd-*-variablerna ovan via
+  // ett attribut på <html>. Anropas tidigt på varje matchad sida (se
+  // dispatcher-blocket längst ned) så temat är rätt redan vid första
+  // målningen. Togglen i sig visas bara i MAIN:s och SBR:s Inställningar-
+  // flikar (de enda vyerna med en egen inställningsflik) — DRAFT/EDIT/GUIDE
+  // läser bara samma sparade värde och rättar sig därefter.
+  function loadVsehTheme() { return GM_getValue('vseh_theme', 'dark') === 'light' ? 'light' : 'dark'; }
+  function applyVsehTheme(theme) { document.documentElement.setAttribute('data-vseh-theme', theme === 'light' ? 'light' : 'dark'); }
+  function wireThemeToggle(id) {
+    const cb = document.getElementById(id);
+    if (!cb) return;
+    cb.checked = loadVsehTheme() === 'light';
+    cb.addEventListener('change', () => {
+      const theme = cb.checked ? 'light' : 'dark';
+      GM_setValue('vseh_theme', theme);
+      applyVsehTheme(theme);
+    });
+  }
+
   // ==== [SBR] buildSbrPanel — "Eventbot SBR.se" ==============================
   // Widget-namn: SBR. @match: stockholmbusinessregion.se/wt/cms/snippets/api/event/*
   // (matchar add/edit/list-sidorna gemensamt — se dispatcher-kommentaren
@@ -2837,6 +2869,10 @@
             <input type="text" id="sbr-mkey" class="vseh-key" placeholder="Mistral API-nyckel (SBR-agent)" autocomplete="off" spellcheck="false"></div>
           <div class="vseh-row"><label>SBR Mistral agent-ID</label>
             <input type="text" id="sbr-magent" class="vseh-key" placeholder="ag_…" autocomplete="off" spellcheck="false"></div>
+          <div class="vseh-row"><label>Utseende</label>
+            <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
+              <input type="checkbox" id="sbr-theme-toggle" style="width:auto;">
+              Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
         </div>
 
       </div></div>
@@ -2872,6 +2908,7 @@
     $('sbr-magent').value = GM_getValue('sbr_mistral_agent', '');
     $('sbr-mkey').addEventListener('change', () => GM_setValue('sbr_mistral_key', $('sbr-mkey').value.trim()));
     $('sbr-magent').addEventListener('change', () => GM_setValue('sbr_mistral_agent', $('sbr-magent').value.trim()));
+    wireThemeToggle('sbr-theme-toggle');
 
     loadSbrSources();
     renderSbrSources();
@@ -3044,6 +3081,10 @@
             <div class="vseh-row"><label>Sidor att hämta</label>
               <select id="vseh-pages"><option value="1">1</option><option value="3">3</option><option value="5">5</option><option value="10" selected>10</option><option value="20">20</option></select></div>
           </div>
+          <div class="vseh-row"><label>Utseende</label>
+            <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
+              <input type="checkbox" id="vseh-theme-toggle" style="width:auto;">
+              Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
         </div>
 
       </div></div>
@@ -3417,20 +3458,20 @@
     ).join('');
   }
 
-  const GUIDE_LIST_CSS = `
+  const GUIDE_LIST_CSS = VSEH_THEME_VARS_CSS + `
     #vseh-guide-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
-      flex-wrap:wrap; gap:10px; background:#2f3542; color:#e8eaee; padding:10px 14px;
+      flex-wrap:wrap; gap:10px; background:var(--vd-bg3); color:var(--vd-txt); padding:10px 14px;
       margin:0 0 14px; border-radius:6px; box-shadow:0 2px 10px rgba(0,0,0,.3);
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
     #vseh-guide-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer;
-      font-size:13px; font-weight:600; background:#4a9fe0; color:#fff; }
-    #vseh-guide-count { font-size:12px; color:#c3c8d1; }
-    #vseh-guide-panel { background:#1b1f27; color:#e8eaee; border-radius:6px; padding:14px; margin:0 0 14px; }
+      font-size:13px; font-weight:600; background:var(--vd-accent); color:#fff; }
+    #vseh-guide-count { font-size:12px; color:var(--vd-txt2); }
+    #vseh-guide-panel { background:var(--vd-bg); color:var(--vd-txt); border-radius:6px; padding:14px; margin:0 0 14px; }
     #vseh-guide-paste { width:100%; min-height:120px; font-family:inherit; font-size:13px;
       box-sizing:border-box; margin-bottom:8px; }
     #vseh-guide-panel .vseh-guide-actions { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
     #vseh-guide-panel .vseh-guide-actions button { padding:6px 12px; border:none; border-radius:5px;
-      cursor:pointer; font-size:12px; font-weight:600; background:#787e8a; color:#fff; }
+      cursor:pointer; font-size:12px; font-weight:600; background:var(--vd-txt3); color:#fff; }
     #vseh-guide-body { max-height:300px; overflow-y:auto; font-size:13px; }
   `;
   function ensureGuideListStyle() {
@@ -3753,6 +3794,7 @@
     $('vseh-mkey').addEventListener('change', () => GM_setValue('mistral_key', $('vseh-mkey').value.trim()));
     $('vseh-magent').addEventListener('change', () => GM_setValue('mistral_agent', $('vseh-magent').value.trim()));
     $('vseh-tixkey').addEventListener('change', () => GM_setValue('tickster_key', $('vseh-tixkey').value.trim()));
+    wireThemeToggle('vseh-theme-toggle');
     $('vseh-fetch-tix').addEventListener('click', runTickster);
     $('vseh-fetch-bl').addEventListener('click', runBilletto);
     $('vseh-fetch-nortic').addEventListener('click', runNortic);
@@ -4317,13 +4359,13 @@
   // som förälder), så de ser likadana ut som i huvudpanelens dubblettvy.
   const DRAFT_EXTRA_CSS = `
     #vseh-draft-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
-      flex-wrap:wrap; gap:10px; background:#2f3542; color:#e8eaee; padding:10px 14px;
+      flex-wrap:wrap; gap:10px; background:var(--vd-bg3); color:var(--vd-txt); padding:10px 14px;
       margin:0 0 14px; border-radius:6px; box-shadow:0 2px 10px rgba(0,0,0,.3);
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
     #vseh-draft-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer;
       font-size:13px; font-weight:600; }
-    #vseh-draft-check-btn { background:#4a9fe0; color:#fff; }
-    #vseh-draft-fetch-btn { background:#787e8a; color:#fff; }
+    #vseh-draft-check-btn { background:var(--vd-accent); color:#fff; }
+    #vseh-draft-fetch-btn { background:var(--vd-txt3); color:#fff; }
     #vseh-draft-bar button:disabled { opacity:.6; cursor:not-allowed; }
     #vseh-draft-ts, #vseh-draft-progress { font-size:12px; color:#c3c8d1; }
     .vseh-draft-cmp-row td { background:var(--vd-bg2); padding:10px 14px; }
@@ -4575,11 +4617,11 @@
   // samma jobb mer träffsäkert.
   const EDIT_BAR_CSS = `
     #vseh-edit-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
-      flex-wrap:wrap; gap:10px; background:#2f3542; color:#e8eaee; padding:10px 14px;
+      flex-wrap:wrap; gap:10px; background:var(--vd-bg3); color:var(--vd-txt); padding:10px 14px;
       margin:0 0 14px; border-radius:6px; box-shadow:0 2px 10px rgba(0,0,0,.3);
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
     #vseh-edit-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer;
-      font-size:13px; font-weight:600; background:#4a9fe0; color:#fff; }
+      font-size:13px; font-weight:600; background:var(--vd-accent); color:#fff; }
     #vseh-edit-bar button:disabled { opacity:.6; cursor:not-allowed; }
     #vseh-consent-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
       flex-wrap:wrap; gap:10px; background:#5a3a1a; color:#fff; padding:10px 14px;
@@ -5773,6 +5815,12 @@
   // content_type=46 (bekräftat värde för "Guide") — samma "kan stå var som
   // helst i query-strängen"-logik som draft-listan ovan.
   const KNOWN_GUIDE_LIST_URL = /\/cms\/pages\/\d+\/\?(?:.*&)?content_type=46(?:&|$)/;
+
+  // Tema sätts EN gång här, oavsett vilken av de fem vyerna nedan som
+  // matchar — DRAFT/EDIT/GUIDE har ingen egen togglingsknapp (bara MAIN och
+  // SBR har en Inställningar-flik) men respekterar ändå samma sparade val.
+  applyVsehTheme(loadVsehTheme());
+
   if (KNOWN_PRODUCTION_URL.test(location.href)) {
     injectStyle();
     loadDismissals();
