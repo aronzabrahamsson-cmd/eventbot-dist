@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.77.3
+// @version      7.77.4
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1390,6 +1390,20 @@
     return true;
   }
 
+  // SBR:s main_subject/subjects kommer som "Engelsk etikett / Svensk etikett"
+  // (samma format som event_type), men bekräftat via live-test (2026-09-21):
+  // widgetens egna förslagslista visar BARA den engelska etiketten ("sus" →
+  // förslag "Sustainable Transition"), aldrig den hopslagna bilingua strängen.
+  // Att söka/matcha på hela "X / Y"-strängen gav därför alltid noll träffar —
+  // dels för att sökningen på den fulla strängen inte hittade något, dels för
+  // att matchningen i selectAutocompleteValue() ändå aldrig kan lyckas när
+  // förslagets text är KORTARE än söksträngen. Klipper bort allt efter " / ".
+  function firstLangLabel(label) {
+    const s = String(label || '').trim();
+    const idx = s.indexOf(' / ');
+    return idx >= 0 ? s.slice(0, idx).trim() : s;
+  }
+
   async function fillCategoriesFromData(data) {
     if (data.main_category) {
       await selectAutocompleteValue("id_main_category", data.main_category);
@@ -1411,16 +1425,60 @@
     // och det sätts bara genom att faktiskt klicka ett förslag (vilket
     // selectAutocompleteValue gör), aldrig genom att bara skriva ett värde.
     if (data.main_subject) {
-      await selectAutocompleteValue("id_main_subject", data.main_subject);
+      await selectAutocompleteValue("id_main_subject", firstLangLabel(data.main_subject));
     }
     if (data.subjects) {
       const subs = Array.isArray(data.subjects)
         ? data.subjects
         : String(data.subjects).split("|").map((s) => s.trim()).filter(Boolean);
       for (const sub of subs) {
-        await selectAutocompleteValue("id_subjects", sub);
+        await selectAutocompleteValue("id_subjects", firstLangLabel(sub));
       }
     }
+  }
+
+  // ---- Event type (Wagtail snippet chooser-modal) ---------------------------
+  // #id_event_type är ett DOLT fält som backas av en riktig chooser-modal
+  // ("Välj Event type"), inte ett textfält — bekräftat via en live modal-
+  // dump (2026-09-21): modalen visar direkt en färdig tabell med alla 8
+  // Event types (ingen sökning behövs), varje rad en <a data-chooser-modal-
+  // choice href="…/chosen/<pk>/">Etikett</a>. Att skriva agentens textsvar
+  // rakt in i det dolda fältet (tidigare beteende) satte aldrig ett giltigt
+  // pk-värde. "Välj Event type"-knappen kan vara disabled precis vid
+  // sidladdning tills sidans JS hunnit initiera klart — väntar in den.
+  async function fillEventTypeField(data) {
+    const value = String(data.event_type || '').trim();
+    if (!value) { vlog('Event type: inget event_type i svaret — lämnas ovalt.', 'err'); return; }
+
+    const chooseBtn = [...document.querySelectorAll('button[data-chooser-action-choose]')]
+      .find(b => /välj event type/i.test((b.textContent || '').trim()));
+    if (!chooseBtn) { vlog('Event type: "Välj Event type"-knappen hittades inte.', 'err'); return; }
+
+    let tries = 0;
+    while (chooseBtn.disabled && tries < 50) { await wait(100); tries++; }
+    if (chooseBtn.disabled) { vlog('Event type: knappen var fortfarande inaktiverad efter 5s väntan.', 'err'); return; }
+
+    chooseBtn.click();
+
+    const table = await waitFor('a[data-chooser-modal-choice]', 8000);
+    if (!table) { vlog('Event type: modalen (eller dess alternativlista) dök aldrig upp.', 'err'); return; }
+
+    const target = value.toLowerCase();
+    const links = [...document.querySelectorAll('a[data-chooser-modal-choice]')];
+    const textOf = (a) => (a.textContent || '').trim();
+    const match =
+      links.find(a => textOf(a).toLowerCase() === target) ||
+      links.find(a => textOf(a).toLowerCase().startsWith(target)) ||
+      links.find(a => textOf(a).toLowerCase().includes(target));
+    if (!match) {
+      vlog(`Event type: inget alternativ matchade "${value}" i modalen. Alternativ: ` +
+        links.map(textOf).join(' | '), 'err');
+      return;
+    }
+    vlog(`Event type väljer: "${textOf(match)}".`, 'ok');
+    match.click();
+    await wait(400);
+    vlog('Event type valt.', 'ok');
   }
 
   // ============================================================
@@ -1537,6 +1595,7 @@
     "main_category", "categories", "subcategory",
     "main_subject", "subjects",   // SBR-schemats motsvarighet, se fillCategoriesFromData
     "language",   // hanteras separat, se fillLanguageField (kräver fallback-gissning)
+    "event_type",   // hanteras separat, se fillEventTypeField (chooser-modal, inte textfält)
     // Image/credit fields are handled by the fetcher's image panel, not the form:
     "press_image_url", "alttext_sv", "alttext_en", "photographer", "notes",
     "dates_uncertain", "language_sv",
@@ -1610,6 +1669,9 @@
 
     try { fillLanguageField(data); }
     catch (err) { vlog(`Språkfält gav fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
+
+    try { await fillEventTypeField(data); }
+    catch (err) { vlog(`Event type gav fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
 
     try { await fillCategoriesFromData(data); }
     catch (err) { vlog(`Kategorifyllning gav fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
