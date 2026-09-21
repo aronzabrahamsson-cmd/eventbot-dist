@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.77.4
+// @version      7.77.5
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2728,6 +2728,11 @@
   `;
   function injectStyle() { const s = document.createElement('style'); s.textContent = PANEL_CSS; document.head.appendChild(s); }
 
+  // ==== [SBR] buildSbrPanel — "Eventbot SBR.se" ==============================
+  // Widget-namn: SBR. @match: stockholmbusinessregion.se/wt/cms/snippets/api/event/*
+  // (matchar add/edit/list-sidorna gemensamt — se dispatcher-kommentaren
+  // längst ned i filen för hela namnschemat: MAIN/SBR/DRAFT/EDIT/GUIDE).
+  // Flikar: URL, CRM-import, Källor, Eventlista, Inställningar.
   // ---- SBR-läge (stockholmbusinessregion.se): endast URL- och Källor-flikar.
   // URL-fliken återanvänder EXAKT samma HTML/id:n och logik (createEventFromUrl)
   // som huvudpanelen — fältifyllningen matchar redan flera av SBR-formulärets
@@ -2915,6 +2920,11 @@
   // upp automatiskt. Se formkartlaggare-1-0.user.js.)
   const $ = id => document.getElementById(id);
 
+  // ==== [MAIN] buildPanel — Visit Calendar Panel ==============================
+  // Widget-namn: MAIN. @match: visitstockholm.{com,se}/cms/api/event/create/*
+  // Flaggskeppet: Kalendrar-hämtning (Ticketmaster/Nortic/Billetto/Tickster),
+  // CRM-import, dedup mot Visit-kalendern, URL-skapande. Se dispatcher-
+  // kommentaren längst ned i filen för hela MAIN/SBR/DRAFT/EDIT/GUIDE-schemat.
   function buildPanel() {
     const p = document.createElement('div'); p.id = 'vseh-panel'; p.className = mode;
     p.innerHTML = `
@@ -3442,6 +3452,11 @@
     else document.body.insertBefore(bar, document.body.firstChild);
   }
 
+  // ==== [GUIDE] initGuideListTool — Guide List Tool ===========================
+  // Widget-namn: GUIDE. @match: visitstockholm.{com,se}/cms/pages/*
+  // (körs bara när query-strängen har content_type=46). Sticky bar/paste-
+  // verktyg på Guide-sidlistan. Se dispatcher-kommentaren längst ned i filen
+  // för hela MAIN/SBR/DRAFT/EDIT/GUIDE-schemat.
   function initGuideListTool() {
     vlog('GuideLista: Initierar på sidlistan (content_type=46)');
     ensureGuideListStyle();
@@ -4322,6 +4337,12 @@
     document.head.appendChild(s);
   }
 
+  // ==== [DRAFT] initDraftvyDubblettkoll — Draft View (dubblettkollen) ========
+  // Widget-namn: DRAFT. @match: visitstockholm.{com,se}/cms/api/event/?*
+  // (körs bara när query-strängen har status__exact=draft). Badge/jämförelse-
+  // overlay injicerad direkt på Visits egen draftlista — ingen sidopanel.
+  // Se dispatcher-kommentaren längst ned i filen för hela
+  // MAIN/SBR/DRAFT/EDIT/GUIDE-schemat.
   function initDraftvyDubblettkoll() {
     vlog('Draftvy-Dubblettkoll: Initierar på draft-lista');
     ensureDraftStyle();
@@ -4577,6 +4598,11 @@
     s.textContent = PANEL_CSS + EDIT_BAR_CSS;
     document.head.appendChild(s);
   }
+  // ==== [EDIT] initEventChecker — Edit Page (EventChecker), del 1/2 ==========
+  // Widget-namn: EDIT. @match: visitstockholm.{com,se}/cms/api/event/edit/*
+  // Rewrite-agent, guide-tag-regler, kontaktinfo-flaggning, språkparssync.
+  // Anropas från initEventEditAutomation() nedan. Se dispatcher-kommentaren
+  // längst ned i filen för hela MAIN/SBR/DRAFT/EDIT/GUIDE-schemat.
   function initEventChecker() {
     vlog('EventChecker: Initierar på edit-sida');
     ensureEditBarStyle();
@@ -5696,6 +5722,9 @@
     });
   }
 
+  // ==== [EDIT] initEventEditAutomation — Edit Page (EventChecker), del 2/2 ===
+  // Widget-namn: EDIT. @match: visitstockholm.{com,se}/cms/api/event/edit/*
+  // Polling-loop/automatik-gate runt initEventChecker() ovan.
   function initEventEditAutomation() {
     vlog('EventEdit: Initierar automatiska kontroller på edit-sidan');
     const startAutomation = () => {
@@ -5720,6 +5749,17 @@
   // vi specifika fält-id:n (id_title_sv m.fl.) som bara finns där. På alla
   // andra sidor (t.ex. nya formulär under kartläggning) visas bara det
   // generella kartläggningsverktyget, inget som förutsätter Wagtails struktur.
+  //
+  // ==== Widget-namnschema (2026-09-21) ========================================
+  // Fem separata vyer/widgets, en @match-regel var, en dispatcher-gren var.
+  // Sök på taggen (t.ex. "[SBR]") för att hoppa rätt i filen.
+  //   [MAIN]  buildPanel()              — Visit Calendar Panel — cms/api/event/create/*
+  //   [SBR]   buildSbrPanel()           — SBR Panel (Eventbot SBR.se) — wt/cms/snippets/api/event/*
+  //   [DRAFT] initDraftvyDubblettkoll() — Draft View (dubblettkollen) — cms/api/event/?...status__exact=draft
+  //   [EDIT]  initEventChecker() +
+  //           initEventEditAutomation() — Edit Page (EventChecker) — cms/api/event/edit/*
+  //   [GUIDE] initGuideListTool()       — Guide List Tool — cms/pages/*?...content_type=46
+  // ============================================================================
   const KNOWN_PRODUCTION_URL = /^https:\/\/www\.visitstockholm\.(com|se)\/cms\/api\/event\/create\//;
   const KNOWN_SBR_URL = /^https:\/\/www\.stockholmbusinessregion\.se\/wt\/cms\/snippets\/api\/event\//;
   // Nya sidtyper (v0.7.52): draft-listan och edit-sidan. Läggs som egna,
