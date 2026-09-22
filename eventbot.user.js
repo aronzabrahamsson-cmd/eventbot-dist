@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.78.0
+// @version      7.79.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2292,6 +2292,9 @@
     // Bildautomation direkt efter formuläret (automatiskt).
     try { await automateImage(data); }
     catch (e) { vlog('Bildautomation gav fel (fortsätter): ' + e.message, 'err'); }
+
+    try { startMainEditStyleChecks(); }
+    catch (e) { vlog('Efterbehandling (EDIT-liknande kontroller) gav fel (fortsätter): ' + e.message, 'err'); }
 
     // Markera som klar med klockslag (styr "utkast skapat"-läget på listknappar).
     const now = new Date();
@@ -5726,6 +5729,28 @@
     checkResaleUrl();
     autofillLinkText();
     runGuideTagRules().catch(() => {});
+  }
+
+  // ---- Samma automatik även på MAIN:s create-sida (på uttrycklig begäran,
+  // 2026-09-22) — anropas från finishEventCreation() (delas av BÅDE
+  // createEvent()-kortflödet och createEventFromUrl()-URL-fliken, dvs.
+  // "skapat via api eller url" täcks av denna enda anropsplats), INTE
+  // unvillkorligt när panelen byggs: autoPublishStatus() m.fl. ska bara
+  // köra på ett event som FAKTISKT skapats via automatiken, inte flippa
+  // statusfältet på en tom sida en admin bara öppnat för att skapa ett
+  // event helt för hand. Startas EN gång, håller sedan igång live (pollar
+  // var 1.5:e sekund, precis som EDIT) så en manuell justering efteråt på
+  // den öppna sidan (t.ex. en extra guide-tagg) också triggar automatiken,
+  // t.ex. språkparssync — inget separat #vseh-edit-bar/#vseh-logwrap byggs
+  // (skulle krocka med MAIN:s egen logg), bara själva kontrollerna körs.
+  let mainEditStyleChecksStarted = false;
+  function startMainEditStyleChecks() {
+    if (mainEditStyleChecksStarted) { runEditPageChecks(); return; }
+    mainEditStyleChecksStarted = true;
+    installResaleSubmitGuard();
+    runEditPageChecks();
+    setInterval(runEditPageChecks, 1500);
+    vlog('Efterbehandling (samma automatik som EDIT-sidan) startad — pollar var 1.5s.', 'ok');
   }
 
   // Wagtails egen "Senast ändrad"-rad (avatar + tidsstämpel i sidfoten/
