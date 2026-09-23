@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.86.1
+// @version      7.86.2
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5751,6 +5751,11 @@
     ['Festivals+Film', null, null, 'At the Movies: Cinemas and Film Festivals Stockholm', 'Mysiga biografer och filmfestivaler i Stockholm'],
     ['Guided tours & Lectures', 'Natur', null, "Enjoy Allemansrätten – Sweden's Right to Roam", 'Njut av allemansrätten i Stockholms natur'],
     ['Music', 'dirigent, orkester, kvartett, kvintett, stråk, kammarkör, "chamber music", kammarmusik', null, 'An Evening With Classical Music in Stockholm', 'Njut av klassisk musik i Stockholm'],
+    // Subcategory-baserad kompletteringsrad (2026-09-23, på begäran): taggar
+    // samma guidepar direkt via subcategoryn, utan att kräva något nyckelord
+    // — currentCategoryTitles() inkluderar subcategory, så kategori-cellen
+    // matchar den här också (samma mönster som Festivals+Film-raden nedan).
+    ['Classical & Art Music', null, null, 'An Evening With Classical Music in Stockholm', 'Njut av klassisk musik i Stockholm'],
     ['Sports & Wellbeing', 'Spa', null, 'Enjoy a Spa Weekend in Stockholm City', 'Njut av spa i Stockholm'],
     [null, 'Semla', null, 'Fat Tuesday – the day of the Semla 2026', 'Njut av Stockholms bästa semlor 2027'],
     ["Christmas & New Year's", 'Nyår, nyårsafton, nyårshelgen, "fira nyår", "new year\'s", "the new year"', null, "New Year's Eve in Stockholm 2026", 'Nyår i Stockholm 2026'],
