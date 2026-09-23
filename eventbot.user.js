@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.84.0
+// @version      7.85.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3184,6 +3184,7 @@
     $('sbr-magent').addEventListener('change', () => GM_setValue('sbr_mistral_agent', $('sbr-magent').value.trim()));
     wireThemeToggle('sbr-theme-toggle');
     wireManualImageUploadAutomation();
+    startSbrTitleChecks();
 
     loadSbrSources();
     renderSbrSources();
@@ -3374,7 +3375,7 @@
     if (mb) mb.classList.add('on');
     wire();
     wireManualImageUploadAutomation();
-    startMainGuideTagging();
+    startMainAlwaysOnChecks();
     vlog('Panel byggd. Läge: ' + mode);
   }
   function setMode(m) {
@@ -5299,7 +5300,10 @@
     const el = document.getElementById('id_title_' + lang);
     const title = (el?.value || '').trim();
     if (!title) return;
-    const mistralKey = GM_getValue('mistral_key', '');
+    // Körs numera även på SBR (egen Mistral-nyckel) — samma host-koll som
+    // createEventFromUrl()/autoFillManualImageUpload() redan använder.
+    const sbrMode = location.hostname === 'www.stockholmbusinessregion.se';
+    const mistralKey = GM_getValue(sbrMode ? 'sbr_mistral_key' : 'mistral_key', '');
     if (!mistralKey) { vlog('Versalrubrik: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
     const instruction = lang === 'en'
       ? 'Skriv om till Title Case (stor bokstav i början av varje ord), UTOM korta artiklar/konjunktioner/prepositioner ("a", "an", "the", "and", "or", "of", "in", "on", "at", "for", "to"), som ska vara gemena om de inte är första ordet.'
@@ -5321,6 +5325,37 @@
       vlog('Versalrubrik: Klar (id_title_' + lang + ').', 'ok');
     } catch (e) {
       vlog('Versalrubrik: Fel — ' + e.message, 'err');
+    }
+  }
+
+  // Samma mönster som rewriteTitleCasing() ovan, fast tar bort datum/
+  // klockslag ur titeln istället för att rätta skiftläge — ÅRTAL ska
+  // uttryckligen lämnas orörda.
+  async function rewriteTitleRemoveDateTime(lang) {
+    const el = document.getElementById('id_title_' + lang);
+    const title = (el?.value || '').trim();
+    if (!title) return;
+    // Körs numera även på SBR (egen Mistral-nyckel) — samma host-koll som
+    // createEventFromUrl()/autoFillManualImageUpload() redan använder.
+    const sbrMode = location.hostname === 'www.stockholmbusinessregion.se';
+    const mistralKey = GM_getValue(sbrMode ? 'sbr_mistral_key' : 'mistral_key', '');
+    if (!mistralKey) { vlog('Datum/tid i rubrik: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
+    try {
+      vlog('Datum/tid i rubrik: Skickar titel till Mistral (id_title_' + lang + ')…');
+      const payload = {
+        model: 'mistral-small-latest',
+        messages: [
+          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstitlar. Ta bort alla datumangivelser och klockslag ur titeln användaren ger (datum/tid fylls redan i i separata datumfält, de hör inte hemma i titeln) — men behåll ÅRTAL orörda (de skiljer t.ex. mellan olika årgångar av en återkommande festival, som "Festivalen 2026"). Ändra INGET annat — samma ord, samma ordning, samma skiftläge, samma skiljetecken i övrigt, bara städa upp eventuell dubbel blanksteg/skiljetecken som blir kvar efter borttagningen. Titeln är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den omskrivna titeln, ingen kommentar, inga citattecken.' },
+          { role: 'user', content: title }
+        ]
+      };
+      const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
+      const rewritten = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+      if (!rewritten) throw new Error('Tomt svar från Mistral');
+      simulateInput(el, rewritten.trim());
+      vlog('Datum/tid i rubrik: Klar (id_title_' + lang + ').', 'ok');
+    } catch (e) {
+      vlog('Datum/tid i rubrik: Fel — ' + e.message, 'err');
     }
   }
 
@@ -5347,6 +5382,44 @@
         const orig = btn.textContent;
         btn.textContent = 'Anropar Mistral…';
         await rewriteTitleCasing(btn.dataset.lang);
+        btn.disabled = false;
+        btn.textContent = orig;
+      });
+    });
+  }
+
+  // Titlar ska aldrig innehålla datum eller klockslag (hör hemma i
+  // datumfälten, inte titeln) — ÅRTAL är dock okej, de skiljer t.ex.
+  // återkommande festivalers olika årgångar åt (på uttrycklig begäran,
+  // 2026-09-23). Återanvänder DATE_IN_TEXT_RE/TIME_IN_TEXT_RE rakt av —
+  // samma redan beprövade mönster som redan flaggar exakt detta i
+  // beskrivningsfälten (checkGuidelineIssues), ingen ny regex att felsöka.
+  // Ett bart årtal ("Festival 2026") matchar ingetdera: TIME_IN_TEXT_RE
+  // kräver ett skiljetecken (kolon/punkt) mellan siffrorna, DATE_IN_TEXT_RE
+  // kräver ett månadsnamn intill talet — samma knapp-mönster som
+  // checkTitleCasing() ovan.
+  function checkDateTimeInTitle() {
+    ['en', 'sv'].forEach(lang => {
+      const el = document.getElementById('id_title_' + lang);
+      const title = el?.value || '';
+      const dateHit = title.match(DATE_IN_TEXT_RE);
+      const timeHit = title.match(TIME_IN_TEXT_RE);
+      if (!dateHit && !timeHit) { setFieldNote(el, 'datetime', ''); return; }
+      const hit = ((dateHit || timeHit)[0] || '').trim();
+      setFieldNote(el, 'datetime',
+        '<div style="color:#c02626;font-weight:600;">⚠️ Datum/tid i rubriken ("' + esc(hit) + '") — hör hemma i datumfälten, inte titeln. Årtal är okej.</div>' +
+        '<div style="margin-top:6px;">' +
+        '<button type="button" class="vseh-datetime-fix-btn" data-lang="' + lang + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (tar bort datum/tid)</button>' +
+        '</div>');
+    });
+    document.querySelectorAll('.vseh-datetime-fix-btn').forEach(btn => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = '1';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Anropar Mistral…';
+        await rewriteTitleRemoveDateTime(btn.dataset.lang);
         btn.disabled = false;
         btn.textContent = orig;
       });
@@ -5580,10 +5653,10 @@
     // numera även subcategory, se currentCategoryTitles()).
     ['Festivals+Film', null, null, 'At the Movies: Cinemas and Film Festivals Stockholm', 'Mysiga biografer och filmfestivaler i Stockholm'],
     ['Guided tours & Lectures', 'Natur', null, "Enjoy Allemansrätten – Sweden's Right to Roam", 'Njut av allemansrätten i Stockholms natur'],
-    ['Music', 'dirigent, orkester, kvartett, kvintett, stråk, kammarkör', null, 'An Evening With Classical Music in Stockholm', 'Njut av klassisk musik i Stockholm'],
+    ['Music', 'dirigent, orkester, kvartett, kvintett, stråk, kammarkör, "chamber music", kammarmusik', null, 'An Evening With Classical Music in Stockholm', 'Njut av klassisk musik i Stockholm'],
     ['Sports & Wellbeing', 'Spa', null, 'Enjoy a Spa Weekend in Stockholm City', 'Njut av spa i Stockholm'],
     [null, 'Semla', null, 'Fat Tuesday – the day of the Semla 2026', 'Njut av Stockholms bästa semlor 2027'],
-    ["Christmas & New Year's", 'Nyår', null, "New Year's Eve in Stockholm 2026", 'Nyår i Stockholm 2026'],
+    ["Christmas & New Year's", 'Nyår, nyårsafton, nyårshelgen, "fira nyår", "new year\'s", "the new year"', null, "New Year's Eve in Stockholm 2026", 'Nyår i Stockholm 2026'],
     [null, 'påsk, easter', null, 'Easter in Stockholm', 'Påsk i Stockholm 2026'],
     [null, 'Quiz, frågesport', null, 'Quiz night in Stockholm', 'Quizkväll i Stockholm'],
     [null, 'ridtur, häst', null, 'Saddle up: Horseback Riding in Stockholm', 'Sadla upp: Se Stockholm från hästryggen'],
@@ -5998,6 +6071,7 @@
     autoPublishStatus();
     stripEmojisFromTitles();
     checkTitleCasing();
+    checkDateTimeInTitle();
     stripDescriptionEmoji();
     checkGuidelineIssues();
     checkIdenticalDescriptions();
@@ -6028,22 +6102,43 @@
     vlog('Efterbehandling (samma automatik som EDIT-sidan) startad — pollar var 1.5s.', 'ok');
   }
 
-  // Guide-taggning + språkparssync bryts ut ur bundlen ovan och startas
-  // OVILLKORLIGT redan vid panelbygget (på uttrycklig begäran, 2026-09-23)
-  // — till skillnad från autoPublishStatus()/andrahandslänk-spärren m.fl.
-  // (som bara ska röra ett event automatiken FAKTISKT skapat) är "tagga
-  // språkparet automatiskt när jag väljer en guide för hand" önskvärt även
-  // på ett event som byggs helt manuellt på create-sidan, aldrig via bot-
-  // flödet. Ren omslagning av runGuideTagRules() — dess egen spärr
-  // (guideTagRulesRunning) skyddar redan mot att denna poller och den andra
+  // Guide-taggning+språkparssync och titel-flaggorna (VERSALER, datum/tid)
+  // bryts ut ur bundlen ovan och startas OVILLKORLIGT redan vid panelbygget
+  // (på uttrycklig begäran, 2026-09-22/23) — till skillnad från
+  // autoPublishStatus()/andrahandslänk-spärren m.fl. (som bara ska röra ett
+  // event automatiken FAKTISKT skapat) är dessa rena FLAGGOR+knappar utan
+  // några autonoma sidoeffekter förrän man själv klickar en fix-knapp, så de
+  // är lika önskvärda på ett event som byggs helt manuellt på create-sidan
+  // som på ett bot-skapat. runGuideTagRules()/checkTitleCasing()/
+  // checkDateTimeInTitle() är alla idempotenta och no-opar tyst på en tom
+  // sida — runGuideTagRules() har dessutom sin egen spärr
+  // (guideTagRulesRunning) som skyddar mot att denna poller och den andra
   // (om/när den startar efter en bot-skapelse) krockar med varandra.
-  let mainGuideTaggingStarted = false;
-  function startMainGuideTagging() {
-    if (mainGuideTaggingStarted) return;
-    mainGuideTaggingStarted = true;
+  function runMainAlwaysOnChecks() {
     runGuideTagRules().catch(() => {});
-    setInterval(() => runGuideTagRules().catch(() => {}), 1500);
-    vlog('Guide-taggning (inkl. språkparssync) aktiv på create-sidan.', 'ok');
+    checkTitleCasing();
+    checkDateTimeInTitle();
+  }
+  let mainAlwaysOnChecksStarted = false;
+  function startMainAlwaysOnChecks() {
+    if (mainAlwaysOnChecksStarted) return;
+    mainAlwaysOnChecksStarted = true;
+    runMainAlwaysOnChecks();
+    setInterval(runMainAlwaysOnChecks, 1500);
+    vlog('Guide-taggning + titelflaggor (VERSALER, datum/tid) aktiva på create-sidan.', 'ok');
+  }
+
+  // SBR har samma id_title_en/id_title_sv-fält (bekräftat via fältkart-
+  // läggning) men inget related_guides-koncept — bara titelkontrollerna
+  // (VERSALER + datum/tid), inte runGuideTagRules().
+  let sbrTitleChecksStarted = false;
+  function startSbrTitleChecks() {
+    if (sbrTitleChecksStarted) return;
+    sbrTitleChecksStarted = true;
+    checkTitleCasing();
+    checkDateTimeInTitle();
+    setInterval(() => { checkTitleCasing(); checkDateTimeInTitle(); }, 1500);
+    vlog('Titelflaggor (VERSALER, datum/tid) aktiva på SBR-sidan.', 'ok');
   }
 
   // Wagtails egen "Senast ändrad"-rad (avatar + tidsstämpel i sidfoten/
