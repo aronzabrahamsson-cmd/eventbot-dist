@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.86.2
+// @version      7.87.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1911,14 +1911,23 @@
     if (existing) return { credit: existing, creditSv: existing, reused: true };
     return { credit: placeholderEn || '', creditSv: placeholderSv || '', reused: false };
   }
+  // Bildrättighetens utgångsdatum, delad av ALLA sidor med ett "Rights expiry
+  // date"-fält (på uttrycklig begäran, 2026-09-23): sista eventdatum + 3
+  // månader om det finns; annars (t.ex. VS-IMG:s fristående bildsida, som
+  // saknar all eventkontext, eller ett event utan ifyllda datum ännu)
+  // dagens datum + 6 månader. Formatet är alltid YYYY-MM-DD.
+  function computeRightsExpiryFallback(lastDateStr) {
+    const d = lastDateStr ? new Date(lastDateStr + 'T00:00:00') : new Date();
+    d.setMonth(d.getMonth() + (lastDateStr ? 3 : 6));
+    return d.toISOString().split('T')[0];
+  }
+  // Läser sista datumet ur formulärets EGNA date_admin-block (om sidan har
+  // några — VS-IMG:s bildsida har det aldrig, faller då tyst igenom till
+  // computeRightsExpiryFallback(null) = dagens datum + 6 månader).
   function computeManualImageRightsExpiry() {
     const dates = [...document.querySelectorAll('input[name^="date_admin-"][name$="-value-date"]')]
       .map(el => el.value).filter(Boolean).sort();
-    const last = dates[dates.length - 1];
-    if (!last) return '';
-    const d = new Date(last + 'T00:00:00');
-    d.setMonth(d.getMonth() + 2);
-    return d.toISOString().split('T')[0];
+    return computeRightsExpiryFallback(dates[dates.length - 1] || null);
   }
   // Om ett event/en bildsida redan HAR en tillagd bild (syns som en <img>
   // ovanför "Fil"-fältet, medan filfältet självt tomt förblir tomt — filinputs
@@ -2173,11 +2182,15 @@
     } else {
       vlog('Bildsida: ingen Mistral-nyckel satt (fliken Inställningar) — hoppar över alt-text.', 'err');
     }
+    // Bildsidan har ingen eventkontext (inga date_admin-block) — samma
+    // funktion faller då tyst igenom till dagens datum + 6 månader.
+    const rights = computeManualImageRightsExpiry();
     const map = [
       [VS_IMG_FIELDS.credit,    creditPair.credit],
       [VS_IMG_FIELDS.credit_sv, creditPair.creditSv],
       [VS_IMG_FIELDS.alt,       altEn || placeholder],
-      [VS_IMG_FIELDS.alt_sv,    altSv || placeholder]
+      [VS_IMG_FIELDS.alt_sv,    altSv || placeholder],
+      [VS_IMG_FIELDS.rights,    rights]
     ];
     let filled = 0;
     for (const [id, val] of map) {
@@ -2598,14 +2611,14 @@
       data._credit_en = data.photographer;
     }
 
-    // Bildrättighetens utgångsdatum = eventets slutdatum + 2 månader (ÅÅÅÅ-MM-DD).
+    // Bildrättighetens utgångsdatum = sista eventdatum + 3 månader (ÅÅÅÅ-MM-DD)
+    // — om inget datum är känt (t.ex. agenten gav inga occurrences alls):
+    // dagens datum + 6 månader (på uttrycklig begäran, 2026-09-23; delad
+    // beräkning med computeRightsExpiryFallback(), samma regel som gäller
+    // överallt annars där fältet finns).
     const lastDate = (ev.dates && ev.dates.length) ? ev.dates[ev.dates.length - 1].date : (ev.end_date || ev.start_date);
-    if (lastDate) {
-      const d = new Date(lastDate + 'T00:00:00');
-      d.setMonth(d.getMonth() + 2);
-      data._rights_expiry = d.toISOString().split('T')[0];
-      vlog('Bildrättighet utgår: ' + data._rights_expiry + ' (slutdatum + 2 mån).');
-    }
+    data._rights_expiry = computeRightsExpiryFallback(lastDate || null);
+    vlog('Bildrättighet utgår: ' + data._rights_expiry + (lastDate ? ' (sista datum + 3 mån).' : ' (inget datum känt — idag + 6 mån).'));
 
     // Huvudagenten ser aldrig bilden (mistral-medium) — dess ev. alttext-gissning
     // nollas alltid, och vi hämtar istället en RIKTIG bildbeskrivning via pixtral.
