@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.79.0
+// @version      7.80.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1861,6 +1861,104 @@
     }
   }
 
+  // ---- Manuell bilduppladdning: samma efterbehandling som vid API-skapande -
+  // På uttrycklig begäran (2026-09-23): väljer man en bildfil FÖR HAND i
+  // choosern (t.ex. när man färdigställer ett utkast manuellt, inte via
+  // automateImage()'s egen URL-nedladdning ovan) ska samma fallback-fyllning
+  // köras ändå — kreditrad, alt-text via pixtral, bildrättighets-utgångsdatum.
+  //
+  // Trigger: filfältets EGNA native change-event (mer pålitligt än att
+  // pollra "Fil"-textens innehåll), fångat via event delegation på document
+  // så det fungerar oavsett när choosermodalen faktiskt skapas i DOM:en.
+  // AVGÖRANDE: tryInjectImageFile() ovan dispatchar OCKSÅ ett change-event
+  // på exakt samma fält när den injicerar en auto-nedladdad bild — utan
+  // spärr skulle den här koden då köra en ANDRA gång direkt efteråt och
+  // skriva över de riktiga data-baserade värdena med sämre DOM-gissningar.
+  // e.isTrusted skiljer dem robust åt: en RIKTIG filväljar-interaktion ger
+  // isTrusted:true, ett dispatchEvent(new Event(...))-anrop ger alltid
+  // isTrusted:false — ingen extra flagga behövs.
+  //
+  // Mistrals vision-API (pixtral, samma anrop som fetchAltTextFromImage()
+  // redan gör) tar image_url som antingen en publik URL ELLER en base64
+  // data:-URI rakt av — enklaste sättet att koppla in det här är alltså att
+  // bara läsa den lokala filen med FileReader och skicka in data-URI:n
+  // direkt, ingen separat uppladdning/URL behövs.
+  function fileToDataUri(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Kunde inte läsa bildfilen'));
+      reader.readAsDataURL(file);
+    });
+  }
+  function computeManualImageCreditFallback() {
+    const who = (document.getElementById('id_title_sv')?.value || '').trim() ||
+                (document.getElementById('id_title_en')?.value || '').trim();
+    return who ? ('Pressbild ' + who) : 'Pressbild';
+  }
+  function computeManualImageRightsExpiry() {
+    const dates = [...document.querySelectorAll('input[name^="date_admin-"][name$="-value-date"]')]
+      .map(el => el.value).filter(Boolean).sort();
+    const last = dates[dates.length - 1];
+    if (!last) return '';
+    const d = new Date(last + 'T00:00:00');
+    d.setMonth(d.getMonth() + 2);
+    return d.toISOString().split('T')[0];
+  }
+  async function autoFillManualImageUpload(file) {
+    vlog('Manuell bilduppladdning upptäckt (' + file.name + ') — fyller i fält automatiskt…');
+    const apiKey = GM_getValue('mistral_key', '').trim();
+    const credit = computeManualImageCreditFallback();
+    const rights = computeManualImageRightsExpiry();
+    const titleVal = (document.getElementById('id_title_sv')?.value || document.getElementById('id_title_en')?.value || '').trim();
+    const placeholder = 'Eventbild ' + titleVal;
+    let altSv = '', altEn = '';
+    if (apiKey) {
+      try {
+        const dataUri = await fileToDataUri(file);
+        const alt = await fetchAltTextFromImage(dataUri, apiKey);
+        if (alt) {
+          altSv = alt.alttext_sv || ''; altEn = alt.alttext_en || '';
+          vlog('Pixtral gav alt-text för den manuellt valda bilden.', 'ok');
+        } else {
+          vlog('Pixtral gav ingen alt-text för den manuellt valda bilden.', 'err');
+        }
+      } catch (e) { vlog('Alt-text (manuell bild) misslyckades: ' + e.message, 'err'); }
+    } else {
+      vlog('Manuell bilduppladdning: ingen Mistral-nyckel satt (fliken Inställningar) — hoppar över alt-text.', 'err');
+    }
+    const map = [
+      [IMG_FIELDS.title,       titleVal],
+      [IMG_FIELDS.title_sv,    document.getElementById('id_title_sv')?.value || ''],
+      [IMG_FIELDS.description, altSv || placeholder],
+      [IMG_FIELDS.credit,      credit],
+      [IMG_FIELDS.credit_sv,   credit],
+      [IMG_FIELDS.alt,         altEn || placeholder],
+      [IMG_FIELDS.alt_sv,      altSv || placeholder],
+      [IMG_FIELDS.rights,      rights]
+    ];
+    let filled = 0;
+    for (const [id, val] of map) {
+      const el = document.getElementById(id);
+      if (!el) { vlog('Bildfält saknas: ' + id, 'err'); continue; }
+      if (val) { setNativeValue(el, val); filled++; }
+    }
+    vlog('Manuell bilduppladdning: fyllde i ' + filled + ' fält automatiskt.', 'ok');
+  }
+  let manualImageUploadWired = false;
+  function wireManualImageUploadAutomation() {
+    if (manualImageUploadWired) return;
+    manualImageUploadWired = true;
+    document.addEventListener('change', e => {
+      if (!e.isTrusted) return;   // se kommentar ovan — filtrerar bort tryInjectImageFile()s egen dispatch
+      if (e.target && e.target.id === IMG_FIELDS.file && e.target.files && e.target.files[0]) {
+        autoFillManualImageUpload(e.target.files[0])
+          .catch(err => vlog('Manuell bilduppladdning gav fel (fortsätter): ' + err.message, 'err'));
+      }
+    }, true);
+    vlog('Automatisk efterbehandling av manuellt vald bildfil aktiverad.');
+  }
+
   async function automateImage(data) {
     const imageUrl = data.press_image_url || '';
     vlog('Bildautomation startar…');
@@ -3101,6 +3199,7 @@
     const mb = document.querySelector('#vseh-headbtns button[data-m="' + mode + '"]');
     if (mb) mb.classList.add('on');
     wire();
+    wireManualImageUploadAutomation();
     vlog('Panel byggd. Läge: ' + mode);
   }
   function setMode(m) {
