@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.80.0
+// @version      7.80.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1907,7 +1907,10 @@
   }
   async function autoFillManualImageUpload(file) {
     vlog('Manuell bilduppladdning upptäckt (' + file.name + ') — fyller i fält automatiskt…');
-    const apiKey = GM_getValue('mistral_key', '').trim();
+    // SBR har egen Mistral-nyckel, separat från Visit Stockholm — samma
+    // host-koll som createEventFromUrl() redan använder för att välja rätt.
+    const sbrMode = location.hostname === 'www.stockholmbusinessregion.se';
+    const apiKey = GM_getValue(sbrMode ? 'sbr_mistral_key' : 'mistral_key', '').trim();
     const credit = computeManualImageCreditFallback();
     const rights = computeManualImageRightsExpiry();
     const titleVal = (document.getElementById('id_title_sv')?.value || document.getElementById('id_title_en')?.value || '').trim();
@@ -3010,6 +3013,7 @@
     $('sbr-mkey').addEventListener('change', () => GM_setValue('sbr_mistral_key', $('sbr-mkey').value.trim()));
     $('sbr-magent').addEventListener('change', () => GM_setValue('sbr_mistral_agent', $('sbr-magent').value.trim()));
     wireThemeToggle('sbr-theme-toggle');
+    wireManualImageUploadAutomation();
 
     loadSbrSources();
     renderSbrSources();
@@ -4750,6 +4754,7 @@
   function initEventChecker() {
     vlog('EventChecker: Initierar på edit-sida');
     ensureEditBarStyle();
+    wireManualImageUploadAutomation();
     if (!document.getElementById('vseh-edit-bar')) {
       const anchor = document.querySelector('.page-header, .header, header, h1') || document.querySelector('form');
       if (anchor) {
