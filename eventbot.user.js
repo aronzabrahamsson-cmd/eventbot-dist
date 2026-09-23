@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.81.0
+// @version      7.82.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/*
+// @match        https://www.stockholmbusinessregion.se/wt/cms/images/*
 // @match        https://www.visitstockholm.com/cms/api/event/?*
 // @match        https://www.visitstockholm.se/cms/api/event/?*
 // @match        https://www.visitstockholm.com/cms/api/event/edit/*
@@ -1895,10 +1896,18 @@
       reader.readAsDataURL(file);
     });
   }
-  function computeManualImageCreditFallback() {
-    const who = (document.getElementById('id_title_sv')?.value || '').trim() ||
-                (document.getElementById('id_title_en')?.value || '').trim();
-    return who ? ('Pressbild ' + who) : 'Pressbild';
+  // Om ETT av kreditfälten redan har ett värde (t.ex. fotografens namn, ofta
+  // auto-extraherat av MediaFlow vid uppladdning — bekräftat via SBR:s
+  // bildsida 2026-09-23: id_credit="Jana Palm", id_credit_sv tom) återanvänds
+  // det rakt av för det andra fältet också — fotografnamn ska inte skrivas
+  // över med en platshållartext, och namn översätts inte mellan språk. Bara
+  // om BÅDA fälten är tomma faller vi tillbaka på en platshållartext. Delad
+  // av alla tre bildautomationsflöden (automateImage(), autoFillManual-
+  // ImageUpload(), SBR:s egen bildsida) — på uttrycklig begäran (2026-09-23).
+  function resolveCreditPair(creditEl, creditSvEl, placeholderEn, placeholderSv) {
+    const existing = (creditEl?.value || '').trim() || (creditSvEl?.value || '').trim();
+    if (existing) return { credit: existing, creditSv: existing, reused: true };
+    return { credit: placeholderEn || '', creditSv: placeholderSv || '', reused: false };
   }
   function computeManualImageRightsExpiry() {
     const dates = [...document.querySelectorAll('input[name^="date_admin-"][name$="-value-date"]')]
@@ -1915,10 +1924,15 @@
     // host-koll som createEventFromUrl() redan använder för att välja rätt.
     const sbrMode = location.hostname === 'www.stockholmbusinessregion.se';
     const apiKey = GM_getValue(sbrMode ? 'sbr_mistral_key' : 'mistral_key', '').trim();
-    const credit = computeManualImageCreditFallback();
     const rights = computeManualImageRightsExpiry();
     const titleVal = (document.getElementById('id_title_sv')?.value || document.getElementById('id_title_en')?.value || '').trim();
     const placeholder = 'Eventbild ' + titleVal;
+    const creditPair = resolveCreditPair(
+      document.getElementById(IMG_FIELDS.credit), document.getElementById(IMG_FIELDS.credit_sv),
+      titleVal ? ('Press image ' + titleVal) : 'Press image',
+      titleVal ? ('Pressbild ' + titleVal) : 'Pressbild'
+    );
+    if (creditPair.reused) vlog('Kreditrad återanvänd mellan språken: "' + creditPair.credit + '".', 'ok');
     let altSv = '', altEn = '';
     if (apiKey) {
       try {
@@ -1938,8 +1952,8 @@
       [IMG_FIELDS.title,       titleVal],
       [IMG_FIELDS.title_sv,    document.getElementById('id_title_sv')?.value || ''],
       [IMG_FIELDS.description, altSv || placeholder],
-      [IMG_FIELDS.credit,      credit],
-      [IMG_FIELDS.credit_sv,   credit],
+      [IMG_FIELDS.credit,      creditPair.credit],
+      [IMG_FIELDS.credit_sv,   creditPair.creditSv],
       [IMG_FIELDS.alt,         altEn || placeholder],
       [IMG_FIELDS.alt_sv,      altSv || placeholder],
       [IMG_FIELDS.rights,      rights]
@@ -1992,6 +2006,90 @@
     vlog('Manuell bilduppladdning: knapp för automatisk ifyllning aktiverad.');
   }
 
+  // ==== [SBR-IMG] SBR:s egen bildsida (wt/cms/images/<id>/) ==================
+  // Widget-namn: SBR-IMG. @match: stockholmbusinessregion.se/wt/cms/images/*
+  // Egen, fristående Wagtail-sida (inte en modal i eventformuläret) med ANDRA
+  // fält-id:n än MAIN/EDIT:s bildchooser — bekräftat via fältkartläggning
+  // (2026-09-23): id_title/id_title_sv/id_file/id_credit/id_credit_sv/
+  // id_alt/id_alt_sv, INGET rights_expiry_date-fält (finns bara i Visit
+  // Stockholms bildmodell). Samma knapp+automatik som MAIN/EDIT (v7.81.0),
+  // på uttrycklig begäran (2026-09-23) — men mot dessa fält, och utan
+  // rights-fallbacken (inget datum att räkna från här).
+  const SBR_IMG_FIELDS = {
+    title: 'id_title', title_sv: 'id_title_sv', file: 'id_file',
+    credit: 'id_credit', credit_sv: 'id_credit_sv', alt: 'id_alt', alt_sv: 'id_alt_sv'
+  };
+  async function autoFillSbrImagePage(file) {
+    vlog('SBR bildsida: fyller i fält automatiskt för "' + file.name + '"…');
+    const apiKey = GM_getValue('sbr_mistral_key', '').trim();
+    const titleVal = (document.getElementById(SBR_IMG_FIELDS.title)?.value || '').trim();
+    const placeholder = titleVal ? ('Bild: ' + titleVal) : '';
+    const creditPair = resolveCreditPair(
+      document.getElementById(SBR_IMG_FIELDS.credit), document.getElementById(SBR_IMG_FIELDS.credit_sv),
+      '', ''   // inget "Pressbild X"-fallback här — SBR:s bildsida har ingen eventkontext att hämta ett namn från
+    );
+    if (creditPair.reused) vlog('Kreditrad återanvänd mellan språken: "' + creditPair.credit + '".', 'ok');
+    let altSv = '', altEn = '';
+    if (apiKey) {
+      try {
+        const dataUri = await fileToDataUri(file);
+        const alt = await fetchAltTextFromImage(dataUri, apiKey);
+        if (alt) {
+          altSv = alt.alttext_sv || ''; altEn = alt.alttext_en || '';
+          vlog('Pixtral gav alt-text för den manuellt valda bilden.', 'ok');
+        } else {
+          vlog('Pixtral gav ingen alt-text för den manuellt valda bilden.', 'err');
+        }
+      } catch (e) { vlog('Alt-text (SBR bildsida) misslyckades: ' + e.message, 'err'); }
+    } else {
+      vlog('SBR bildsida: ingen SBR Mistral-nyckel satt (fliken Inställningar i SBR-panelen) — hoppar över alt-text.', 'err');
+    }
+    const map = [
+      [SBR_IMG_FIELDS.credit,    creditPair.credit],
+      [SBR_IMG_FIELDS.credit_sv, creditPair.creditSv],
+      [SBR_IMG_FIELDS.alt,       altEn || placeholder],
+      [SBR_IMG_FIELDS.alt_sv,    altSv || placeholder]
+    ];
+    let filled = 0;
+    for (const [id, val] of map) {
+      const el = document.getElementById(id);
+      if (!el) { vlog('Bildfält saknas: ' + id, 'err'); continue; }
+      if (val) { setNativeValue(el, val); filled++; }
+    }
+    vlog('SBR bildsida: fyllde i ' + filled + ' fält automatiskt.', 'ok');
+  }
+  function ensureSbrImagePageButton() {
+    const fileInput = document.getElementById(SBR_IMG_FIELDS.file);
+    if (!fileInput || fileInput.dataset.vsehAutofillWired) return;
+    fileInput.dataset.vsehAutofillWired = '1';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '🤖 Fyll i automatiskt (Mistral)';
+    btn.style.cssText = 'margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;';
+    btn.addEventListener('click', async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) { vlog('SBR bildsida: ingen fil vald i "Fil"-fältet ännu.', 'err'); return; }
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Anropar Mistral…';
+      try {
+        await autoFillSbrImagePage(file);
+        btn.textContent = '✓ Klart';
+      } catch (e) {
+        vlog('SBR bildsida gav fel: ' + e.message, 'err');
+        btn.textContent = 'Fel — se logg';
+      } finally {
+        setTimeout(() => { btn.disabled = false; btn.textContent = origText; }, 1500);
+      }
+    });
+    fileInput.parentNode.insertBefore(btn, fileInput.nextSibling);
+  }
+  function initSbrImagePage() {
+    vlog('SBR bildsida: knapp för automatisk ifyllning aktiverad.');
+    ensureSbrImagePageButton();
+    setInterval(ensureSbrImagePageButton, 1000);
+  }
+
   async function automateImage(data) {
     const imageUrl = data.press_image_url || '';
     vlog('Bildautomation startar…');
@@ -2020,12 +2118,17 @@
     const placeholder = 'Eventbild ' + (data.title_sv || data.title_en || '').trim();
     const altEn = data.alttext_en || placeholder;
     const altSv = data.alttext_sv || placeholder;
+    const creditPair = resolveCreditPair(
+      document.getElementById(IMG_FIELDS.credit), document.getElementById(IMG_FIELDS.credit_sv),
+      data._credit_en || '', data._credit_sv || ''
+    );
+    if (creditPair.reused) vlog('Kreditrad återanvänd mellan språken: "' + creditPair.credit + '".', 'ok');
     const map = [
       [IMG_FIELDS.title,       data.title_sv || data.title_en || ''],
       [IMG_FIELDS.title_sv,    data.title_sv || ''],
       [IMG_FIELDS.description, altSv],
-      [IMG_FIELDS.credit,      data._credit_en || ''],
-      [IMG_FIELDS.credit_sv,   data._credit_sv || ''],
+      [IMG_FIELDS.credit,      creditPair.credit],
+      [IMG_FIELDS.credit_sv,   creditPair.creditSv],
       [IMG_FIELDS.alt,         altEn],
       [IMG_FIELDS.alt_sv,      altSv],
       [IMG_FIELDS.rights,      data._rights_expiry || '']
@@ -5960,9 +6063,11 @@
   //   [EDIT]  initEventChecker() +
   //           initEventEditAutomation() — Edit Page (EventChecker) — cms/api/event/edit/*
   //   [GUIDE] initGuideListTool()       — Guide List Tool — cms/pages/*?...content_type=46
+  //   [SBR-IMG] initSbrImagePage()      — SBR:s bildsida — wt/cms/images/*
   // ============================================================================
   const KNOWN_PRODUCTION_URL = /^https:\/\/www\.visitstockholm\.(com|se)\/cms\/api\/event\/create\//;
   const KNOWN_SBR_URL = /^https:\/\/www\.stockholmbusinessregion\.se\/wt\/cms\/snippets\/api\/event\//;
+  const KNOWN_SBR_IMAGE_URL = /^https:\/\/www\.stockholmbusinessregion\.se\/wt\/cms\/images\//;
   // Nya sidtyper (v0.7.52): draft-listan och edit-sidan. Läggs som egna,
   // fristående grenar — rör inte create-grenen ovan.
   // status__exact=draft kan stå var som helst i query-strängen (Wagtails
@@ -6022,6 +6127,8 @@
     initEventEditAutomation();
   } else if (KNOWN_GUIDE_LIST_URL.test(location.href)) {
     initGuideListTool();
+  } else if (KNOWN_SBR_IMAGE_URL.test(location.href)) {
+    initSbrImagePage();
   }
   // (Ingen else-gren längre — scriptet matchar numera bara de kända URL:erna
   // ovan, se @match. Kartläggningsverktyget för okända sidor lever nu i ett
