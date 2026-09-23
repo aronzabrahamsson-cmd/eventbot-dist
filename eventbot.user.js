@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.85.0
+// @version      7.86.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -14,6 +14,8 @@
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/edit/*
 // @match        https://www.visitstockholm.com/cms/pages/*
 // @match        https://www.visitstockholm.se/cms/pages/*
+// @match        https://www.visitstockholm.com/cms/images/*
+// @match        https://www.visitstockholm.se/cms/images/*
 // @updateURL    https://raw.githubusercontent.com/aronzabrahamsson-cmd/eventbot-dist/main/eventbot.user.js
 // @downloadURL  https://raw.githubusercontent.com/aronzabrahamsson-cmd/eventbot-dist/main/eventbot.user.js
 // @grant        GM_xmlhttpRequest
@@ -2125,6 +2127,101 @@
     vlog('SBR bildsida: knapp för automatisk ifyllning aktiverad.');
     ensureSbrImagePageButton();
     setInterval(ensureSbrImagePageButton, 1000);
+  }
+
+  // ==== [VS-IMG] Visit Stockholms egen bildsida (cms/images/<id>/) ===========
+  // Widget-namn: VS-IMG. @match: visitstockholm.{com,se}/cms/images/*
+  // Samma sidtyp som SBR-IMG ovan (fristående Wagtail-"redigera bild"-sida,
+  // inte en modal i eventformuläret) — bara på Visit Stockholms egen domän
+  // och utan /wt/-prefixet, så den missades helt av tidigare @match-regler
+  // (aldrig täckt, inte en regression). Rapporterad 2026-09-23 via
+  // https://www.visitstockholm.se/cms/images/22080/ — id-numret varierar
+  // per bild, matchas generellt. Antar SAMMA fältnamnsmönster som SBR-IMG
+  // (id_title/id_credit/id_alt/id_file, inget prefix) eftersom det är samma
+  // underliggande Wagtail-mall — chooser-MODALENS id_image-chooser-upload-*-
+  // prefix hör bara till modal-widgeten, inte den fristående sidan (samma
+  // skillnad redan bekräftad mellan SBR:s chooser-modal och SBR:s egen
+  // bildsida). Inkluderar även rights_expiry_date (Visit Stockholms
+  // bildmodell har det fältet, till skillnad från SBR:s) — fältet fylls
+  // bara i om det faktiskt hittas i DOM:en, annars no-opar det tyst precis
+  // som alla andra bildfält här.
+  const VS_IMG_FIELDS = {
+    title: 'id_title', title_sv: 'id_title_sv', file: 'id_file',
+    credit: 'id_credit', credit_sv: 'id_credit_sv', alt: 'id_alt', alt_sv: 'id_alt_sv',
+    rights: 'id_rights_expiry_date'
+  };
+  async function autoFillVsImagePage(source) {
+    vlog('Bildsida: fyller i fält automatiskt för "' + sourceDisplayName(source) +
+      (source.url ? '" (redan tillagd bild, inget nytt filval)…' : '"…'));
+    const apiKey = GM_getValue('mistral_key', '').trim();
+    const titleVal = (document.getElementById(VS_IMG_FIELDS.title)?.value || '').trim();
+    const placeholder = titleVal ? ('Bild: ' + titleVal) : '';
+    const creditPair = resolveCreditPair(
+      document.getElementById(VS_IMG_FIELDS.credit), document.getElementById(VS_IMG_FIELDS.credit_sv),
+      '', ''   // inget "Pressbild X"-fallback här — bildsidan har ingen eventkontext att hämta ett namn från
+    );
+    if (creditPair.reused) vlog('Kreditrad återanvänd mellan språken: "' + creditPair.credit + '".', 'ok');
+    let altSv = '', altEn = '';
+    if (apiKey) {
+      const alt = await resolveAltTextForImage(source, apiKey);
+      if (alt) {
+        altSv = alt.alttext_sv || ''; altEn = alt.alttext_en || '';
+        vlog('Pixtral gav alt-text för bilden.', 'ok');
+      } else {
+        vlog('Pixtral gav ingen alt-text för bilden.', 'err');
+      }
+    } else {
+      vlog('Bildsida: ingen Mistral-nyckel satt (fliken Inställningar) — hoppar över alt-text.', 'err');
+    }
+    const map = [
+      [VS_IMG_FIELDS.credit,    creditPair.credit],
+      [VS_IMG_FIELDS.credit_sv, creditPair.creditSv],
+      [VS_IMG_FIELDS.alt,       altEn || placeholder],
+      [VS_IMG_FIELDS.alt_sv,    altSv || placeholder]
+    ];
+    let filled = 0;
+    for (const [id, val] of map) {
+      const el = document.getElementById(id);
+      if (!el) { vlog('Bildfält saknas: ' + id, 'err'); continue; }
+      if (val) { setNativeValue(el, val); filled++; }
+    }
+    vlog('Bildsida: fyllde i ' + filled + ' fält automatiskt.', 'ok');
+  }
+  function ensureVsImagePageButton() {
+    const fileInput = document.getElementById(VS_IMG_FIELDS.file);
+    if (!fileInput || fileInput.dataset.vsehAutofillWired) return;
+    fileInput.dataset.vsehAutofillWired = '1';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '🤖 Fyll i automatiskt (Mistral)';
+    btn.style.cssText = 'margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;';
+    btn.addEventListener('click', async () => {
+      const file = fileInput.files && fileInput.files[0];
+      let source = file ? { file } : null;
+      if (!source) {
+        const existingUrl = findExistingImagePreviewUrl();
+        if (existingUrl) source = { url: existingUrl };
+      }
+      if (!source) { vlog('Bildsida: ingen fil vald i "Fil"-fältet, och ingen redan tillagd bild hittades.', 'err'); return; }
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Anropar Mistral…';
+      try {
+        await autoFillVsImagePage(source);
+        btn.textContent = '✓ Klart';
+      } catch (e) {
+        vlog('Bildsida gav fel: ' + e.message, 'err');
+        btn.textContent = 'Fel — se logg';
+      } finally {
+        setTimeout(() => { btn.disabled = false; btn.textContent = origText; }, 1500);
+      }
+    });
+    fileInput.parentNode.insertBefore(btn, fileInput.nextSibling);
+  }
+  function initVsImagePage() {
+    vlog('Bildsida: knapp för automatisk ifyllning aktiverad.');
+    ensureVsImagePageButton();
+    setInterval(ensureVsImagePageButton, 1000);
   }
 
   async function automateImage(data) {
@@ -6215,10 +6312,12 @@
   //           initEventEditAutomation() — Edit Page (EventChecker) — cms/api/event/edit/*
   //   [GUIDE] initGuideListTool()       — Guide List Tool — cms/pages/*?...content_type=46
   //   [SBR-IMG] initSbrImagePage()      — SBR:s bildsida — wt/cms/images/*
+  //   [VS-IMG]  initVsImagePage()       — Visit Stockholms bildsida — cms/images/*
   // ============================================================================
   const KNOWN_PRODUCTION_URL = /^https:\/\/www\.visitstockholm\.(com|se)\/cms\/api\/event\/create\//;
   const KNOWN_SBR_URL = /^https:\/\/www\.stockholmbusinessregion\.se\/wt\/cms\/snippets\/api\/event\//;
   const KNOWN_SBR_IMAGE_URL = /^https:\/\/www\.stockholmbusinessregion\.se\/wt\/cms\/images\//;
+  const KNOWN_VS_IMAGE_URL = /^https:\/\/www\.visitstockholm\.(com|se)\/cms\/images\//;
   // Nya sidtyper (v0.7.52): draft-listan och edit-sidan. Läggs som egna,
   // fristående grenar — rör inte create-grenen ovan.
   // status__exact=draft kan stå var som helst i query-strängen (Wagtails
@@ -6280,6 +6379,8 @@
     initGuideListTool();
   } else if (KNOWN_SBR_IMAGE_URL.test(location.href)) {
     initSbrImagePage();
+  } else if (KNOWN_VS_IMAGE_URL.test(location.href)) {
+    initVsImagePage();
   }
   // (Ingen else-gren längre — scriptet matchar numera bara de kända URL:erna
   // ovan, se @match. Kartläggningsverktyget för okända sidor lever nu i ett
