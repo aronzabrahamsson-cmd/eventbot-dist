@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.80.2
+// @version      7.81.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1865,18 +1865,22 @@
   // På uttrycklig begäran (2026-09-23): väljer man en bildfil FÖR HAND i
   // choosern (t.ex. när man färdigställer ett utkast manuellt, inte via
   // automateImage()'s egen URL-nedladdning ovan) ska samma fallback-fyllning
-  // köras ändå — kreditrad, alt-text via pixtral, bildrättighets-utgångsdatum.
+  // gå att köra ändå — kreditrad, alt-text via pixtral, bildrättighets-
+  // utgångsdatum.
   //
-  // Trigger: filfältets EGNA native change-event (mer pålitligt än att
-  // pollra "Fil"-textens innehåll), fångat via event delegation på document
-  // så det fungerar oavsett när choosermodalen faktiskt skapas i DOM:en.
-  // AVGÖRANDE: tryInjectImageFile() ovan dispatchar OCKSÅ ett change-event
-  // på exakt samma fält när den injicerar en auto-nedladdad bild — utan
-  // spärr skulle den här koden då köra en ANDRA gång direkt efteråt och
-  // skriva över de riktiga data-baserade värdena med sämre DOM-gissningar.
-  // e.isTrusted skiljer dem robust åt: en RIKTIG filväljar-interaktion ger
-  // isTrusted:true, ett dispatchEvent(new Event(...))-anrop ger alltid
-  // isTrusted:false — ingen extra flagga behövs.
+  // Trigger: en knapp bredvid "Fil"-fältet, inte filfältets change-event.
+  // v7.80.0/.1 försökte fånga fältets EGNA native change-event via event
+  // delegation på document — bekräftat 2026-09-23 att det INTE triggade i
+  // praktiken (loggen visade att lyssnaren aktiverades, men aldrig att den
+  // faktiskt fångade en händelse). Snarare än att gräva vidare i VARFÖR
+  // (Wagtails chooser-widget kan tänkas svälja/ersätta eventet på sätt som
+  // är svåra att diagnosticera utan liveåtkomst) bytt till en knapp — enligt
+  // uttrycklig begäran, och strikt mer pålitligt eftersom klicket LÄSER
+  // filfältets aktuella .files[0] direkt istället för att förlita sig på
+  // att observera händelsen som satte det. Knappen injiceras av en enkel
+  // poller (var 1:e sekund) som letar efter filfältet och sätter in knappen
+  // bredvid det första gången den hittar det — samma beprövade polling-
+  // mönster som EDIT:s runEditPageChecks() redan använder för annat.
   //
   // Mistrals vision-API (pixtral, samma anrop som fetchAltTextFromImage()
   // redan gör) tar image_url som antingen en publik URL ELLER en base64
@@ -1906,7 +1910,7 @@
     return d.toISOString().split('T')[0];
   }
   async function autoFillManualImageUpload(file) {
-    vlog('Manuell bilduppladdning upptäckt (' + file.name + ') — fyller i fält automatiskt…');
+    vlog('Manuell bilduppladdning: fyller i fält automatiskt för "' + file.name + '"…');
     // SBR har egen Mistral-nyckel, separat från Visit Stockholm — samma
     // host-koll som createEventFromUrl() redan använder för att välja rätt.
     const sbrMode = location.hostname === 'www.stockholmbusinessregion.se';
@@ -1948,18 +1952,44 @@
     }
     vlog('Manuell bilduppladdning: fyllde i ' + filled + ' fält automatiskt.', 'ok');
   }
+  // Sätter in knappen bredvid filfältet första gången den hittas i DOM:en
+  // (choosermodalen finns bara medan den är öppen) — dataset-flaggan på
+  // fältet SJÄLVT (inte en modul-variabel) gör detta säkert att köra om
+  // och om igen från pollern, även om modalen stängs/öppnas flera gånger
+  // under samma sidladdning (ett nytt filfält = ingen dataset-flagga än).
+  function ensureManualImageUploadButton() {
+    const fileInput = document.getElementById(IMG_FIELDS.file);
+    if (!fileInput || fileInput.dataset.vsehAutofillWired) return;
+    fileInput.dataset.vsehAutofillWired = '1';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '🤖 Fyll i automatiskt (Mistral)';
+    btn.style.cssText = 'margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;';
+    btn.addEventListener('click', async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) { vlog('Manuell bilduppladdning: ingen fil vald i "Fil"-fältet ännu.', 'err'); return; }
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Anropar Mistral…';
+      try {
+        await autoFillManualImageUpload(file);
+        btn.textContent = '✓ Klart';
+      } catch (e) {
+        vlog('Manuell bilduppladdning gav fel: ' + e.message, 'err');
+        btn.textContent = 'Fel — se logg';
+      } finally {
+        setTimeout(() => { btn.disabled = false; btn.textContent = origText; }, 1500);
+      }
+    });
+    fileInput.parentNode.insertBefore(btn, fileInput.nextSibling);
+  }
   let manualImageUploadWired = false;
   function wireManualImageUploadAutomation() {
     if (manualImageUploadWired) return;
     manualImageUploadWired = true;
-    document.addEventListener('change', e => {
-      if (!e.isTrusted) return;   // se kommentar ovan — filtrerar bort tryInjectImageFile()s egen dispatch
-      if (e.target && e.target.id === IMG_FIELDS.file && e.target.files && e.target.files[0]) {
-        autoFillManualImageUpload(e.target.files[0])
-          .catch(err => vlog('Manuell bilduppladdning gav fel (fortsätter): ' + err.message, 'err'));
-      }
-    }, true);
-    vlog('Automatisk efterbehandling av manuellt vald bildfil aktiverad.');
+    ensureManualImageUploadButton();
+    setInterval(ensureManualImageUploadButton, 1000);
+    vlog('Manuell bilduppladdning: knapp för automatisk ifyllning aktiverad.');
   }
 
   async function automateImage(data) {
