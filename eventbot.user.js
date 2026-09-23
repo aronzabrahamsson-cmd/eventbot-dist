@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.82.0
+// @version      7.83.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1918,8 +1918,40 @@
     d.setMonth(d.getMonth() + 2);
     return d.toISOString().split('T')[0];
   }
-  async function autoFillManualImageUpload(file) {
-    vlog('Manuell bilduppladdning: fyller i fält automatiskt för "' + file.name + '"…');
+  // Om ett event/en bildsida redan HAR en tillagd bild (syns som en <img>
+  // ovanför "Fil"-fältet, medan filfältet självt tomt förblir tomt — filinputs
+  // kan av säkerhetsskäl aldrig förhandsifyllas med en redan uppladdad server-
+  // fil) används DEN bilden som utgångspunkt för alt-textanropet i stället,
+  // när inget NYTT filval finns. Bekräftat via en live-dump av alla <img> på
+  // SBR:s bildsida (2026-09-23): Wagtails bildrenditioner serveras under
+  // /media/images/ — samma mönster gäller generellt oavsett domänprefix
+  // (fungerar likadant på Visit Stockholm-sidorna). Delad av alla widgets
+  // med bildredigering — på uttrycklig begäran (2026-09-23).
+  function findExistingImagePreviewUrl() {
+    const img = document.querySelector('img[src*="/media/images/"]');
+    return img ? img.src : null;
+  }
+  // source: { file: File } (nyss valt i filfältet) ELLER { url: string }
+  // (redan tillagd bild, se findExistingImagePreviewUrl ovan). Mistrals
+  // vision-API tar image_url som antingen en publik URL eller en base64
+  // data:-URI — bara det förra behövs här, det senare kräver FileReader.
+  async function resolveAltTextForImage(source, apiKey) {
+    if (!apiKey) return null;
+    try {
+      const imageArg = source.file ? await fileToDataUri(source.file) : source.url;
+      return await fetchAltTextFromImage(imageArg, apiKey);
+    } catch (e) {
+      vlog('Alt-text: fel — ' + e.message, 'err');
+      return null;
+    }
+  }
+  function sourceDisplayName(source) {
+    if (source.file) return source.file.name;
+    try { return decodeURIComponent(source.url.split('/').pop()); } catch { return source.url; }
+  }
+  async function autoFillManualImageUpload(source) {
+    vlog('Bilduppladdning: fyller i fält automatiskt för "' + sourceDisplayName(source) +
+      (source.url ? '" (redan tillagd bild, inget nytt filval)…' : '"…'));
     // SBR har egen Mistral-nyckel, separat från Visit Stockholm — samma
     // host-koll som createEventFromUrl() redan använder för att välja rätt.
     const sbrMode = location.hostname === 'www.stockholmbusinessregion.se';
@@ -1935,16 +1967,13 @@
     if (creditPair.reused) vlog('Kreditrad återanvänd mellan språken: "' + creditPair.credit + '".', 'ok');
     let altSv = '', altEn = '';
     if (apiKey) {
-      try {
-        const dataUri = await fileToDataUri(file);
-        const alt = await fetchAltTextFromImage(dataUri, apiKey);
-        if (alt) {
-          altSv = alt.alttext_sv || ''; altEn = alt.alttext_en || '';
-          vlog('Pixtral gav alt-text för den manuellt valda bilden.', 'ok');
-        } else {
-          vlog('Pixtral gav ingen alt-text för den manuellt valda bilden.', 'err');
-        }
-      } catch (e) { vlog('Alt-text (manuell bild) misslyckades: ' + e.message, 'err'); }
+      const alt = await resolveAltTextForImage(source, apiKey);
+      if (alt) {
+        altSv = alt.alttext_sv || ''; altEn = alt.alttext_en || '';
+        vlog('Pixtral gav alt-text för bilden.', 'ok');
+      } else {
+        vlog('Pixtral gav ingen alt-text för bilden.', 'err');
+      }
     } else {
       vlog('Manuell bilduppladdning: ingen Mistral-nyckel satt (fliken Inställningar) — hoppar över alt-text.', 'err');
     }
@@ -1981,12 +2010,17 @@
     btn.style.cssText = 'margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;';
     btn.addEventListener('click', async () => {
       const file = fileInput.files && fileInput.files[0];
-      if (!file) { vlog('Manuell bilduppladdning: ingen fil vald i "Fil"-fältet ännu.', 'err'); return; }
+      let source = file ? { file } : null;
+      if (!source) {
+        const existingUrl = findExistingImagePreviewUrl();
+        if (existingUrl) source = { url: existingUrl };
+      }
+      if (!source) { vlog('Manuell bilduppladdning: ingen fil vald i "Fil"-fältet, och ingen redan tillagd bild hittades.', 'err'); return; }
       const origText = btn.textContent;
       btn.disabled = true;
       btn.textContent = 'Anropar Mistral…';
       try {
-        await autoFillManualImageUpload(file);
+        await autoFillManualImageUpload(source);
         btn.textContent = '✓ Klart';
       } catch (e) {
         vlog('Manuell bilduppladdning gav fel: ' + e.message, 'err');
@@ -2019,8 +2053,9 @@
     title: 'id_title', title_sv: 'id_title_sv', file: 'id_file',
     credit: 'id_credit', credit_sv: 'id_credit_sv', alt: 'id_alt', alt_sv: 'id_alt_sv'
   };
-  async function autoFillSbrImagePage(file) {
-    vlog('SBR bildsida: fyller i fält automatiskt för "' + file.name + '"…');
+  async function autoFillSbrImagePage(source) {
+    vlog('SBR bildsida: fyller i fält automatiskt för "' + sourceDisplayName(source) +
+      (source.url ? '" (redan tillagd bild, inget nytt filval)…' : '"…'));
     const apiKey = GM_getValue('sbr_mistral_key', '').trim();
     const titleVal = (document.getElementById(SBR_IMG_FIELDS.title)?.value || '').trim();
     const placeholder = titleVal ? ('Bild: ' + titleVal) : '';
@@ -2031,16 +2066,13 @@
     if (creditPair.reused) vlog('Kreditrad återanvänd mellan språken: "' + creditPair.credit + '".', 'ok');
     let altSv = '', altEn = '';
     if (apiKey) {
-      try {
-        const dataUri = await fileToDataUri(file);
-        const alt = await fetchAltTextFromImage(dataUri, apiKey);
-        if (alt) {
-          altSv = alt.alttext_sv || ''; altEn = alt.alttext_en || '';
-          vlog('Pixtral gav alt-text för den manuellt valda bilden.', 'ok');
-        } else {
-          vlog('Pixtral gav ingen alt-text för den manuellt valda bilden.', 'err');
-        }
-      } catch (e) { vlog('Alt-text (SBR bildsida) misslyckades: ' + e.message, 'err'); }
+      const alt = await resolveAltTextForImage(source, apiKey);
+      if (alt) {
+        altSv = alt.alttext_sv || ''; altEn = alt.alttext_en || '';
+        vlog('Pixtral gav alt-text för bilden.', 'ok');
+      } else {
+        vlog('Pixtral gav ingen alt-text för bilden.', 'err');
+      }
     } else {
       vlog('SBR bildsida: ingen SBR Mistral-nyckel satt (fliken Inställningar i SBR-panelen) — hoppar över alt-text.', 'err');
     }
@@ -2068,12 +2100,17 @@
     btn.style.cssText = 'margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;';
     btn.addEventListener('click', async () => {
       const file = fileInput.files && fileInput.files[0];
-      if (!file) { vlog('SBR bildsida: ingen fil vald i "Fil"-fältet ännu.', 'err'); return; }
+      let source = file ? { file } : null;
+      if (!source) {
+        const existingUrl = findExistingImagePreviewUrl();
+        if (existingUrl) source = { url: existingUrl };
+      }
+      if (!source) { vlog('SBR bildsida: ingen fil vald i "Fil"-fältet, och ingen redan tillagd bild hittades.', 'err'); return; }
       const origText = btn.textContent;
       btn.disabled = true;
       btn.textContent = 'Anropar Mistral…';
       try {
-        await autoFillSbrImagePage(file);
+        await autoFillSbrImagePage(source);
         btn.textContent = '✓ Klart';
       } catch (e) {
         vlog('SBR bildsida gav fel: ' + e.message, 'err');
