@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.87.4
+// @version      7.87.5
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5087,7 +5087,9 @@
   const EMOJI_RE = /\p{Extended_Pictographic}/gu;
   // Klockslag i löptext ("18:00", "kl 19", "kl. 19", "klockan 20") — tid ska
   // stå i datumfälten, inte i beskrivningen.
-  const TIME_IN_TEXT_RE = /\b\d{1,2}[:.]\d{2}\b|\bkl\.?\s?\d{1,2}\b|\bklockan\b/i;
+  // Engelska klockslagsformuleringar ("10 pm", "10pm", "12 noon", "midnight")
+  // — samma princip som "kl 19"/"klockan 20" ovan, fast för engelska texter.
+  const TIME_IN_TEXT_RE = /\b\d{1,2}[:.]\d{2}\b|\bkl\.?\s?\d{1,2}\b|\bklockan\b|\b\d{1,2}\s?(?:am|pm)\b|\bnoon\b|\bmidnight\b/i;
   // Kalenderdatum i löptext ("Den 23–24 oktober", "On 23–24 October") —
   // samma princip som TIME_IN_TEXT_RE ovan, fast för datum: ska fyllas i i
   // datumfälten, inte skrivas i beskrivningen. Kräver ett tal intill
