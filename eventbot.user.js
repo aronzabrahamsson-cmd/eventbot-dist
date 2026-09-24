@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.87.5
+// @version      7.88.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1911,6 +1911,28 @@
     if (existing) return { credit: existing, creditSv: existing, reused: true };
     return { credit: placeholderEn || '', creditSv: placeholderSv || '', reused: false };
   }
+  // Alt-textfälten är för smala för att visa hela den AI-genererade texten
+  // utan att sidoscrolla i själva fältet — visar därför den fullständiga
+  // texten i en temporär ruta direkt under fältet så snart automatiken har
+  // fyllt i den (på uttrycklig begäran, 2026-09-24). Rutan hör inte till
+  // CMS-formuläret (skickas aldrig in), bara ett läshjälpmedel som script:et
+  // själv lägger till — samma insertBefore(...nextSibling)-mönster som redan
+  // används för "Fyll i automatiskt"-knappen bredvid filfältet ovan. Delad
+  // av alla tre bildautomationsflödena.
+  function showAltTextPreview(fieldId, text) {
+    const el = document.getElementById(fieldId);
+    if (!el) return;
+    let box = el.parentNode && el.parentNode.querySelector('.vseh-alt-preview[data-for="' + fieldId + '"]');
+    if (!text) { if (box) box.remove(); return; }
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'vseh-alt-preview';
+      box.dataset.for = fieldId;
+      box.style.cssText = 'font-size:12px; margin:4px 0 10px; padding:6px 8px; background:#eef6ff; border:1px solid #b8d8ff; border-radius:4px; color:#1a3a5c; white-space:pre-wrap; max-width:480px;';
+      el.parentNode.insertBefore(box, el.nextSibling);
+    }
+    box.textContent = text;
+  }
   // Bildrättighetens utgångsdatum, delad av ALLA sidor med ett "Rights expiry
   // date"-fält (på uttrycklig begäran, 2026-09-23): sista eventdatum + 3
   // månader om det finns; annars (t.ex. VS-IMG:s fristående bildsida, som
@@ -2004,6 +2026,8 @@
       if (!el) { vlog('Bildfält saknas: ' + id, 'err'); continue; }
       if (val) { setNativeValue(el, val); filled++; }
     }
+    showAltTextPreview(IMG_FIELDS.alt, altEn || placeholder);
+    showAltTextPreview(IMG_FIELDS.alt_sv, altSv || placeholder);
     vlog('Manuell bilduppladdning: fyllde i ' + filled + ' fält automatiskt.', 'ok');
   }
   // Sätter in knappen bredvid filfältet första gången den hittas i DOM:en
@@ -2099,6 +2123,8 @@
       if (!el) { vlog('Bildfält saknas: ' + id, 'err'); continue; }
       if (val) { setNativeValue(el, val); filled++; }
     }
+    showAltTextPreview(SBR_IMG_FIELDS.alt, altEn || placeholder);
+    showAltTextPreview(SBR_IMG_FIELDS.alt_sv, altSv || placeholder);
     vlog('SBR bildsida: fyllde i ' + filled + ' fält automatiskt.', 'ok');
   }
   function ensureSbrImagePageButton() {
@@ -2198,6 +2224,8 @@
       if (!el) { vlog('Bildfält saknas: ' + id, 'err'); continue; }
       if (val) { setNativeValue(el, val); filled++; }
     }
+    showAltTextPreview(VS_IMG_FIELDS.alt, altEn || placeholder);
+    showAltTextPreview(VS_IMG_FIELDS.alt_sv, altSv || placeholder);
     vlog('Bildsida: fyllde i ' + filled + ' fält automatiskt.', 'ok');
   }
   function ensureVsImagePageButton() {
