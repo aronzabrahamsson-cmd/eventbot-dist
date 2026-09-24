@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.88.0
+// @version      7.89.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1586,6 +1586,152 @@
     } else {
       vlog('Datum: inget occurrences/start_date-fält i svaret — inga datumblock fylls i.', 'err');
     }
+  }
+
+  // ---- [EDIT] Fritextruta för att tolka om felaktiga datum (v7.89.0) -------
+  // Ibland postas ett event felaktigt som ett datumSPAN (t.ex. ett enda block
+  // "2026-06-01 till 2026-08-31") när det i verkligheten är återkommande
+  // ENSKILDA tillfällen under perioden (ev. med undantagna veckodagar, "stängt
+  // alla måndagar"). Låter användaren klistra in fritext (en lista med datum,
+  // eller en textinstruktion som "closed all mondays during...") och skicka
+  // den till Mistral, som tolkar den till en lista av {date, start_time,
+  // end_time}-tillfällen — samma form som insertAndFillDateBlock() redan tar.
+  // På uttrycklig begäran (2026-09-24): ERSÄTTER alla befintliga datumblock
+  // (så det felaktiga spannet försvinner), och faller — om fritexten INTE
+  // själv anger period/klockslag — tillbaka på vad som REDAN står ifyllt i
+  // formuläret (skickas med som kontext till Mistral).
+
+  // Läser både datum OCH klockslag ur de redan ifyllda date_admin-blocken
+  // (currentEventDates() i guide-taggningsdelen längre ner läser bara datum)
+  // — används som fallback-kontext när fritexten inte själv anger period/tid.
+  function currentDateBlocksWithTimes() {
+    const dateInputs = [...document.querySelectorAll('input[name^="date_admin-"][name$="-value-date"]')];
+    return dateInputs.map(el => {
+      const n = el.name.match(/^date_admin-(\d+)-value-date$/)?.[1];
+      return {
+        date: el.value || '',
+        start_time: document.getElementById(`date_admin-${n}-value-start_time`)?.value || '',
+        end_time: document.getElementById(`date_admin-${n}-value-end_time`)?.value || ''
+      };
+    }).filter(b => b.date);
+  }
+
+  // Klickar bort ALLA befintliga datumblock innan de nytolkade tillfällena
+  // fylls i (ersätter, rör inte lägg-till). Spegling av findDateAdminAddButton
+  // ovans bekräftade ADD-knappsmönster (button[data-streamfield-action]) —
+  // DELETE-varianten är inte lika hårt bekräftad live, så funktionen loggar
+  // tydligt om block blir kvar istället för att misslyckas tyst.
+  async function removeAllDateBlocks() {
+    const root = document.getElementById("date_admin-root") || document.querySelector('[data-contentpath="date_admin"]');
+    const scope = root || document;
+    let guard = 0;
+    while (guard++ < 50) {
+      const btns = [...scope.querySelectorAll('button[data-streamfield-action="DELETE"]')].filter(b => b.offsetParent !== null);
+      if (!btns.length) break;
+      btns[0].click();
+      await wait(150);
+    }
+    const remaining = document.querySelectorAll('input[name^="date_admin-"][name$="-value-date"]').length;
+    if (remaining) {
+      vlog(`Datum-omtolkning: kunde inte ta bort alla befintliga datumblock (${remaining} kvar) — nya tillfällen läggs till UTÖVER dessa istället för att ersätta.`, 'err');
+    } else {
+      vlog('Datum-omtolkning: befintliga datumblock borttagna.', 'ok');
+    }
+  }
+
+  // Skickar fritexten (+ ev. redan ifyllda datum/tider som fallback-kontext)
+  // till Mistral och ber om en strikt JSON-lista av enskilda tillfällen.
+  async function parseDatesWithMistral(freeText, apiKey) {
+    const existing = currentDateBlocksWithTimes();
+    const contextLines = existing.length
+      ? 'Formuläret har redan dessa datum/tider ifyllda (använd som period/klockslag OM texten nedan inte själv anger det, t.ex. vid en instruktion som bara utesluter veckodagar):\n' +
+        existing.map(b => `${b.date} ${b.start_time}-${b.end_time}`).join('\n') + '\n\n'
+      : '';
+    const payload = {
+      model: 'mistral-small-latest',
+      messages: [
+        { role: 'system', content:
+          'Du tolkar fritext om ett events datum/öppettider till en lista av ENSKILDA tillfällen (aldrig datumspann/intervall som ett enda block). ' +
+          'Texten kan vara en uppräkning av datum, ELLER en instruktion som anger en period och undantagna veckodagar (t.ex. "closed all mondays", "stängt måndagar"). ' +
+          'Expandera alltid en period till varje enskild dag inom den, exkludera angivna veckodagar. Klockslag alltid 24-timmarsformat "HH:MM". ' +
+          'Om varken texten eller kontexten nedan ger dig ett klockslag, lämna start_time/end_time tomma strängar för det tillfället hellre än att hitta på ett. ' +
+          'Om du inte kan avgöra någon period alls (varken från texten eller kontexten), svara med en tom lista. ' +
+          'Svara ENBART med JSON: {"occurrences":[{"date":"YYYY-MM-DD","start_time":"HH:MM","end_time":"HH:MM"}, ...]}. Ingen text utanför JSON.' },
+        { role: 'user', content: contextLines + 'Fritext att tolka:\n' + freeText }
+      ]
+    };
+    const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, payload);
+    const text = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+    const data = extractJSON(typeof text === 'string' ? text : JSON.stringify(text || ''));
+    return Array.isArray(data?.occurrences) ? data.occurrences : [];
+  }
+
+  // Sorterar kronologiskt (samma princip som fillDateBlocksFromCSV ovan),
+  // tar bort befintliga block, fyller sedan i de nytolkade tillfällena ett i
+  // taget via insertAndFillDateBlock() — samma fyllningsfunktion som resten
+  // av scriptet redan använder och litar på.
+  async function applyParsedDates(occurrences) {
+    const sorted = [...occurrences].sort((a, b) =>
+      `${a.date} ${a.start_time || '00:00'}`.localeCompare(`${b.date} ${b.start_time || '00:00'}`));
+    await removeAllDateBlocks();
+    vlog(`Datum-omtolkning: fyller i ${sorted.length} tillfälle(n) (kronologiskt)…`);
+    for (const occ of sorted) {
+      await insertAndFillDateBlock({ date: occ.date, start_time: occ.start_time || '', end_time: occ.end_time || '' });
+    }
+    vlog('Datum-omtolkning: klar.', 'ok');
+  }
+
+  // Sätter in fritextrutan + knappen direkt under date_admin-blocket, en gång
+  // per sidladdning (dataset-flagga på root:en, samma mönster som filfältets
+  // "Fyll i automatiskt"-knapp). Pollas var 1:e sekund tills date_admin-
+  // blocket faktiskt finns i DOM:en (precis som ensureManualImageUploadButton).
+  function ensureDateFixBox() {
+    const root = document.getElementById("date_admin-root") || document.querySelector('[data-contentpath="date_admin"]');
+    if (!root || root.dataset.vsehDateFixWired) return;
+    root.dataset.vsehDateFixWired = '1';
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'margin-top:10px; padding:8px; border:1px dashed #999; border-radius:4px;';
+    wrap.innerHTML =
+      '<div style="font-size:12px; font-weight:600; margin-bottom:4px;">🤖 Tolka om datum (Mistral)</div>' +
+      '<div style="font-size:11px; color:#666; margin-bottom:4px;">Klistra in en datumlista, eller en instruktion som "closed all mondays during..." — ersätter ALLA datumblock ovan med det Mistral tolkar fram.</div>' +
+      '<textarea class="vseh-datefix-input" rows="3" style="width:100%; box-sizing:border-box; font-size:12px;" placeholder="T.ex. 2026-06-01, 2026-06-08, 2026-06-15 kl 18-20&#10;eller: Öppet dagligen 10-18 1 juni-31 aug, stängt alla måndagar"></textarea>' +
+      '<button type="button" class="vseh-datefix-btn" style="margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;">🤖 Tolka och ersätt datum (Mistral)</button>';
+    root.parentNode.insertBefore(wrap, root.nextSibling);
+    const btn = wrap.querySelector('.vseh-datefix-btn');
+    const textarea = wrap.querySelector('.vseh-datefix-input');
+    btn.addEventListener('click', async () => {
+      const freeText = textarea.value.trim();
+      if (!freeText) { vlog('Datum-omtolkning: fritextrutan är tom.', 'err'); return; }
+      const sbrMode = location.hostname === 'www.stockholmbusinessregion.se';
+      const apiKey = GM_getValue(sbrMode ? 'sbr_mistral_key' : 'mistral_key', '').trim();
+      if (!apiKey) { vlog('Datum-omtolkning: ingen Mistral-nyckel satt (fliken Inställningar).', 'err'); return; }
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Anropar Mistral…';
+      try {
+        vlog('Datum-omtolkning: skickar fritext till Mistral…');
+        const occurrences = await parseDatesWithMistral(freeText, apiKey);
+        if (!occurrences.length) {
+          vlog('Datum-omtolkning: Mistral kunde inte tolka fram några tillfällen ur texten (och/eller de befintliga datumen).', 'err');
+          btn.textContent = 'Inga datum tolkade';
+        } else {
+          await applyParsedDates(occurrences);
+          btn.textContent = '✓ Klart';
+        }
+      } catch (e) {
+        vlog('Datum-omtolkning: fel — ' + e.message, 'err');
+        btn.textContent = 'Fel — se logg';
+      } finally {
+        setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 1500);
+      }
+    });
+  }
+  let dateFixBoxWired = false;
+  function wireDateFixBox() {
+    if (dateFixBoxWired) return;
+    dateFixBoxWired = true;
+    ensureDateFixBox();
+    setInterval(ensureDateFixBox, 1000);
   }
 
   // ============================================================
@@ -5065,6 +5211,7 @@
     vlog('EventChecker: Initierar på edit-sida');
     ensureEditBarStyle();
     wireManualImageUploadAutomation();
+    wireDateFixBox();
     if (!document.getElementById('vseh-edit-bar')) {
       const anchor = document.querySelector('.page-header, .header, header, h1') || document.querySelector('form');
       if (anchor) {
