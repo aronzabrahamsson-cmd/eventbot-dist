@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.89.1
+// @version      7.89.2
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1616,48 +1616,32 @@
     }).filter(b => b.date);
   }
 
-  // Klickar bort ALLA befintliga datumblock innan de nytolkade tillfällena
-  // fylls i (ersätter, rör inte lägg-till). Spegling av findDateAdminAddButton
-  // ovans bekräftade ADD-knappsmönster (button[data-streamfield-action]) —
-  // DELETE-varianten är inte lika hårt bekräftad live.
-  // BEKRÄFTAT FEL (2026-09-24, live logg): ett fast 150ms-dröjsmål mellan
-  // klicken räckte inte — Wagtails EGEN blocks.js hann inte bli klar med
-  // föregående borttagning innan nästa klick kom, vilket gav "Cannot read
-  // properties of undefined (reading 'markDeleted')" i sidans JS och lämnade
-  // blocks.js interna radräkning i ett skevt läge. Följden: alla block TOGS
-  // visuellt bort (remaining blev 0, så felet syntes inte här), men det
-  // FÖRSTA nya blocket som sedan lades till fick fel/obefintligt fält-id och
-  // stod tomt (bekräftat: exakt datum #1 av 20 uteblev, resten fylldes rätt).
-  // Fix: vänta tills antalet datum-inputs FAKTISKT minskat (inte bara ett
-  // fast dröjsmål) innan nästa klick, plus en kort paus efter sista
-  // borttagningen så blocks.js interna state hinner stabiliseras helt innan
-  // vi börjar lägga till nya block.
-  async function removeAllDateBlocks() {
+  // Tar bort de SISTA `count` befintliga datumblocken (använt när det finns
+  // FLER befintliga block än nytolkade tillfällen — ovanligt, se
+  // applyParsedDates). Väntar in varje borttagning innan nästa klick (inte
+  // ett fast dröjsmål) eftersom ett för tidigt nästa klick BEKRÄFTAT
+  // (2026-09-24, live logg) fick Wagtails EGEN blocks.js att kasta "Cannot
+  // read properties of undefined (reading 'markDeleted')" och lämna dess
+  // interna radräkning i ett skevt läge.
+  async function removeTrailingDateBlocks(count) {
     const root = document.getElementById("date_admin-root") || document.querySelector('[data-contentpath="date_admin"]');
     const scope = root || document;
     const countDateInputs = () => document.querySelectorAll('input[name^="date_admin-"][name$="-value-date"]').length;
-    let guard = 0;
-    while (guard++ < 50) {
+    for (let i = 0; i < count; i++) {
       const btns = [...scope.querySelectorAll('button[data-streamfield-action="DELETE"]')].filter(b => b.offsetParent !== null);
       if (!btns.length) break;
       const before = countDateInputs();
-      btns[0].click();
+      btns[btns.length - 1].click();   // sista blockets knapp — tar bort bakifrån
       const removed = await new Promise(resolve => {
         let tries = 0;
         const iv = setInterval(() => {
           if (countDateInputs() < before) { clearInterval(iv); resolve(true); }
-          else if (++tries > 30) { clearInterval(iv); resolve(false); }
+          else if (++tries > 50) { clearInterval(iv); resolve(false); }
         }, 100);
       });
-      if (!removed) { vlog('Datum-omtolkning: ett datumblock verkade inte försvinna efter borttagningsklicket (väntade 3s) — avbryter borttagningen.', 'err'); break; }
+      if (!removed) { vlog('Datum-omtolkning: ett överflödigt datumblock verkade inte försvinna — lämnas kvar.', 'err'); break; }
     }
-    await wait(300);   // låt blocks.js interna state stabiliseras helt innan vi lägger till något nytt
-    const remaining = countDateInputs();
-    if (remaining) {
-      vlog(`Datum-omtolkning: kunde inte ta bort alla befintliga datumblock (${remaining} kvar) — nya tillfällen läggs till UTÖVER dessa istället för att ersätta.`, 'err');
-    } else {
-      vlog('Datum-omtolkning: befintliga datumblock borttagna.', 'ok');
-    }
+    await wait(300);
   }
 
   // Skickar fritexten (+ ev. redan ifyllda datum/tider som fallback-kontext)
@@ -1687,16 +1671,39 @@
     return Array.isArray(data?.occurrences) ? data.occurrences : [];
   }
 
-  // Sorterar kronologiskt (samma princip som fillDateBlocksFromCSV ovan),
-  // tar bort befintliga block, fyller sedan i de nytolkade tillfällena ett i
-  // taget via insertAndFillDateBlock() — samma fyllningsfunktion som resten
-  // av scriptet redan använder och litar på.
+  // Sorterar kronologiskt (samma princip som fillDateBlocksFromCSV ovan).
+  // BEKRÄFTAT FEL (2026-09-24, live logg, TVÅ gånger — v7.89.0 OCH v7.89.1s
+  // försök att bara vänta längre): raderar man ALLA befintliga block först
+  // och lägger sedan till nya på ett formulär som tillfälligt haft NOLL
+  // datumblock, hinner Wagtails egen blocks.js inte bli klar internt —
+  // exakt det FÖRSTA nya blocket får då fel/obefintligt fält-id och töms ut
+  // efter 12s väntan, oavsett hur länge vi väntar innan vi börjar lägga
+  // till. Fix (annan strategi, inte bara längre väntan): skriv i stället OM
+  // de befintliga blockens fält direkt (ren simulateInput, inget
+  // radera+lägga-till, inget race) för så många tillfällen som får plats,
+  // och använd insertAndFillDateBlock() bara för RESTEN — formuläret har då
+  // ALLTID minst ett kvarvarande block, aldrig ett tillfälligt tomt läge.
   async function applyParsedDates(occurrences) {
     const sorted = [...occurrences].sort((a, b) =>
       `${a.date} ${a.start_time || '00:00'}`.localeCompare(`${b.date} ${b.start_time || '00:00'}`));
-    await removeAllDateBlocks();
-    vlog(`Datum-omtolkning: fyller i ${sorted.length} tillfälle(n) (kronologiskt)…`);
-    for (const occ of sorted) {
+    const existingInputs = [...document.querySelectorAll('input[name^="date_admin-"][name$="-value-date"]')];
+    const reuseCount = Math.min(existingInputs.length, sorted.length);
+    vlog(`Datum-omtolkning: skriver om ${reuseCount} befintliga block, lägger till ${Math.max(sorted.length - reuseCount, 0)} nya` +
+      (existingInputs.length > sorted.length ? `, tar bort ${existingInputs.length - sorted.length} överflödiga` : '') + '…');
+    for (let i = 0; i < reuseCount; i++) {
+      const n = existingInputs[i].name.match(/^date_admin-(\d+)-value-date$/)?.[1];
+      const dateEl = document.getElementById(`date_admin-${n}-value-date`);
+      const startEl = document.getElementById(`date_admin-${n}-value-start_time`);
+      const endEl = document.getElementById(`date_admin-${n}-value-end_time`);
+      if (dateEl) simulateInput(dateEl, sorted[i].date);
+      if (startEl) simulateInput(startEl, sorted[i].start_time || '');
+      if (endEl) simulateInput(endEl, sorted[i].end_time || '');
+    }
+    if (existingInputs.length > sorted.length) {
+      await removeTrailingDateBlocks(existingInputs.length - sorted.length);
+    }
+    for (let i = reuseCount; i < sorted.length; i++) {
+      const occ = sorted[i];
       await insertAndFillDateBlock({ date: occ.date, start_time: occ.start_time || '', end_time: occ.end_time || '' });
     }
     vlog('Datum-omtolkning: klar.', 'ok');
@@ -1714,7 +1721,7 @@
     wrap.style.cssText = 'margin-top:10px; padding:8px; border:1px dashed #999; border-radius:4px;';
     wrap.innerHTML =
       '<div style="font-size:12px; font-weight:600; margin-bottom:4px;">🤖 Tolka om datum (Mistral)</div>' +
-      '<div style="font-size:11px; color:#666; margin-bottom:4px;">Klistra in en datumlista, eller en instruktion som "closed all mondays during..." — ersätter ALLA datumblock ovan med det Mistral tolkar fram.</div>' +
+      '<div style="font-size:11px; color:#666; margin-bottom:4px;">Klistra in en datumlista, eller en instruktion som "closed all mondays during..." — skriver om datumen ovan till det Mistral tolkar fram.</div>' +
       '<textarea class="vseh-datefix-input" rows="3" style="width:100%; box-sizing:border-box; font-size:12px;" placeholder="T.ex. 2026-06-01, 2026-06-08, 2026-06-15 kl 18-20&#10;eller: Öppet dagligen 10-18 1 juni-31 aug, stängt alla måndagar"></textarea>' +
       '<button type="button" class="vseh-datefix-btn" style="margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;">🤖 Tolka och ersätt datum (Mistral)</button>';
     root.parentNode.insertBefore(wrap, root.nextSibling);
