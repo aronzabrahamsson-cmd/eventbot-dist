@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.89.2
+// @version      7.90.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5742,6 +5742,71 @@
     });
   }
 
+  // Gräns för "för lång titel" (på uttrycklig begäran, 2026-09-28): titlar
+  // över detta antal tecken flaggas med en Mistral-förkortningsknapp — bara
+  // på EDIT-sidan, inte MAIN/SBR:s always-on-kontroller (till skillnad från
+  // VERSALER/datum-i-titel ovan, som gäller överallt).
+  const TITLE_TOO_LONG_LIMIT = 50;
+
+  // Samma mönster som rewriteTitleRemoveDateTime() ovan, fast förkortar
+  // titeln till kärnan (artist/akt + ev. genre) istället för att ta bort
+  // datum/tid — lång uppräkning av medverkande/instrument m.m. ska bort,
+  // tonvikt på tydlighet och kortfattat (på uttrycklig begäran).
+  async function rewriteTitleShorten(lang) {
+    const el = document.getElementById('id_title_' + lang);
+    const title = (el?.value || '').trim();
+    if (!title) return;
+    const sbrMode = location.hostname === 'www.stockholmbusinessregion.se';
+    const mistralKey = GM_getValue(sbrMode ? 'sbr_mistral_key' : 'mistral_key', '');
+    if (!mistralKey) { vlog('För lång titel: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
+    try {
+      vlog('För lång titel: Skickar titel till Mistral (id_title_' + lang + ')…');
+      const payload = {
+        model: 'mistral-small-latest',
+        messages: [
+          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstitlar. Titeln användaren ger är för lång och detaljerad (t.ex. en fullständig uppräkning av medverkande artister/instrument/besättning). Skriv om den till en KORT, tydlig titel på max ' + TITLE_TOO_LONG_LIMIT + ' tecken — behåll bara det viktigaste (huvudakt/artistnamn och ev. genre/typ av event), stryk uppräkningar av enskilda medverkande, instrument och annan detaljinformation. Prioritera tydlighet och kortfattat framför fullständighet. Titeln är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den nya titeln, ingen kommentar, inga citattecken.' },
+          { role: 'user', content: title }
+        ]
+      };
+      const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
+      const rewritten = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+      if (!rewritten) throw new Error('Tomt svar från Mistral');
+      simulateInput(el, rewritten.trim());
+      vlog('För lång titel: Klar (id_title_' + lang + ').', 'ok');
+    } catch (e) {
+      vlog('För lång titel: Fel — ' + e.message, 'err');
+    }
+  }
+
+  // Flaggar titlar längre än TITLE_TOO_LONG_LIMIT tecken — samma knapp-
+  // mönster som checkTitleCasing()/checkDateTimeInTitle() ovan. Bara på
+  // EDIT-sidan (anropas från runEditPageChecks(), inte MAIN/SBR:s always-on-
+  // kontroller — på uttrycklig begäran, 2026-09-28).
+  function checkTitleTooLong() {
+    ['en', 'sv'].forEach(lang => {
+      const el = document.getElementById('id_title_' + lang);
+      const title = el?.value || '';
+      if (title.length <= TITLE_TOO_LONG_LIMIT) { setFieldNote(el, 'toolong', ''); return; }
+      setFieldNote(el, 'toolong',
+        '<div style="color:#c02626;font-weight:600;">⚠️ Rubriken är för lång (' + title.length + ' tecken, gräns ' + TITLE_TOO_LONG_LIMIT + ') — bör vara kort och tydlig, inte en fullständig uppräkning.</div>' +
+        '<div style="margin-top:6px;">' +
+        '<button type="button" class="vseh-toolong-fix-btn" data-lang="' + lang + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (förkortar rubriken)</button>' +
+        '</div>');
+    });
+    document.querySelectorAll('.vseh-toolong-fix-btn').forEach(btn => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = '1';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Anropar Mistral…';
+        await rewriteTitleShorten(btn.dataset.lang);
+        btn.disabled = false;
+        btn.textContent = orig;
+      });
+    });
+  }
+
   // Beskrivningen är Draftail (rich text) — enda sättet i det här scriptet
   // att skriva till den (updateDraftail) gör det via en total nyskriven
   // ContentState, vilket plattar ut eventuell befintlig formatering (fetstil,
@@ -6407,6 +6472,7 @@
     stripEmojisFromTitles();
     checkTitleCasing();
     checkDateTimeInTitle();
+    checkTitleTooLong();
     stripDescriptionEmoji();
     checkGuidelineIssues();
     checkIdenticalDescriptions();
