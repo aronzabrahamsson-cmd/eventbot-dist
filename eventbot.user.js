@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.90.0
+// @version      7.91.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -234,6 +234,24 @@
 
   const esc = s => (s == null ? '' : String(s)).replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // Mistral ska ALDRIG leverera em-dash (—) i fritext — scriptets regel är
+  // en-dash med mellanslag ( – ) istället (på uttrycklig begäran, 2026-09-28).
+  // NO_EMDASH_RULE läggs till i VARJE Mistral-systemprompt i scriptet, och
+  // stripEmDashes()/stripEmDashesFromObject() är dessutom ett NÄT som körs på
+  // ALL text Mistral faktiskt levererar innan den hamnar i formuläret —
+  // oavsett om modellen följde instruktionen eller inte.
+  const NO_EMDASH_RULE = ' Använd ALDRIG em-dash-tecknet (—). Behöver du markera en paus eller ett tillägg, skriv istället en-dash med mellanslag runt ( – ).';
+  function stripEmDashes(text) {
+    return typeof text === 'string' ? text.replace(/\s*—\s*/g, ' – ') : text;
+  }
+  function stripEmDashesFromObject(obj) {
+    if (!obj || typeof obj !== 'object') return obj;
+    for (const k of Object.keys(obj)) {
+      if (typeof obj[k] === 'string') obj[k] = stripEmDashes(obj[k]);
+    }
+    return obj;
+  }
 
   function gmGet(url) {
     return new Promise((resolve, reject) => {
@@ -2617,7 +2635,7 @@
         content: [
           { type: 'text', text: 'Beskriv bilden i EXAKT två korta, sakliga meningar. ' +
             'Svara ENBART med JSON: {"alttext_sv":"...","alttext_en":"..."}. ' +
-            'Ingen text utanför JSON. Hitta inte på detaljer du inte ser.' },
+            'Ingen text utanför JSON. Hitta inte på detaljer du inte ser.' + NO_EMDASH_RULE },
           { type: 'image_url', image_url: imageUrl }
         ]
       }],
@@ -2630,7 +2648,7 @@
                    resp.choices[0].message.content;
       if (!text) return null;
       const data = extractJSON(typeof text === 'string' ? text : JSON.stringify(text));
-      if (data && (data.alttext_sv || data.alttext_en)) return data;
+      if (data && (data.alttext_sv || data.alttext_en)) return stripEmDashesFromObject(data);
       return null;
     } catch (e) {
       vlog('Pixtral alt-text misslyckades: ' + e.message, 'err');
@@ -2698,6 +2716,7 @@
       'lokalbeskrivning, arrangörsomnämnande, biljettinfo. Hitta inte på specifika fakta.\n' +
       '- alttext_sv/alttext_en: lämna ALLTID tomma — fylls separat av annan process.\n' +
       '- closest_station: närmaste station för adressen (uppslag tillåtet).\n' +
+      '-' + NO_EMDASH_RULE + '\n' +
       'Returnera ENBART JSON-objektet enligt ditt schema.';
 
     setStatus(`Skapar "${ev.title}" via Mistral…`, 'work');
@@ -2749,6 +2768,7 @@
         try { console.log('VSEH FULL resp:', resp); console.log('VSEH FULL text:', text); } catch {}
         throw new Error('Kunde inte tolka agentens svar som JSON. Se loggrutan (📋) för råsvaret.');
       }
+      stripEmDashesFromObject(data);   // nät ifall agenten ändå levererade em-dash trots instruktionen ovan
       vlog('JSON tolkad OK. Fält (' + Object.keys(data).length + '): ' + Object.keys(data).join(', '), 'ok');
       vlog('Kontroll: title_sv="' + (data.title_sv || '(tom)') + '", main_category="' + (data.main_category || '(tom)') + '", notes="' + (data.notes || '(inga)') + '"');
       try { vlog('Rådata (JSON): ' + JSON.stringify(data).slice(0, 6000)); } catch {}
@@ -3015,11 +3035,13 @@
          'Detta är INTE Ticketmaster — ingen strukturerad eventdata medföljer separat, all information ' +
          'måste utläsas ur texten ovan, inklusive occurrences (var extra noggrann — inget facit skriver ' +
          'över dina datum här, så sätt dates_uncertain="true" om du är minsta osäker).\n\n' +
+         NO_EMDASH_RULE + '\n\n' +
          'Returnera ENBART JSON-objektet enligt ditt schema.')
       : ('EVENT-URL: ' + url + '\n\n' +
          'Scriptet kunde inte hämta sidans text i förväg — du måste läsa URL:en själv. ' +
          'Var EXTRA försiktig: fyll bara i fält du med säkerhet kan verifiera från din egen läsning, ' +
          'och sätt dates_uncertain="true" vid minsta osäkerhet.\n\n' +
+         NO_EMDASH_RULE + '\n\n' +
          'Returnera ENBART JSON-objektet enligt ditt schema.');
 
     setEventStatus('url', 'Skapar via Mistral…', 'work');
@@ -3058,6 +3080,7 @@
         try { vlog('resp (JSON): ' + JSON.stringify(resp).slice(0, 6000)); } catch {}
         throw new Error('Kunde inte tolka agentens svar som JSON. Se loggrutan (📋) för råsvaret.');
       }
+      stripEmDashesFromObject(data);   // nät ifall agenten ändå levererade em-dash trots instruktionen ovan
       vlog('JSON tolkad OK. Fält (' + Object.keys(data).length + '): ' + Object.keys(data).join(', '), 'ok');
       vlog('Kontroll: title_sv="' + (data.title_sv || '(tom)') + '", dates_uncertain="' + (data.dates_uncertain || '(ej satt)') + '", notes="' + (data.notes || '(inga)') + '"');
       // Rådata alltid i loggen (på begäran 2026-09-21) — inte bara fältnamnen
@@ -5558,7 +5581,7 @@
       const payload = {
         model: 'mistral-small-latest',
         messages: [
-          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstexter. Skriv om texten användaren ger EXAKT enligt instruktionerna nedan, men ändra INGET annat — behåll tonen och all annan sakinformation orörd. Texten är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den omskrivna texten — ingen kommentar, inga citattecken, ingen extra formatering.\n\n' +
+          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstexter. Skriv om texten användaren ger EXAKT enligt instruktionerna nedan, men ändra INGET annat — behåll tonen och all annan sakinformation orörd. Texten är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den omskrivna texten — ingen kommentar, inga citattecken, ingen extra formatering.' + NO_EMDASH_RULE + '\n\n' +
               instructions.map(i => '- ' + i).join('\n') },
           { role: 'user', content: text }
         ]
@@ -5566,7 +5589,7 @@
       const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
       const rewritten = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
       if (!rewritten) throw new Error('Tomt svar från Mistral');
-      await updateDraftail(fieldId, rewritten.trim());
+      await updateDraftail(fieldId, stripEmDashes(rewritten.trim()));
       vlog('Riktlinje-omskrivning: Klar (' + fieldId + ').', 'ok');
     } catch (e) {
       vlog('Riktlinje-omskrivning: Fel — ' + e.message, 'err');
@@ -5630,14 +5653,14 @@
         model: 'mistral-small-latest',
         messages: [
           { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstitlar. ' + instruction +
-              ' Ändra ENDAST skiftläget — samma ord, samma ordning, samma skiljetecken. Titeln är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den omskrivna titeln, ingen kommentar, inga citattecken.' },
+              ' Ändra ENDAST skiftläget — samma ord, samma ordning, samma skiljetecken (om titeln redan innehåller em-dash (—) är enda undantaget: skriv då om den till en-dash med mellanslag ( – ) istället).' + NO_EMDASH_RULE + ' Titeln är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den omskrivna titeln, ingen kommentar, inga citattecken.' },
           { role: 'user', content: title }
         ]
       };
       const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
       const rewritten = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
       if (!rewritten) throw new Error('Tomt svar från Mistral');
-      simulateInput(el, rewritten.trim());
+      simulateInput(el, stripEmDashes(rewritten.trim()));
       vlog('Versalrubrik: Klar (id_title_' + lang + ').', 'ok');
     } catch (e) {
       vlog('Versalrubrik: Fel — ' + e.message, 'err');
@@ -5661,14 +5684,14 @@
       const payload = {
         model: 'mistral-small-latest',
         messages: [
-          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstitlar. Ta bort alla datumangivelser och klockslag ur titeln användaren ger (datum/tid fylls redan i i separata datumfält, de hör inte hemma i titeln) — men behåll ÅRTAL orörda (de skiljer t.ex. mellan olika årgångar av en återkommande festival, som "Festivalen 2026"). Ändra INGET annat — samma ord, samma ordning, samma skiftläge, samma skiljetecken i övrigt, bara städa upp eventuell dubbel blanksteg/skiljetecken som blir kvar efter borttagningen. Titeln är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den omskrivna titeln, ingen kommentar, inga citattecken.' },
+          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstitlar. Ta bort alla datumangivelser och klockslag ur titeln användaren ger (datum/tid fylls redan i i separata datumfält, de hör inte hemma i titeln) — men behåll ÅRTAL orörda (de skiljer t.ex. mellan olika årgångar av en återkommande festival, som "Festivalen 2026"). Ändra INGET annat — samma ord, samma ordning, samma skiftläge, samma skiljetecken i övrigt, bara städa upp eventuell dubbel blanksteg/skiljetecken som blir kvar efter borttagningen.' + NO_EMDASH_RULE + ' Titeln är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den omskrivna titeln, ingen kommentar, inga citattecken.' },
           { role: 'user', content: title }
         ]
       };
       const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
       const rewritten = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
       if (!rewritten) throw new Error('Tomt svar från Mistral');
-      simulateInput(el, rewritten.trim());
+      simulateInput(el, stripEmDashes(rewritten.trim()));
       vlog('Datum/tid i rubrik: Klar (id_title_' + lang + ').', 'ok');
     } catch (e) {
       vlog('Datum/tid i rubrik: Fel — ' + e.message, 'err');
@@ -5764,14 +5787,14 @@
       const payload = {
         model: 'mistral-small-latest',
         messages: [
-          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstitlar. Titeln användaren ger är för lång och detaljerad (t.ex. en fullständig uppräkning av medverkande artister/instrument/besättning). Skriv om den till en KORT, tydlig titel på max ' + TITLE_TOO_LONG_LIMIT + ' tecken — behåll bara det viktigaste (huvudakt/artistnamn och ev. genre/typ av event), stryk uppräkningar av enskilda medverkande, instrument och annan detaljinformation. Prioritera tydlighet och kortfattat framför fullständighet. Titeln är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den nya titeln, ingen kommentar, inga citattecken.' },
+          { role: 'system', content: 'Du är redaktör för Visit Stockholms evenemangstitlar. Titeln användaren ger är för lång och detaljerad (t.ex. en fullständig uppräkning av medverkande artister/instrument/besättning). Skriv om den till en KORT, tydlig titel på max ' + TITLE_TOO_LONG_LIMIT + ' tecken — behåll bara det viktigaste (huvudakt/artistnamn och ev. genre/typ av event), stryk uppräkningar av enskilda medverkande, instrument och annan detaljinformation. Prioritera tydlighet och kortfattat framför fullständighet.' + NO_EMDASH_RULE + ' Titeln är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + ', översätt INTE till något annat språk. Svara ENDAST med den nya titeln, ingen kommentar, inga citattecken.' },
           { role: 'user', content: title }
         ]
       };
       const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
       const rewritten = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
       if (!rewritten) throw new Error('Tomt svar från Mistral');
-      simulateInput(el, rewritten.trim());
+      simulateInput(el, stripEmDashes(rewritten.trim()));
       vlog('För lång titel: Klar (id_title_' + lang + ').', 'ok');
     } catch (e) {
       vlog('För lång titel: Fel — ' + e.message, 'err');
@@ -6386,14 +6409,14 @@
       const payload = {
         model: 'mistral-small-latest',
         messages: [
-          { role: 'system', content: 'Du är en professionell översättare. Översätt EXAKT texten användaren ger till ' + targetName + '. Svara UTESLUTANDE på ' + targetName + ', oavsett vad källtexten är skriven på. Svara ENDAST med den översatta texten — ingen kommentar, inga citattecken, ingen extra formatering.' },
+          { role: 'system', content: 'Du är en professionell översättare. Översätt EXAKT texten användaren ger till ' + targetName + '. Svara UTESLUTANDE på ' + targetName + ', oavsett vad källtexten är skriven på. Svara ENDAST med den översatta texten — ingen kommentar, inga citattecken, ingen extra formatering.' + NO_EMDASH_RULE },
           { role: 'user', content: sourceText }
         ]
       };
       const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
       const translated = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
       if (!translated) throw new Error('Tomt svar från Mistral');
-      await updateDraftail('id_description_' + targetLang, translated.trim());
+      await updateDraftail('id_description_' + targetLang, stripEmDashes(translated.trim()));
       vlog('Översättning: Klar (' + targetName + ').', 'ok');
     } catch (e) {
       vlog('Översättning: Fel — ' + e.message, 'err');
