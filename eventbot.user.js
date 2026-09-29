@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.93.0
+// @version      7.94.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3322,6 +3322,14 @@
     .vseh-row input:focus, .vseh-row select:focus { outline:2px solid var(--vd-accent); outline-offset:-1px; }
     .vseh-key { font-family:monospace; font-size:12px !important; }
     .vseh-two { display:flex; gap:9px; } .vseh-two > div { flex:1; }
+    .vseh-divider { border:none; border-top:1px solid var(--vd-line); margin:16px 0; }
+    .vseh-dropzone { flex:1; border:1.5px dashed var(--vd-line); border-radius:7px; padding:8px 10px;
+      font-size:11px; color:var(--vd-txt3); text-align:center; cursor:pointer; transition:border-color .12s, background .12s; }
+    .vseh-dropzone.vseh-drop-hover { border-color:var(--vd-accent); background:var(--vd-bg3); color:var(--vd-txt); }
+    #vseh-settings-export, #sbr-settings-export { font-size:11.5px; font-weight:600; padding:7px 11px;
+      border:1px solid var(--vd-line); background:var(--vd-bg2); color:var(--vd-accent); border-radius:7px;
+      cursor:pointer; white-space:nowrap; }
+    #vseh-settings-export:hover, #sbr-settings-export:hover { background:var(--vd-bg3); }
 
     #vseh-dedup-row { display:flex; align-items:center; gap:8px; margin:10px 0 2px; flex-wrap:wrap; }
     #vseh-dedup-btn { font-size:11.5px; font-weight:600; padding:7px 11px; border:1px solid var(--vd-line); background:var(--vd-bg2); color:var(--vd-accent); border-radius:7px; cursor:pointer; white-space:nowrap; }
@@ -3505,6 +3513,82 @@
     });
   }
 
+  // ---- Exportera/importera inställningar (v7.94.0, på uttrycklig begäran
+  // 2026-09-29) — ALLA API-nycklar/tokens/namn i EN JSON-fil, så en ny
+  // kollega slipper skriva in varje fält för hand. id-listan täcker båda
+  // panelernas fält (en nyckel kan visas på båda, t.ex. github_data_pat) —
+  // importen uppdaterar VARJE synligt fält som matchar, oavsett vilken panel
+  // filen släpptes i, eftersom alla dessa GM-nycklar redan är globalt delade.
+  // OBS: filen innehåller riktiga hemligheter (Mistral/Ticketmaster/Tickster-
+  // nycklar, GitHub-PAT) — dela den bara som ni redan delar sådant idag
+  // (samma försiktighet som att skicka en lösenordshanterare-post).
+  const SETTINGS_FIELD_MAP = {
+    tm_key:            { label: 'Ticketmaster Consumer Key', ids: ['vseh-key'] },
+    mistral_key:       { label: 'Mistral API-nyckel (Visit Stockholm)', ids: ['vseh-mkey'] },
+    mistral_agent:     { label: 'Mistral agent-ID (Visit Stockholm)', ids: ['vseh-magent'] },
+    tickster_key:      { label: 'Tickster API-nyckel', ids: ['vseh-tixkey'] },
+    sbr_mistral_key:   { label: 'Mistral API-nyckel (SBR)', ids: ['sbr-mkey'] },
+    sbr_mistral_agent: { label: 'Mistral agent-ID (SBR)', ids: ['sbr-magent'] },
+    github_data_pat:   { label: 'GitHub-PAT (delad datasynk)', ids: ['vseh-ghpat', 'sbr-ghpat'] },
+    vseh_user_name:    { label: 'Ditt namn', ids: ['vseh-username', 'sbr-username'] }
+  };
+  function exportSettingsFile() {
+    const data = {};
+    Object.keys(SETTINGS_FIELD_MAP).forEach(key => { data[key] = GM_getValue(key, ''); });
+    const blob = new Blob([JSON.stringify(data, null, 2) + '\n'], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    try {
+      GM_download({ url, name: 'eventbot-settings.json', saveAs: true });
+      vlog('Inställningar exporterade (eventbot-settings.json).', 'ok');
+    } catch (e) {
+      vlog('Export misslyckades: ' + e.message, 'err');
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+  }
+  function applyImportedSettingsText(text) {
+    let obj;
+    try { obj = JSON.parse(text); } catch { vlog('Import: filen är inte giltig JSON.', 'err'); return; }
+    let count = 0;
+    Object.keys(SETTINGS_FIELD_MAP).forEach(key => {
+      if (!(key in obj)) return;
+      const val = String(obj[key] == null ? '' : obj[key]).trim();
+      GM_setValue(key, val);
+      SETTINGS_FIELD_MAP[key].ids.forEach(id => { const el = document.getElementById(id); if (el) el.value = val; });
+      count++;
+    });
+    vlog('Import: ' + count + ' fält importerade från fil (' + Object.keys(SETTINGS_FIELD_MAP).filter(k => k in obj).map(k => SETTINGS_FIELD_MAP[k].label).join(', ') + ').', 'ok');
+  }
+  function wireSettingsImportExport(exportBtnId, dropZoneId, fileInputId) {
+    const exportBtn = document.getElementById(exportBtnId);
+    const dropZone = document.getElementById(dropZoneId);
+    const fileInput = document.getElementById(fileInputId);
+    if (exportBtn) exportBtn.addEventListener('click', exportSettingsFile);
+    const readAndApply = file => {
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => applyImportedSettingsText(reader.result);
+      reader.onerror = () => vlog('Import: kunde inte läsa filen.', 'err');
+      reader.readAsText(file);
+    };
+    if (dropZone) {
+      dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('vseh-drop-hover'); });
+      dropZone.addEventListener('dragleave', () => dropZone.classList.remove('vseh-drop-hover'));
+      dropZone.addEventListener('drop', e => {
+        e.preventDefault();
+        dropZone.classList.remove('vseh-drop-hover');
+        readAndApply(e.dataTransfer.files && e.dataTransfer.files[0]);
+      });
+      dropZone.addEventListener('click', () => fileInput && fileInput.click());
+    }
+    if (fileInput) {
+      fileInput.addEventListener('change', () => {
+        readAndApply(fileInput.files && fileInput.files[0]);
+        fileInput.value = '';
+      });
+    }
+  }
+
   // ==== [SBR] buildSbrPanel — "Eventbot SBR.se" ==============================
   // Widget-namn: SBR. @match: stockholmbusinessregion.se/wt/cms/snippets/api/event/*
   // (matchar add/edit/list-sidorna gemensamt — se dispatcher-kommentaren
@@ -3608,16 +3692,20 @@
 
         <div class="vseh-tabpane" data-pane="sbr-set">
           <div class="vseh-fetch-h">Inställningar</div>
+          <div class="vseh-hint">Dela alla API-nycklar m.m. med en kollega: exportera som fil,
+            dra och släpp filen här (eller klicka) för att återställa.</div>
+          <div style="display:flex; gap:10px; align-items:center; margin-bottom:14px;">
+            <button type="button" id="sbr-settings-export">⬇️ Exportera inställningar</button>
+            <div id="sbr-settings-drop" class="vseh-dropzone">📄 Dra och släpp exportfil här (eller klicka)</div>
+            <input type="file" id="sbr-settings-file" accept="application/json" style="display:none;">
+          </div>
+          <hr class="vseh-divider">
           <div class="vseh-hint">Egen Mistral-nyckel och agent-ID för SBR-läget — helt separat
             från Visit Stockholm-agenten, de påverkar inte varandra.</div>
           <div class="vseh-row"><label>SBR Mistral API-nyckel</label>
             <input type="text" id="sbr-mkey" class="vseh-key" placeholder="Mistral API-nyckel (SBR-agent)" autocomplete="off" spellcheck="false"></div>
           <div class="vseh-row"><label>SBR Mistral agent-ID</label>
             <input type="text" id="sbr-magent" class="vseh-key" placeholder="ag_…" autocomplete="off" spellcheck="false"></div>
-          <div class="vseh-row"><label>Utseende</label>
-            <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
-              <input type="checkbox" id="sbr-theme-toggle" style="width:auto;">
-              Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
           <div class="vseh-fetch-h" style="margin-top:16px;">Delad datasynk (GitHub)</div>
           <div class="vseh-hint">Synkar "Hanterat"-markeringar centralt mellan alla EventBot-användare
             (eget privat repo, aronzabrahamsson-cmd/eventbot-data) — delas med huvudpanelen, sätts en gång.</div>
@@ -3625,6 +3713,11 @@
             <input type="text" id="sbr-ghpat" class="vseh-key" placeholder="github_pat_…" autocomplete="off" spellcheck="false"></div>
           <div class="vseh-row"><label>Ditt namn</label>
             <input type="text" id="sbr-username" class="vseh-key" placeholder="Visas som \"markerat av\"" autocomplete="off" spellcheck="false"></div>
+          <hr class="vseh-divider">
+          <div class="vseh-row"><label>Utseende</label>
+            <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
+              <input type="checkbox" id="sbr-theme-toggle" style="width:auto;">
+              Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
         </div>
 
       </div></div>
@@ -3669,6 +3762,7 @@
     $('sbr-ghpat').addEventListener('change', () => GM_setValue('github_data_pat', $('sbr-ghpat').value.trim()));
     $('sbr-username').addEventListener('change', () => GM_setValue('vseh_user_name', $('sbr-username').value.trim()));
     wireThemeToggle('sbr-theme-toggle');
+    wireSettingsImportExport('sbr-settings-export', 'sbr-settings-drop', 'sbr-settings-file');
     wireManualImageUploadAutomation();
     startSbrTitleChecks();
 
@@ -3827,6 +3921,14 @@
 
         <!-- FLIK: INSTÄLLNINGAR -->
         <div class="vseh-tabpane" data-pane="set">
+          <div class="vseh-hint">Dela alla API-nycklar m.m. med en kollega: exportera som fil,
+            dra och släpp filen här (eller klicka) för att återställa.</div>
+          <div style="display:flex; gap:10px; align-items:center; margin-bottom:14px;">
+            <button type="button" id="vseh-settings-export">⬇️ Exportera inställningar</button>
+            <div id="vseh-settings-drop" class="vseh-dropzone">📄 Dra och släpp exportfil här (eller klicka)</div>
+            <input type="file" id="vseh-settings-file" accept="application/json" style="display:none;">
+          </div>
+          <hr class="vseh-divider">
           <div class="vseh-row"><label>Ticketmaster Consumer Key</label>
             <input type="text" id="vseh-key" class="vseh-key" placeholder="Ticketmaster-nyckel" autocomplete="off" spellcheck="false"></div>
           <div class="vseh-row"><label>Mistral API-nyckel</label>
@@ -3844,10 +3946,6 @@
             <div class="vseh-row"><label>Sidor att hämta</label>
               <select id="vseh-pages"><option value="1">1</option><option value="3">3</option><option value="5">5</option><option value="10" selected>10</option><option value="20">20</option></select></div>
           </div>
-          <div class="vseh-row"><label>Utseende</label>
-            <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
-              <input type="checkbox" id="vseh-theme-toggle" style="width:auto;">
-              Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
           <div class="vseh-fetch-h" style="margin-top:16px;">Delad datasynk (GitHub)</div>
           <div class="vseh-hint">Synkar "Hanterat"-markeringar centralt mellan alla EventBot-användare
             (eget privat repo, aronzabrahamsson-cmd/eventbot-data) — delas med SBR-panelen, sätts en gång.</div>
@@ -3855,6 +3953,11 @@
             <input type="text" id="vseh-ghpat" class="vseh-key" placeholder="github_pat_…" autocomplete="off" spellcheck="false"></div>
           <div class="vseh-row"><label>Ditt namn</label>
             <input type="text" id="vseh-username" class="vseh-key" placeholder="Visas som &quot;markerat av&quot;" autocomplete="off" spellcheck="false"></div>
+          <hr class="vseh-divider">
+          <div class="vseh-row"><label>Utseende</label>
+            <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
+              <input type="checkbox" id="vseh-theme-toggle" style="width:auto;">
+              Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
         </div>
 
       </div></div>
@@ -4583,6 +4686,7 @@
     $('vseh-ghpat').addEventListener('change', () => GM_setValue('github_data_pat', $('vseh-ghpat').value.trim()));
     $('vseh-username').addEventListener('change', () => GM_setValue('vseh_user_name', $('vseh-username').value.trim()));
     wireThemeToggle('vseh-theme-toggle');
+    wireSettingsImportExport('vseh-settings-export', 'vseh-settings-drop', 'vseh-settings-file');
     $('vseh-fetch-tix').addEventListener('click', runTickster);
     $('vseh-fetch-bl').addEventListener('click', runBilletto);
     $('vseh-fetch-nortic').addEventListener('click', runNortic);
