@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.92.0
+// @version      7.92.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5242,14 +5242,14 @@
     const title = (titleEl?.textContent || '').trim();
     if (!title) return null;
 
-    // Svenska titeln (samma kolonn-konvention som td.field-title_en) — utan
-    // denna missas dubbletter mot en kalenderrad som bara exponerar SIN
-    // svenska titel (bekräftat 2026-09-29, "Stockholm Numismatica"-fallet:
-    // dedupIndex-raden hade bara den svenska titeln, så jämförelsen mot
-    // utkastets engelska title_en blev en tvåspråkig jämförelse och gav för
-    // låg titellikhet — se matchStatus() nedan, som nu provar båda språken).
-    const titleSvEl = row.querySelector('td.field-title_sv .title-wrapper a, td.field-title_sv a');
-    const title_sv = (titleSvEl?.textContent || '').trim();
+    // Svenska titeln — TILL SKILLNAD FRÅN title_en-kolumnen (en länk inuti
+    // en .title-wrapper) är denna cellen ren text direkt i <td>:n, ingen
+    // länk/wrapper alls (bekräftat via en riktig DOM-dump 2026-09-29:
+    // <td class="field-title_sv title">Musik till tröst och avsked</td>).
+    // Föregående version letade efter en <a> här och hittade aldrig något,
+    // så title_sv förblev alltid tom och fixen nedan (matchStatus() provar
+    // båda språken) fick aldrig något att faktiskt jämföra med.
+    const title_sv = (row.querySelector('td.field-title_sv')?.textContent || '').trim();
 
     const address = (row.querySelector('td.field-address')?.textContent || '').trim();
     const startRaw = (row.querySelector('td.field-start_date')?.textContent || '').trim();
