@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.91.1
+// @version      7.92.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1066,6 +1066,13 @@
     const simThreshold = strict ? DRAFT_SIM_THRESHOLD : SIM_THRESHOLD;
     const cand = new Set();
     new Set(tokens(ev.title)).forEach(tok => { const s = dedupIndex.byToken.get(tok); if (s) s.forEach(i => cand.add(i)); });
+    // Om utkastet har en egen svensk titel (draftvyns extractRowData()) —
+    // kalenderraden vi jämför mot kan exponera BARA sin svenska titel (t.ex.
+    // om den engelska sidan inte är publicerad separat), så utan detta hittas
+    // den varken som kandidat eller matchar på titel (bekräftat 2026-09-29).
+    if (ev.title_sv) {
+      new Set(tokens(ev.title_sv)).forEach(tok => { const s = dedupIndex.byToken.get(tok); if (s) s.forEach(i => cand.add(i)); });
+    }
 
     // Adressbaserade kandidater LÄGGS TILL separat — fångar fall där titlarna
     // delar NOLL gemensamma ord (t.ex. helt olika språk: "Öl & Sprit..." vs
@@ -1094,7 +1101,9 @@
     cand.forEach(i => {
       const row = dedupIndex.rows[i];
       if (isDismissed(ev, row)) return;
-      const tSim = titleSim(ev.title, row.title);
+      // Bästa av engelsk/svensk titeljämförelse — en kalenderrad kan exponera
+      // bara ETT språks titel (se kommentaren vid kandidatinsamlingen ovan).
+      const tSim = Math.max(titleSim(ev.title, row.title), ev.title_sv ? titleSim(ev.title_sv, row.title) : 0);
       const vSim = placeSim(ev.venue_name, ev.address, row.venue_name, row.address);
       const match = evHasPlace
         ? (tSim >= simThreshold && vSim >= VENUE_THRESHOLD)
@@ -5009,10 +5018,38 @@
           <button type="button" id="vseh-draft-fetch-btn">Hämta Visit-Kalendern</button>
           <span id="vseh-draft-ts"></span>
           <span id="vseh-draft-progress"></span>
+          <button type="button" id="vseh-draft-logbtn" title="Visa logg">📋 Logg</button>
         `;
         insertBarAtTop(bar);
         document.getElementById('vseh-draft-check-btn').addEventListener('click', runDraftvyCheck);
         document.getElementById('vseh-draft-fetch-btn').addEventListener('click', loadDedupForDraft);
+        // Samma fristående logwrap-mönster som EDIT-sidans #vseh-edit-logbtn
+        // (draftvyn har liksom EDIT ingen egen flytande panel att lägga
+        // loggrutan i) — bekräftat saknades helt här (2026-09-29).
+        const logWrap = document.createElement('div');
+        logWrap.id = 'vseh-logwrap';
+        logWrap.style.display = 'none';
+        logWrap.innerHTML = `
+          <div class="vseh-loghdr">Diagnostiklogg <span style="display:flex;gap:5px;">
+            <button type="button" id="vseh-logcopy" title="Kopiera loggen">📋 Kopiera</button>
+            <button type="button" id="vseh-logclose" title="Stäng">✕</button></span></div>
+          <div id="vseh-log"></div>
+        `;
+        document.body.appendChild(logWrap);
+        document.getElementById('vseh-draft-logbtn').addEventListener('click', () => {
+          const w = document.getElementById('vseh-logwrap');
+          w.style.display = (w.style.display === 'none' || !w.style.display) ? 'flex' : 'none';
+          renderLog();
+        });
+        document.getElementById('vseh-logclose').addEventListener('click', () => {
+          document.getElementById('vseh-logwrap').style.display = 'none';
+        });
+        document.getElementById('vseh-logcopy').addEventListener('click', async () => {
+          const btn = document.getElementById('vseh-logcopy');
+          const text = VLOG.map(e => e.line).join('\n');
+          try { await navigator.clipboard.writeText(text); btn.textContent = '✓ Kopierat'; setTimeout(() => btn.textContent = '📋 Kopiera', 1200); }
+          catch { btn.textContent = 'Fel'; setTimeout(() => btn.textContent = '📋 Kopiera', 1200); }
+        });
     }
     updateDraftvyTs();
     // Ingen automatisk hämtning här (den är tung — läser hela Visit-kalendern
@@ -5205,12 +5242,22 @@
     const title = (titleEl?.textContent || '').trim();
     if (!title) return null;
 
+    // Svenska titeln (samma kolonn-konvention som td.field-title_en) — utan
+    // denna missas dubbletter mot en kalenderrad som bara exponerar SIN
+    // svenska titel (bekräftat 2026-09-29, "Stockholm Numismatica"-fallet:
+    // dedupIndex-raden hade bara den svenska titeln, så jämförelsen mot
+    // utkastets engelska title_en blev en tvåspråkig jämförelse och gav för
+    // låg titellikhet — se matchStatus() nedan, som nu provar båda språken).
+    const titleSvEl = row.querySelector('td.field-title_sv .title-wrapper a, td.field-title_sv a');
+    const title_sv = (titleSvEl?.textContent || '').trim();
+
     const address = (row.querySelector('td.field-address')?.textContent || '').trim();
     const startRaw = (row.querySelector('td.field-start_date')?.textContent || '').trim();
     const start_date = parseSwedishDate(startRaw);
 
     return {
       title,
+      title_sv,
       venue_name: '',
       address,
       start_date,
@@ -5309,7 +5356,9 @@
   // bara till, ändrar inget befintligt. Adress-aktiveringen återställer
   // exakt samma värde den läste.
   // ":-" efter ett tal ("200:-", "50 :-") är en vanlig svensk prisnotation.
-  const PRICE_WORD_RE = /\b(sek|kr|eur)\b|€|\d+\s?:-/gi;
+  // "krona"/"kronor" (utskrivet, t.ex. engelska "200 Swedish krona") täcks
+  // inte av den korta "kr"-förkortningen ovan — på uttrycklig begäran (2026-09-29).
+  const PRICE_WORD_RE = /\b(sek|kr|krona|kronor|eur)\b|€|\d+\s?:-/gi;
   const EMOJI_RE = /\p{Extended_Pictographic}/gu;
   // Klockslag i löptext ("18:00", "kl 19", "kl. 19", "klockan 20") — tid ska
   // stå i datumfälten, inte i beskrivningen.
