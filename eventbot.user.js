@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.92.3
+// @version      7.93.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -287,6 +287,121 @@
       });
     });
   }
+  // ---- [Delad datasynk] GitHub Contents API som central "hanterat"-lagring
+  // (v7.93.0, på uttrycklig begäran 2026-09-24/29) — eget privat repo
+  // (aronzabrahamsson-cmd/eventbot-data), separat från eventbot/eventbot-dist
+  // så att datasynk-commits ALDRIG triggar eventbots egen publish-dist.yml.
+  // EN fil per redan befintlig lokal "hanterat"-flagga (manual_in/
+  // sbr_crm_handled) — ingen ny datamodell, samma nyckel som redan används
+  // lokalt (eventKey()/crmKey()) plus vem/när. Optimistisk concurrency via
+  // Content-API:ets blob-SHA (GitHubs egen rekommenderade mönster): läs →
+  // ändra → skriv med senast kända SHA → 409 om någon hann skriva emellan →
+  // läs om och försök igen (några gånger, sen ge upp och logga).
+  const GITHUB_DATA_OWNER = 'aronzabrahamsson-cmd';
+  const GITHUB_DATA_REPO = 'eventbot-data';
+  // btoa/atob är bara Latin1-säkra — den här omvägen (samma klassiska trick
+  // som resten av webben använder) gör dem UTF-8-säkra för å/ä/ö i namn/nycklar.
+  function utf8ToBase64(str) { return btoa(unescape(encodeURIComponent(str))); }
+  function base64ToUtf8(str) { return decodeURIComponent(escape(atob(str))); }
+  function githubDataToken() { return GM_getValue('github_data_pat', '').trim(); }
+  function githubDataUserName() { return GM_getValue('vseh_user_name', '').trim() || 'okänd'; }
+
+  // Läser en fil ur data-repot. 404 (filen finns inte än — helt normalt
+  // första gången) ger tyst {records:[]}/sha:null istället för ett fel.
+  function githubDataGet(path) {
+    return new Promise((resolve, reject) => {
+      const token = githubDataToken();
+      if (!token) return reject(new Error('ingen GitHub-PAT satt (fliken Inställningar)'));
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: 'https://api.github.com/repos/' + GITHUB_DATA_OWNER + '/' + GITHUB_DATA_REPO + '/contents/' + path,
+        headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json' },
+        onload: r => {
+          if (r.status === 404) return resolve({ json: { records: [] }, sha: null });
+          if (r.status === 401) return reject(new Error('401 – ogiltig GitHub-PAT'));
+          if (r.status < 200 || r.status >= 300) return reject(new Error('HTTP ' + r.status));
+          try {
+            const data = JSON.parse(r.responseText);
+            const json = JSON.parse(base64ToUtf8(data.content.replace(/\n/g, '')));
+            resolve({ json, sha: data.sha });
+          } catch (e) { reject(new Error('ogiltigt svar (' + e.message + ')')); }
+        },
+        onerror: () => reject(new Error('nätverksfel')),
+        ontimeout: () => reject(new Error('timeout')), timeout: 20000
+      });
+    });
+  }
+  // sha=null (utelämnas helt ur body:n, inte satt till null — Content-API:et
+  // kräver det för att skapa en NY fil, annars 422) skriver en helt ny fil.
+  function githubDataPut(path, json, sha, message) {
+    return new Promise((resolve, reject) => {
+      const token = githubDataToken();
+      if (!token) return reject(new Error('ingen GitHub-PAT satt (fliken Inställningar)'));
+      const body = { message, content: utf8ToBase64(JSON.stringify(json, null, 2) + '\n') };
+      if (sha) body.sha = sha;
+      GM_xmlhttpRequest({
+        method: 'PUT',
+        url: 'https://api.github.com/repos/' + GITHUB_DATA_OWNER + '/' + GITHUB_DATA_REPO + '/contents/' + path,
+        headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json' },
+        data: JSON.stringify(body),
+        onload: r => {
+          if (r.status === 409) { const e = new Error('409 – konflikt'); e.conflict = true; return reject(e); }
+          if (r.status === 401) return reject(new Error('401 – ogiltig GitHub-PAT'));
+          if (r.status < 200 || r.status >= 300) return reject(new Error('HTTP ' + r.status + ' — ' + (r.responseText || '').slice(0, 200)));
+          try { resolve(JSON.parse(r.responseText)); } catch { reject(new Error('ogiltigt svar')); }
+        },
+        onerror: () => reject(new Error('nätverksfel')),
+        ontimeout: () => reject(new Error('timeout')), timeout: 20000
+      });
+    });
+  }
+  // Lägger till/tar bort EN nyckel i en delad post-lista. Fire-and-forget
+  // från toggleManualIn()/toggleCrmHandled() — blockerar aldrig UI:t, loggar
+  // bara resultatet. Konflikt (två användare samtidigt) löses genom att läsa
+  // om och försöka igen, upp till några gånger.
+  async function syncSharedRecordSet(fileName, key, action) {
+    if (!githubDataToken()) return;   // ingen PAT satt — datasynk avstängd, helt tyst
+    const path = 'data/' + fileName + '.json';
+    const byName = githubDataUserName();
+    for (let attempt = 0; attempt < 4; attempt++) {
+      let current;
+      try { current = await githubDataGet(path); }
+      catch (e) { vlog('Datasynk (' + fileName + '): kunde inte läsa — ' + e.message, 'err'); return; }
+      const records = Array.isArray(current.json.records) ? current.json.records.slice() : [];
+      const idx = records.findIndex(r => r.key === key);
+      if (action === 'add') {
+        const rec = { key, by: byName, at: new Date().toISOString() };
+        if (idx === -1) records.push(rec); else records[idx] = rec;
+      } else {
+        if (idx === -1) return;   // redan borttaget centralt — inget att göra
+        records.splice(idx, 1);
+      }
+      try {
+        await githubDataPut(path, { records }, current.sha,
+          (action === 'add' ? 'Mark handled: ' : 'Unmark handled: ') + key);
+        vlog('Datasynk (' + fileName + '): ' + (action === 'add' ? 'markerade' : 'avmarkerade') + ' "' + key + '" centralt.', 'ok');
+        return;
+      } catch (e) {
+        if (e.conflict) continue;   // någon annan skrev emellan — läs om och försök igen
+        vlog('Datasynk (' + fileName + '): kunde inte skriva — ' + e.message, 'err');
+        return;
+      }
+    }
+    vlog('Datasynk (' + fileName + '): gav upp efter upprepade konflikter, försök igen senare.', 'err');
+  }
+  // Hämtar hela den centrala nyckellistan — används för att slå ihop med den
+  // lokala Set:en när en panel byggs, så andras markeringar dyker upp lokalt.
+  async function pullSharedRecordSet(fileName) {
+    if (!githubDataToken()) return [];   // ingen PAT satt — inget att hämta
+    try {
+      const { json } = await githubDataGet('data/' + fileName + '.json');
+      return Array.isArray(json.records) ? json.records.map(r => r.key) : [];
+    } catch (e) {
+      vlog('Datasynk (' + fileName + '): kunde inte hämta centrala listan — ' + e.message, 'err');
+      return [];
+    }
+  }
+
   // Algolias JS-klient postar JSON men sätter Content-Type till
   // x-www-form-urlencoded (bekräftat via en riktig fångad request från
   // billetto.se) — ovanligt, men det är vad servern faktiskt förväntar sig.
@@ -431,8 +546,20 @@
   function isManualIn(ev) { return manualIn.has(eventKey(ev)); }
   function toggleManualIn(ev) {
     const k = eventKey(ev);
-    if (manualIn.has(k)) manualIn.delete(k); else manualIn.add(k);
+    const added = !manualIn.has(k);
+    if (added) manualIn.add(k); else manualIn.delete(k);
     saveManualIn();
+    syncSharedRecordSet('manual_in', k, added ? 'add' : 'remove').catch(() => {});
+  }
+  // Hämtar central manual_in-lista en gång (panelbygget) och slår ihop den
+  // MED den lokala Set:en (union, aldrig ersätter) — så en markering en annan
+  // användare gjort dyker upp här utan att radera något lokalt (2026-09-29).
+  async function pullAndMergeManualIn() {
+    const remoteKeys = await pullSharedRecordSet('manual_in');
+    if (!remoteKeys.length) return;
+    let added = 0;
+    remoteKeys.forEach(k => { if (!manualIn.has(k)) { manualIn.add(k); added++; } });
+    if (added) { saveManualIn(); vlog('Datasynk (manual_in): ' + added + ' central(a) markering(ar) hämtade.', 'ok'); }
   }
 
   // ---- Avflaggade dubblettgrupper (sparade) --------------------------------
@@ -3491,6 +3618,13 @@
             <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
               <input type="checkbox" id="sbr-theme-toggle" style="width:auto;">
               Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
+          <div class="vseh-fetch-h" style="margin-top:16px;">Delad datasynk (GitHub)</div>
+          <div class="vseh-hint">Synkar "Hanterat"-markeringar centralt mellan alla EventBot-användare
+            (eget privat repo, aronzabrahamsson-cmd/eventbot-data) — delas med huvudpanelen, sätts en gång.</div>
+          <div class="vseh-row"><label>GitHub PAT (data-repo)</label>
+            <input type="text" id="sbr-ghpat" class="vseh-key" placeholder="github_pat_…" autocomplete="off" spellcheck="false"></div>
+          <div class="vseh-row"><label>Ditt namn</label>
+            <input type="text" id="sbr-username" class="vseh-key" placeholder="Visas som \"markerat av\"" autocomplete="off" spellcheck="false"></div>
         </div>
 
       </div></div>
@@ -3526,6 +3660,14 @@
     $('sbr-magent').value = GM_getValue('sbr_mistral_agent', '');
     $('sbr-mkey').addEventListener('change', () => GM_setValue('sbr_mistral_key', $('sbr-mkey').value.trim()));
     $('sbr-magent').addEventListener('change', () => GM_setValue('sbr_mistral_agent', $('sbr-magent').value.trim()));
+    // Delad datasynk — SAMMA GM-nycklar som MAIN-panelens motsvarande fält
+    // (github_data_pat/vseh_user_name), inte egna per domän (till skillnad
+    // från Mistral-nycklarna ovan): det är EN delad datakälla oavsett varifrån
+    // den sätts, samma mönster som temat (wireThemeToggle).
+    $('sbr-ghpat').value = GM_getValue('github_data_pat', '');
+    $('sbr-username').value = GM_getValue('vseh_user_name', '');
+    $('sbr-ghpat').addEventListener('change', () => GM_setValue('github_data_pat', $('sbr-ghpat').value.trim()));
+    $('sbr-username').addEventListener('change', () => GM_setValue('vseh_user_name', $('sbr-username').value.trim()));
     wireThemeToggle('sbr-theme-toggle');
     wireManualImageUploadAutomation();
     startSbrTitleChecks();
@@ -3546,6 +3688,7 @@
     // ---- CRM-import ----
     loadSbrCrmEvents();
     loadCrmHandled();
+    pullAndMergeCrmHandled().then(renderCrmEvents).catch(() => {});
     renderCrmEvents();
     $('sbr-crm-import').addEventListener('click', () => {
       const ta = $('sbr-crm-paste');
@@ -3705,6 +3848,13 @@
             <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
               <input type="checkbox" id="vseh-theme-toggle" style="width:auto;">
               Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
+          <div class="vseh-fetch-h" style="margin-top:16px;">Delad datasynk (GitHub)</div>
+          <div class="vseh-hint">Synkar "Hanterat"-markeringar centralt mellan alla EventBot-användare
+            (eget privat repo, aronzabrahamsson-cmd/eventbot-data) — delas med SBR-panelen, sätts en gång.</div>
+          <div class="vseh-row"><label>GitHub PAT (data-repo)</label>
+            <input type="text" id="vseh-ghpat" class="vseh-key" placeholder="github_pat_…" autocomplete="off" spellcheck="false"></div>
+          <div class="vseh-row"><label>Ditt namn</label>
+            <input type="text" id="vseh-username" class="vseh-key" placeholder="Visas som &quot;markerat av&quot;" autocomplete="off" spellcheck="false"></div>
         </div>
 
       </div></div>
@@ -3715,6 +3865,8 @@
     $('vseh-mkey').value = GM_getValue('mistral_key', '');
     $('vseh-magent').value = GM_getValue('mistral_agent', '');
     $('vseh-tixkey').value = GM_getValue('tickster_key', '');
+    $('vseh-ghpat').value = GM_getValue('github_data_pat', '');
+    $('vseh-username').value = GM_getValue('vseh_user_name', '');
     const mb = document.querySelector('#vseh-headbtns button[data-m="' + mode + '"]');
     if (mb) mb.classList.add('on');
     wire();
@@ -3836,8 +3988,19 @@
   function isCrmHandled(ev) { return isCrmManuallyHandled(ev) || isCrmPassed(ev); }
   function toggleCrmHandled(ev) {
     const k = crmKey(ev);
-    if (crmHandled.has(k)) crmHandled.delete(k); else crmHandled.add(k);
+    const added = !crmHandled.has(k);
+    if (added) crmHandled.add(k); else crmHandled.delete(k);
     saveCrmHandled();
+    syncSharedRecordSet('sbr_crm_handled', k, added ? 'add' : 'remove').catch(() => {});
+  }
+  // Samma union-ihopslagning som pullAndMergeManualIn() (MAIN-panelen) —
+  // egen kopia här eftersom nyckelrymden/Set:en är SBR-lägets egen (2026-09-29).
+  async function pullAndMergeCrmHandled() {
+    const remoteKeys = await pullSharedRecordSet('sbr_crm_handled');
+    if (!remoteKeys.length) return;
+    let added = 0;
+    remoteKeys.forEach(k => { if (!crmHandled.has(k)) { crmHandled.add(k); added++; } });
+    if (added) { saveCrmHandled(); vlog('Datasynk (sbr_crm_handled): ' + added + ' central(a) markering(ar) hämtade.', 'ok'); }
   }
 
   // Kolumnordning (tab-separerat från Excel):
@@ -4416,6 +4579,9 @@
     $('vseh-mkey').addEventListener('change', () => GM_setValue('mistral_key', $('vseh-mkey').value.trim()));
     $('vseh-magent').addEventListener('change', () => GM_setValue('mistral_agent', $('vseh-magent').value.trim()));
     $('vseh-tixkey').addEventListener('change', () => GM_setValue('tickster_key', $('vseh-tixkey').value.trim()));
+    // Delad datasynk — samma GM-nycklar som SBR-panelens motsvarande fält.
+    $('vseh-ghpat').addEventListener('change', () => GM_setValue('github_data_pat', $('vseh-ghpat').value.trim()));
+    $('vseh-username').addEventListener('change', () => GM_setValue('vseh_user_name', $('vseh-username').value.trim()));
     wireThemeToggle('vseh-theme-toggle');
     $('vseh-fetch-tix').addEventListener('click', runTickster);
     $('vseh-fetch-bl').addEventListener('click', runBilletto);
@@ -6722,6 +6888,7 @@
     loadClearedGroups();
     loadSkipList();
     loadManualIn();
+    pullAndMergeManualIn().then(() => { if (lastGrouped.length) render(lastGrouped); }).catch(() => {});
     // Engångsmigrering: gamla "Ska ej in"-markeringar blir nu "Hanterad".
     if (skipList.size) {
       let migrated = 0;
