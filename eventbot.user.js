@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.94.0
+// @version      7.95.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5717,6 +5717,102 @@
     'Möjlig otillåten eventtyp': '🚫'
   };
 
+  // Färgkod per riktlinjeflagga (på uttrycklig begäran 2026-09-30) — samma
+  // färg används både på etikettens understrykning och på själva den
+  // flaggade termens understrykning i förhandsvisningen nedan, så det syns
+  // direkt i löptexten VAR och VILKEN sorts fel sitter, inte bara ATT något
+  // är fel. Familjevis grupperade (pris=gult, tid/datum=orange eftersom
+  // båda "hör hemma i datumfälten", plats/adress=blått, osv).
+  const GUIDELINE_ISSUE_COLOR = {
+    'Prisinfo': '#e6c200',
+    'Tidsinfo i fält': '#ff9800',
+    'Datuminfo i fält': '#ff9800',
+    'Platsinfo i fält': '#3399ff',
+    'Adressinfo i fält': '#3399ff',
+    'Länk i fält': '#b266ff',
+    'Kontaktuppgift i fält': '#ff66b2',
+    'Vi/oss-språk': '#2fbf9f',
+    'Säljspråk': '#ff5555',
+    'Möjlig otillåten eventtyp': '#aa3333'
+  };
+  // Hittar ALLA träffar (inte bara den första, till skillnad från
+  // upptäcktskontrollerna ovan som bara behöver veta ATT något matchar) för
+  // en given regex i RÅ text — lägger till 'g' om den saknas, annars
+  // återanvänds regexens egna flaggor rakt av.
+  function findAllRanges(text, re) {
+    const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+    const ranges = [];
+    let m;
+    while ((m = g.exec(text))) {
+      if (!m[0]) { g.lastIndex++; continue; }
+      ranges.push([m.index, m.index + m[0].length]);
+    }
+    return ranges;
+  }
+  // Räknar om VILKA tecken-intervall i texten som hörde till en given
+  // riktlinjeflagga — separat funktion (inte återanvänd rakt av från
+  // checkGuidelineIssues() ovan) eftersom den behöver ALLA förekomster för
+  // understrykningen, inte bara den första träffen som räcker för att
+  // flagga fältet.
+  function guidelineIssueRanges(text, label, venueNames, addressRaw) {
+    switch (label) {
+      case 'Prisinfo': return findAllRanges(text, PRICE_WORD_RE);
+      case 'Tidsinfo i fält': return findAllRanges(text, TIME_IN_TEXT_RE);
+      case 'Datuminfo i fält': return findAllRanges(text, DATE_IN_TEXT_RE);
+      case 'Platsinfo i fält': {
+        const v = (venueNames || []).find(v => new RegExp(wordBoundaryPattern(v), 'i').test(text));
+        return v ? findAllRanges(text, new RegExp(wordBoundaryPattern(v), 'i')) : [];
+      }
+      case 'Adressinfo i fält': {
+        // Bästa möjliga försök: adressfältets EXAKTA sträng, ordagrant och
+        // skiftlägesokänsligt — till skillnad från upptäckten ovan (som
+        // jämför normaliserad text mot normaliserad adress) kan denna missa
+        // om löptexten skriver adressen något annorlunda. Flaggan visas
+        // ändå, bara understrykningen uteblir då.
+        if (!addressRaw) return [];
+        const i = text.toLowerCase().indexOf(addressRaw.toLowerCase());
+        return i >= 0 ? [[i, i + addressRaw.length]] : [];
+      }
+      case 'Länk i fält': return findAllRanges(text, URL_IN_TEXT_RE);
+      case 'Kontaktuppgift i fält':
+        return findAllRanges(text, PHONE_IN_TEXT_RE).concat(findAllRanges(text, EMAIL_IN_TEXT_RE));
+      case 'Vi/oss-språk': return findAllRanges(text, wordListRe(WE_US_WORDS_SV.concat(WE_US_WORDS_EN)));
+      case 'Säljspråk': {
+        const hit = HYPE_WORDS.find(w => text.toLowerCase().includes(w.toLowerCase()));
+        return hit ? findAllRanges(text, new RegExp(hit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')) : [];
+      }
+      case 'Möjlig otillåten eventtyp': {
+        const hit = INELIGIBLE_EVENT_WORDS.find(w => wordListRe([w]).test(text)) || (/\bmässa\b/i.test(text) ? 'mässa' : null);
+        return hit ? findAllRanges(text, wordListRe([hit])) : [];
+      }
+      default: return [];
+    }
+  }
+  // Bygger en SKRIVSKYDDAD förhandsvisning av hela beskrivningstexten med
+  // varje flaggad term understruken i respektive flaggas färg — en ren
+  // text-till-HTML-rendering, rör ALDRIG det riktiga Draftail-fältet (som
+  // enda skrivvägen, updateDraftail(), redan plattar ut vid en total
+  // omskrivning — se kommentaren vid readDraftailText()). Överlappande
+  // träffar: den FÖRSTA (kortaste startindex) vinner, resten hoppas över.
+  function highlightedTextPreview(text, fieldIssues, venueNames, addressRaw) {
+    const marks = [];
+    fieldIssues.forEach(issue => {
+      const color = GUIDELINE_ISSUE_COLOR[issue.label] || '#ff3b3b';
+      guidelineIssueRanges(text, issue.label, venueNames, addressRaw).forEach(([s, e]) => marks.push({ s, e, color }));
+    });
+    if (!marks.length) return '';
+    marks.sort((a, b) => a.s - b.s || a.e - b.e);
+    let out = '', pos = 0;
+    marks.forEach(({ s, e, color }) => {
+      if (s < pos) return;
+      out += esc(text.slice(pos, s));
+      out += '<span style="text-decoration:underline;text-decoration-color:' + color + ';text-decoration-thickness:2px;text-underline-offset:2px;">' + esc(text.slice(s, e)) + '</span>';
+      pos = e;
+    });
+    out += esc(text.slice(pos));
+    return '<div style="margin-top:8px;padding:8px 10px;background:var(--vd-bg);border-radius:6px;font-size:12.5px;line-height:1.5;white-space:pre-wrap;">' + out + '</div>';
+  }
+
   function fieldWrapper(el) {
     return (el && (el.closest('.w-field, .w-panel, [data-field]') || el.parentElement)) || null;
   }
@@ -5848,10 +5944,14 @@
           '<div style="font-weight:700;margin-bottom:6px;">⚠️ Åtgärder</div>' +
           fieldIssues.map(i =>
             '<div style="margin-bottom:6px;">' +
-            '<div style="font-weight:700;">' + (GUIDELINE_ISSUE_EMOJI[i.label] || '⚠️') + ' ' + esc(i.label) + '</div>' +
+            '<div style="font-weight:700;text-decoration:underline;text-decoration-color:' + (GUIDELINE_ISSUE_COLOR[i.label] || '#ff3b3b') + ';text-decoration-thickness:2px;text-underline-offset:2px;">' + (GUIDELINE_ISSUE_EMOJI[i.label] || '⚠️') + ' ' + esc(i.label) + '</div>' +
             '<div>' + esc(i.msg) + '</div>' +
             '</div>'
           ).join('');
+        // Samma text som fältet, men med varje flaggad term understruken i
+        // sin flaggas färg — ett snabbt "var i texten?"-facit utan att
+        // behöva läsa varje förklaringsrad för sig (på uttrycklig begäran).
+        html += highlightedTextPreview(text, fieldIssues, venueNames, addressRaw);
         if (fixLabels.length) {
           const frags = [...new Set(fixLabels.map(l => GUIDELINE_FIXES[l].frag))];
           const fragText = frags.length > 1
@@ -6404,7 +6504,7 @@
     [null, 'slaktkyrkan, fållan, slaktis, slakthusområdet', null, 'Sunrise over Slakthusområdet', 'Solen går upp över Slakthusområdet'],
     [null, 'Golf', null, 'Tee Up On Your Vacation', 'Spela golf på semestern'],
     [null, 'nörd, "tv-spel", rollspel, fantasy, "sci-fi", "cosplay"', null, 'Stockholm ❤️ Nerds', 'Stockholm ❤️ Nördar'],
-    [null, 'teenager', null, "The Teenager's Guide to Stockholm", 'Stockholm för tonårsfamiljen'],
+    [null, 'teenager, teens, youth, ungdomar, tonåringar, "för unga"', null, "The Teenager's Guide to Stockholm", 'Stockholm för tonårsfamiljen'],
     ['Guided tours & Lectures', 'Film', null, 'Stockholm in the Movies', 'Stockholm i filmens värld'],
     [null, 'brunch', null, 'The best brunch in Stockholm', 'Stockholms bästa brunch'],
     [null, 'kräftor, surströmming, mårten gås, "inlagd sill", senapssill, knäckebröd, "västerbottens"', null, 'Traditional Swedish food in Stockholm', 'Svensk husmanskost i Stockholm'],
@@ -6515,8 +6615,14 @@
   // (på begäran 2026-09-19: kortare inskrivning = snabbare och mindre yta
   // för ev. skrivfel). Den FULLA titeln används fortfarande som facit när
   // rätt förslag ska väljas ur listan (selectAutocompleteValue's `value`).
+  // Höjt från 2 till 3 ord (2026-09-30, på begäran) — en live-logg visade
+  // "Stockholm för" (2 ord, för "Stockholm för tonårsfamiljen") krävde tre
+  // skrivförsök innan sökwidgetens egen resultatlista hann filtreras klart;
+  // en mer specifik 3-ords-sökning ger en mindre, mer träffsäker
+  // kandidatlista snabbare och är fortfarande garanterat en verklig
+  // delsträng av guidens egen titel (den kommer ju från den).
   function guideSearchPrefix(title) {
-    return title.split(/\s+/).slice(0, 2).join(' ');
+    return title.split(/\s+/).slice(0, 3).join(' ');
   }
 
   // window.scrollTo() räcker bara om DOKUMENTET/fönstret självt är det som
