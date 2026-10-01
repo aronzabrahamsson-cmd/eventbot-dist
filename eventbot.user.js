@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.95.1
+// @version      7.95.2
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -253,8 +253,24 @@
     return obj;
   }
 
-  function gmGet(url) {
+  // Skyddsnät för userscript-hanterare som inte respekterar timeout (t.ex.
+  // SBR-bot saknar AbortController): own watchdog via Promise.race.
+  function withTimeout(promiseFactory, ms, label) {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error((label || 'Anrop') + ': timeout'));
+      }, ms);
+      promiseFactory().then(
+        v => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } },
+        e => { if (!settled) { settled = true; clearTimeout(timer); reject(e); } }
+      );
+    });
+  }
+  function gmGet(url) {
+    return withTimeout(() => new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET', url,
         onload: r => {
@@ -266,10 +282,10 @@
         onerror: () => reject(new Error('Nätverksfel')),
         ontimeout: () => reject(new Error('Timeout')), timeout: 25000
       });
-    });
+    }), 25000 + 5000, 'Hämtning');
   }
   function gmPost(url, headers, body) {
-    return new Promise((resolve, reject) => {
+    return withTimeout(() => new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST', url, headers, data: JSON.stringify(body),
         onload: r => {
@@ -285,7 +301,7 @@
         onerror: () => reject(new Error('Mistral: nätverksfel')),
         ontimeout: () => reject(new Error('Mistral: timeout')), timeout: 120000
       });
-    });
+    }), 120000 + 5000, 'Mistral');
   }
   // ---- [Delad datasynk] GitHub Contents API som central "hanterat"-lagring
   // (v7.93.0, på uttrycklig begäran 2026-09-24/29) — eget privat repo
@@ -2148,11 +2164,51 @@
   const MIME_EXT = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png',
                       'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif' };
   function downloadImageAsFile(url) {
-    return new Promise((resolve, reject) => {
+    // Vissa userscript-hanterare (t.ex. SBR-bot) saknar blob-stöd i
+    // GM_xmlhttpRequest och returnerar text. Reserv: hämta i sidkontext via
+    // fetch() — fungerar för CORS-vänliga bild-origins, annars faller vi
+    // tillbaka till <img>+canvas.
+    function viaPageFetch(url, headerTypeHint) {
+      return fetch(url).then(resp => {
+        if (!resp.ok) throw new Error('bildnedladdning HTTP ' + resp.status);
+        const type = (resp.headers.get('content-type') || headerTypeHint || 'image/jpeg').split(';')[0];
+        return resp.blob().then(b => new File([b], 'bild', { type }));
+      });
+    }
+    function viaImgCanvas(imgUrl) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => {
+          try {
+            const c = document.createElement('canvas');
+            c.width = img.naturalWidth; c.height = img.naturalHeight;
+            c.getContext('2d').drawImage(img, 0, 0);
+            c.toBlob(b => {
+              if (b) resolve(new File([b], 'bild', { type: b.type || 'image/jpeg' }));
+              else reject(new Error('bildnedladdning: canvas->blob misslyckades'));
+            });
+          } catch (e) { reject(e); }
+        };
+        img.onerror = () => reject(new Error('bildnedladdning nätverksfel'));
+        img.src = imgUrl;
+        setTimeout(() => reject(new Error('bildnedladdning timeout')), 30000);
+      });
+    }
+    return withTimeout(() => new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET', url, responseType: 'blob',
         onload: r => {
           if (r.status >= 200 && r.status < 300 && r.response) {
+            // SBR-bot returnerar text även när responseType: 'blob' begärs —
+            // upptäck det och använd reservvägarna i stället för en korrupt fil.
+            if (typeof r.response === 'string') {
+              let headerType = '';
+              try { const m = (r.responseHeaders || '').match(/content-type:\s*([^\s;]+)/i); if (m) headerType = m[1]; } catch {}
+              vlog('GM_xmlhttpRequest gav text i stället för blob (SBR-bot?) — provar fetch()-reserv.');
+              viaPageFetch(url, headerType).then(resolve, () => viaImgCanvas(url).then(resolve, reject));
+              return;
+            }
             const actualType = r.response.type || '';
             // Läs även svarshuvudet som reserv om blob.type saknas.
             let headerType = '';
@@ -2167,11 +2223,11 @@
             resolve(new File([r.response], name, { type }));
           } else reject(new Error('bildnedladdning HTTP ' + r.status));
         },
-        onerror: () => reject(new Error('bildnedladdning nätverksfel')),
+        onerror: () => viaImgCanvas(url).then(resolve, reject),
         ontimeout: () => reject(new Error('bildnedladdning timeout')),
         timeout: 30000
       });
-    });
+    }), 35000, 'bildnedladdning');
   }
 
   async function tryInjectImageFile(imageUrl) {
@@ -3538,7 +3594,11 @@
     const blob = new Blob([JSON.stringify(data, null, 2) + '\n'], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     try {
-      GM_download({ url, name: 'eventbot-settings.json', saveAs: true });
+      // GM_download kan INTE lösa blob:-URL:er i SW-baserade hanterare
+      // (t.ex. SBR-bot) och misslyckas då ofta tyst, utan onerror. En
+      // a.click()-nedladdning fungerar identiskt under alla hanterare
+      // (saveAs-dialog försvinner, men filen landar säkert).
+      anchorDownload(url, 'eventbot-settings.json');
       vlog('Inställningar exporterade (eventbot-settings.json).', 'ok');
     } catch (e) {
       vlog('Export misslyckades: ' + e.message, 'err');
@@ -3819,7 +3879,15 @@
   // Flaggskeppet: Kalendrar-hämtning (Ticketmaster/Nortic/Billetto/Tickster),
   // CRM-import, dedup mot Visit-kalendern, URL-skapande. Se dispatcher-
   // kommentaren längst ned i filen för hela MAIN/SBR/DRAFT/EDIT/GUIDE-schemat.
+  function anchorDownload(url, name) {
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+  }
   function buildPanel() {
+    // Idempotetsvakt: hanterare som reinjekterar vid SPA-navigering
+    // (t.ex. SBR-bot via onHistoryStateUpdated) skulle annars dublettera panelen.
+    if (document.getElementById('vseh-panel')) return;
     const p = document.createElement('div'); p.id = 'vseh-panel'; p.className = mode;
     p.innerHTML = `
       <div id="vseh-head">
