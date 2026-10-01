@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.95.2
+// @version      7.96.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5619,7 +5619,7 @@
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
     #vseh-edit-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer;
       font-size:13px; font-weight:600; background:var(--vd-accent); color:#fff; }
-    #vseh-edit-bar button:disabled { opacity:.6; cursor:not-allowed; }
+    #vseh-edit-bar button:disabled { opacity:.6; cursor:not-allowed; }    #vseh-edit-title { color:#fff; font-weight:700; font-size:14px; letter-spacing:.2px; }
     #vseh-consent-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
       flex-wrap:wrap; gap:10px; background:#5a3a1a; color:#fff; padding:10px 14px;
       margin:0 0 14px; border-radius:6px; box-shadow:0 2px 10px rgba(0,0,0,.3); font-weight:600;
@@ -5645,6 +5645,7 @@
   function initEventChecker() {
     vlog('EventChecker: Initierar på edit-sida');
     ensureEditBarStyle();
+    if (!dedupIndex) loadCache();
     wireManualImageUploadAutomation();
     wireDateFixBox();
     if (!document.getElementById('vseh-edit-bar')) {
@@ -5653,6 +5654,7 @@
         const bar = document.createElement('div');
         bar.id = 'vseh-edit-bar';
         bar.innerHTML = `
+          <span id="vseh-edit-title">Eventbot: EDIT</span>
           <span id="vseh-issues-summary" style="color:#e0a052;font-weight:600;"></span>
           <button type="button" id="vseh-edit-logbtn" title="Visa logg">📋 Logg</button>
         `;
