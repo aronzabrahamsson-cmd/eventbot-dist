@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.96.1
+// @version      7.96.2
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2834,12 +2834,14 @@
 
   const doneCreate = new Map();   // idx -> klockslag "HH:MM" för skapade utkast
 
-  // Separat, snabbt anrop till en RIKTIG synmodell (pixtral) enbart för alt-text.
+  // Separat, snabbt anrop till en RIKTIG synmodell enbart för alt-text.
   // Görs fristående från huvudagenten (som bygger på mistral-medium och inte ser bilder).
+  // pixtral-12b-2409 togs ur drift 2025-12-31 (direkt 404) — därför en prioritetslista
+  // med reservmodeller som provas i ordning tills en svarar.
+  const ALT_TEXT_MODELS = ['ministral-14b-2512', 'mistral-small-latest'];
   async function fetchAltTextFromImage(imageUrl, apiKey) {
     if (!imageUrl || !apiKey) return null;
     const body = {
-      model: 'pixtral-12b-2409',
       messages: [{
         role: 'user',
         content: [
@@ -2851,19 +2853,22 @@
       }],
       max_tokens: 300
     };
-    try {
-      const resp = await gmPost(MISTRAL_CHAT,
-        { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey }, body);
-      const text = resp && resp.choices && resp.choices[0] && resp.choices[0].message &&
-                   resp.choices[0].message.content;
-      if (!text) return null;
-      const data = extractJSON(typeof text === 'string' ? text : JSON.stringify(text));
-      if (data && (data.alttext_sv || data.alttext_en)) return stripEmDashesFromObject(data);
-      return null;
-    } catch (e) {
-      vlog('Pixtral alt-text misslyckades: ' + e.message, 'err');
-      return null;
+    for (const model of ALT_TEXT_MODELS) {
+      try {
+        const resp = await gmPost(MISTRAL_CHAT,
+          { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+          Object.assign({ model }, body));
+        const text = resp && resp.choices && resp.choices[0] && resp.choices[0].message &&
+                     resp.choices[0].message.content;
+        if (!text) { vlog('Alt-text: modellen ' + model + ' gav tomt svar — provar nästa modell.', 'warn'); continue; }
+        const data = extractJSON(typeof text === 'string' ? text : JSON.stringify(text));
+        if (data && (data.alttext_sv || data.alttext_en)) return stripEmDashesFromObject(data);
+        vlog('Alt-text: modellen ' + model + ' svarade utan alt-text-fält — provar nästa modell.', 'warn');
+      } catch (e) {
+        vlog('Alt-text: modellen ' + model + ' misslyckades: ' + e.message + (model === ALT_TEXT_MODELS[ALT_TEXT_MODELS.length - 1] ? ' — alla modeller provade.' : ' — provar nästa modell.'), 'err');
+      }
     }
+    return null;
   }
 
   async function createEvent(ev, idx) {
