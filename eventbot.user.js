@@ -1415,13 +1415,13 @@
   }
 
   function getDraftProps(root) {
-    // React ≤16 döper fiber-nyckeln på DOM-noden till
-    // __reactInternalInstance$, React 17+ till __reactFiber$. Fel nyckel =
-    // "hittade fältet men inte dess React-props" trots synligt fält.
-    const instKey = Object.keys(root).find(
-      (k) =>
-        k.startsWith("__reactInternalInstance$") ||
-        k.startsWith("__reactFiber$")
+    // React 17+ döpte om fiber-nyckeln på DOM-noden från __reactInternalInstance$
+    // till __reactFiber$ — bara den gamla nyckeln söks blev ALLA skrivningar
+    // till beskrivningsfälten en tyst no-op med en felrad per 1,5s-poll
+    // (bekräftat i loggen 2026-09-30, edit-sida /cms/api/event/edit/18056/).
+    // Provar båda namnen, plus __reactProps$-vägen som sista reserv.
+    const instKey = Object.keys(root).find((k) =>
+      k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")
     );
     let node = instKey ? root[instKey] : null;
     let hops = 0;
@@ -1443,6 +1443,15 @@
     return null;
   }
 
+  // updateDraftail kan anropas från 1.5s-pollern (stripDescriptionEmoji) — en
+  // misslyckad mount/props-uppslagning ska loggas EN gång per fält, inte en
+  // felrad per poll som spämmar loggen (renden syns i 2026-09-30-loggen).
+  const draftailWarned = new Set();
+  function warnDraftailOnce(fieldId, msg) {
+    if (draftailWarned.has(fieldId)) return;
+    draftailWarned.add(fieldId);
+    vlog(msg, 'err');
+  }
   async function updateDraftail(fieldId, text) {
     // Bekräftat via fältkartläggning (2026-09-21) att SBR:s add-event-formulär
     // använder en VANLIG <textarea> för description_en/sv, inte Draftail —
@@ -1458,12 +1467,12 @@
     try {
       const root = await mountDraftail(fieldId);
       if (!root) {
-        vlog(`Beskrivning: hittade inget Draftail-fält för ${fieldId} (varken .DraftEditor-root eller en klickbar .Draftail-Editor) — fältet lämnas tomt.`, 'err');
+        warnDraftailOnce(fieldId, `Beskrivning: hittade inget Draftail-fält för ${fieldId} (varken .DraftEditor-root eller en klickbar .Draftail-Editor) — fältet lämnas tomt.`);
         return;
       }
       const props = getDraftProps(root);
       if (!props) {
-        vlog(`Beskrivning: hittade Draftail-fältet ${fieldId} men inte dess React-props (onChange/editorState) — fältet lämnas tomt.`, 'err');
+        warnDraftailOnce(fieldId, `Beskrivning: hittade Draftail-fältet ${fieldId} men inte dess React-props (onChange/editorState) — fältet lämnas tomt.`);
         return;
       }
       const editorState = props.editorState;
@@ -5920,7 +5929,8 @@
     'Länk i fält': { frag: 'tar bort länkar/webbadresser', instruction: 'Ta bort webbadresser/länkar ur texten (länkar fylls redan i i länkfältet).' },
     'Kontaktuppgift i fält': { frag: 'tar bort telefonnummer/mejladresser', instruction: 'Ta bort telefonnummer och mejladresser ur texten — hänvisa till arrangörens egen sida istället.' },
     'Vi/oss-språk': { frag: 'skriver om "vi"/"oss" till tredje person', instruction: 'Skriv om "vi"/"oss"/"vår"-formuleringar till tredje person, så det inte ser ut som Visit Stockholm är arrangören.' },
-    'Säljspråk': { frag: 'tar bort säljande formuleringar', instruction: 'Ta bort säljande/hypande formuleringar — håll tonen neutral och saklig.' }
+    'Säljspråk': { frag: 'tar bort säljande formuleringar', instruction: 'Ta bort säljande/hypande formuleringar — håll tonen neutral och saklig.' },
+    'Emojis': { frag: 'tar bort emojis', instruction: 'Ta bort ALLA emojis/smileys ur texten (de ska aldrig förekomma i publicerade evenemangstexter).' }
   };
 
   // En typspecifik emoji per avvikelse istället för samma ⚠️ upprepad på
@@ -5936,7 +5946,8 @@
     'Kontaktuppgift i fält': '📞',
     'Vi/oss-språk': '🗣️',
     'Säljspråk': '📢',
-    'Möjlig otillåten eventtyp': '🚫'
+    'Möjlig otillåten eventtyp': '🚫',
+    'Emojis': '🙂'
   };
 
   // Färgkod per riktlinjeflagga (på uttrycklig begäran 2026-09-30) — samma
@@ -5955,7 +5966,8 @@
     'Kontaktuppgift i fält': '#ff66b2',
     'Vi/oss-språk': '#2fbf9f',
     'Säljspråk': '#ff5555',
-    'Möjlig otillåten eventtyp': '#aa3333'
+    'Möjlig otillåten eventtyp': '#aa3333',
+    'Emojis': '#ff5555'
   };
   // Hittar ALLA träffar (inte bara den första, till skillnad från
   // upptäcktskontrollerna ovan som bara behöver veta ATT något matchar) för
@@ -6007,6 +6019,7 @@
         const hit = INELIGIBLE_EVENT_WORDS.find(w => wordListRe([w]).test(text)) || (/\bmässa\b/i.test(text) ? 'mässa' : null);
         return hit ? findAllRanges(text, wordListRe([hit])) : [];
       }
+      case 'Emojis': return findAllRanges(text, EMOJI_RE);
       default: return [];
     }
   }
@@ -6135,6 +6148,10 @@
       if (phoneHit || emailHit) {
         fieldIssues.push({ label: 'Kontaktuppgift i fält', msg: 'Möjlig kontaktuppgift i texten ("' + (phoneHit || emailHit)[0] + '") — hänvisa till arrangörens sida istället för telefonnummer/mejladress i beskrivningen.' });
       }
+      const emojiHits = text.match(EMOJI_RE);
+      if (emojiHits && emojiHits.length) {
+        fieldIssues.push({ label: 'Emojis', msg: 'Emoj' + (emojiHits.length === 1 ? 'i' : 'er') + ' i texten (' + [...new Set(emojiHits)].join(' ') + ') — emojis ska inte förekomma i publicerade evenemangstexter.' });
+      }
       const pronounRe = wordListRe(lang === 'sv' ? WE_US_WORDS_SV : WE_US_WORDS_EN);
       if (pronounRe.test(text)) {
         fieldIssues.push({ label: 'Vi/oss-språk', msg: 'Undvik "vi"/"oss" — skriv i tredje person så det inte ser ut som Visit Stockholm är arrangören.' });
@@ -6212,7 +6229,10 @@
     const fieldId = 'id_description_' + lang;
     const text = readDraftailText(fieldId);
     if (!text) return;
-    const mistralKey = GM_getValue('mistral_key', '');
+    // Faller tillbaka på SBR-nyckeln om Visit-nyckeln saknas — chat/completions
+    // fungerar med vilken Mistral-konto-nyckel som helst, och fältet kan ha
+    // fyllts i via SBR-panelen (samma delade GM-lager).
+    const mistralKey = (GM_getValue('mistral_key', '') || GM_getValue('sbr_mistral_key', '')).trim();
     if (!mistralKey) { vlog('Riktlinje-omskrivning: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
     const instructions = fixLabels.map(l => GUIDELINE_FIXES[l]?.instruction).filter(Boolean);
     if (!instructions.length) return;
