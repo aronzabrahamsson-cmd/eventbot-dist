@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.96.3
+// @version      7.97.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2578,6 +2578,7 @@
     vlog('SBR bildsida: knapp för automatisk ifyllning aktiverad.');
     ensureSbrImagePageButton();
     setInterval(ensureSbrImagePageButton, 1000);
+    ensureSettingsCogButton();
   }
 
   // ==== [VS-IMG] Visit Stockholms egen bildsida (cms/images/<id>/) ===========
@@ -2679,6 +2680,7 @@
     vlog('Bildsida: knapp för automatisk ifyllning aktiverad.');
     ensureVsImagePageButton();
     setInterval(ensureVsImagePageButton, 1000);
+    ensureSettingsCogButton();
   }
 
   async function automateImage(data) {
@@ -3616,14 +3618,14 @@
   // nycklar, GitHub-PAT) — dela den bara som ni redan delar sådant idag
   // (samma försiktighet som att skicka en lösenordshanterare-post).
   const SETTINGS_FIELD_MAP = {
-    tm_key:            { label: 'Ticketmaster Consumer Key', ids: ['vseh-key'] },
-    mistral_key:       { label: 'Mistral API-nyckel (Visit Stockholm)', ids: ['vseh-mkey'] },
-    mistral_agent:     { label: 'Mistral agent-ID (Visit Stockholm)', ids: ['vseh-magent'] },
-    tickster_key:      { label: 'Tickster API-nyckel', ids: ['vseh-tixkey'] },
-    sbr_mistral_key:   { label: 'Mistral API-nyckel (SBR)', ids: ['sbr-mkey'] },
-    sbr_mistral_agent: { label: 'Mistral agent-ID (SBR)', ids: ['sbr-magent'] },
-    github_data_pat:   { label: 'GitHub-PAT (delad datasynk)', ids: ['vseh-ghpat', 'sbr-ghpat'] },
-    vseh_user_name:    { label: 'Ditt namn', ids: ['vseh-username', 'sbr-username'] }
+    tm_key:            { label: 'Ticketmaster Consumer Key', ids: ['vseh-key', 'vseh-sb-tmkey'] },
+    mistral_key:       { label: 'Mistral API-nyckel (Visit Stockholm)', ids: ['vseh-mkey', 'vseh-sb-mkey'] },
+    mistral_agent:     { label: 'Mistral agent-ID (Visit Stockholm)', ids: ['vseh-magent', 'vseh-sb-magent'] },
+    tickster_key:      { label: 'Tickster API-nyckel', ids: ['vseh-tixkey', 'vseh-sb-tixkey'] },
+    sbr_mistral_key:   { label: 'Mistral API-nyckel (SBR)', ids: ['sbr-mkey', 'vseh-sb-sbrmkey'] },
+    sbr_mistral_agent: { label: 'Mistral agent-ID (SBR)', ids: ['sbr-magent', 'vseh-sb-sbrmag'] },
+    github_data_pat:   { label: 'GitHub-PAT (delad datasynk)', ids: ['vseh-ghpat', 'sbr-ghpat', 'vseh-sb-ghpat'] },
+    vseh_user_name:    { label: 'Ditt namn', ids: ['vseh-username', 'sbr-username', 'vseh-sb-uname'] }
   };
   function exportSettingsFile() {
     const data = {};
@@ -3684,6 +3686,118 @@
         fileInput.value = '';
       });
     }
+  }
+  // ---- Delad inställningslåda (v7.97.0, på begäran 2026-09-30) ------------
+  // Inställningar ska kunna nås från ALLA widgets utan att lämna sidan. MAIN
+  // och SBR har redan en Inställnings-flik i sin panel, men bar-widgetarna
+  // (DRAFT/EDIT/GUIDE) och bildsidorna (SBR-IMG/VS-IMG) hade ingen väg dit.
+  // Lådan ritar samma GM-backade fält som panelernas flikar (samma nycklar i
+  // SETTINGS_FIELD_MAP ovan) plus temavalet — varje ändring sparas direkt i
+  // GM-lagret, som redan delas av alla widgets, så inget behöver skrivas in
+  // mer än en gång oavsett vilken sida man sitter på.
+  const SETTINGS_BOX_FIELDS = [
+    { gm: 'tm_key',             id: 'vseh-sb-tmkey',   label: 'Ticketmaster Consumer Key', ph: 'Ticketmaster-nyckel' },
+    { gm: 'mistral_key',        id: 'vseh-sb-mkey',    label: 'Mistral API-nyckel (Visit Stockholm)', ph: 'Mistral Bearer-nyckel' },
+    { gm: 'mistral_agent',      id: 'vseh-sb-magent',  label: 'Mistral agent-ID (Visit Stockholm)', ph: 'ag_…' },
+    { gm: 'tickster_key',       id: 'vseh-sb-tixkey', label: 'Tickster API-nyckel', ph: 'Tickster API-nyckel' },
+    { gm: 'sbr_mistral_key',    id: 'vseh-sb-sbrmkey', label: 'SBR Mistral API-nyckel', ph: 'Mistral API-nyckel (SBR-agent)' },
+    { gm: 'sbr_mistral_agent',  id: 'vseh-sb-sbrmag',  label: 'SBR Mistral agent-ID', ph: 'ag_…' },
+    { gm: 'github_data_pat',    id: 'vseh-sb-ghpat',   label: 'GitHub PAT (data-repo)', ph: 'github_pat_…' },
+    { gm: 'vseh_user_name',     id: 'vseh-sb-uname',   label: 'Ditt namn', ph: 'Visas som &quot;markerat av&quot;' }
+  ];
+  const SETTINGS_BOX_CSS = VSEH_THEME_VARS_CSS + `
+    #vseh-setbox { position:fixed; top:14px; right:14px; z-index:100000; width:340px; max-width:calc(100vw - 28px);
+      max-height:calc(100vh - 28px); overflow-y:auto; background:var(--vd-bg); color:var(--vd-txt);
+      border:1px solid var(--vd-line); border-radius:10px; box-shadow:0 14px 44px rgba(0,0,0,.5); padding:14px 14px 12px;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; font-size:13px; box-sizing:border-box; }
+    #vseh-setbox .vseh-sb-hdr { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+    #vseh-setbox .vseh-sb-hdr b { font-size:14px; }
+    #vseh-setbox .vseh-sb-close { padding:4px 10px; border:none; border-radius:6px; cursor:pointer;
+      font-size:12px; font-weight:600; background:var(--vd-bg3); color:var(--vd-txt); }
+    #vseh-setbox .vseh-hint { font-size:11px; color:var(--vd-txt3); margin:4px 0 10px; }
+    #vseh-setbox .vseh-sb-io { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
+    #vseh-setbox .vseh-sb-export { font-size:11.5px; font-weight:600; padding:7px 11px; white-space:nowrap;
+      border:1px solid var(--vd-line); background:var(--vd-bg2); color:var(--vd-accent); border-radius:7px; cursor:pointer; }
+    #vseh-setbox .vseh-sb-export:hover { background:var(--vd-bg3); }
+    #vseh-setbox .vseh-dropzone { flex:1; border:1.5px dashed var(--vd-line); border-radius:7px; padding:8px 10px;
+      font-size:11px; color:var(--vd-txt3); text-align:center; cursor:pointer; transition:border-color .12s, background .12s; }
+    #vseh-setbox .vseh-dropzone.vseh-drop-hover { border-color:var(--vd-accent); background:var(--vd-bg3); color:var(--vd-txt); }
+    #vseh-setbox .vseh-divider { border:none; border-top:1px solid var(--vd-line); margin:12px 0; }
+    #vseh-setbox .vseh-row { display:flex; flex-direction:column; gap:3px; margin-bottom:10px; }
+    #vseh-setbox .vseh-row label { font-size:11.5px; color:var(--vd-txt2); font-weight:600; }
+    #vseh-setbox .vseh-row input[type="text"] { width:100%; font-size:13px; padding:8px 10px; box-sizing:border-box;
+      border:1px solid var(--vd-line); border-radius:7px; font-family:inherit; background:var(--vd-bg2); color:var(--vd-txt); }
+    #vseh-setbox .vseh-row input:focus { outline:2px solid var(--vd-accent); outline-offset:-1px; }
+    #vseh-setbox .vseh-key { font-family:monospace; font-size:12px !important; }
+    #vseh-setbox .vseh-sb-theme { display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer; }
+    #vseh-cogbtn { position:fixed; bottom:18px; right:18px; z-index:100000; width:42px; height:42px; border-radius:50%;
+      border:1px solid var(--vd-line); background:var(--vd-bg3); color:var(--vd-txt); font-size:18px; cursor:pointer;
+      box-shadow:0 4px 16px rgba(0,0,0,.4); font-family:inherit; }
+  `;
+  function ensureSettingsBoxStyle() {
+    if (document.getElementById('vseh-setbox-css')) return;
+    const s = document.createElement('style');
+    s.id = 'vseh-setbox-css';
+    s.textContent = SETTINGS_BOX_CSS;
+    document.head.appendChild(s);
+  }
+  function buildSettingsBox() {
+    ensureSettingsBoxStyle();
+    if (document.getElementById('vseh-setbox')) return;
+    const box = document.createElement('div');
+    box.id = 'vseh-setbox';
+    box.style.display = 'none';
+    box.innerHTML = `
+      <div class="vseh-sb-hdr"><b>⚙️ Eventbot — Inställningar</b>
+        <button type="button" class="vseh-sb-close" title="Stäng">✕</button></div>
+      <div class="vseh-hint">Samma inställningar som panelernas Inställningar-flik. Allt sparas direkt i den delade cachen — gäller alla EventBot-widgets, om du redan fyllt i ett värde någon annanstans står det kvar här.</div>
+      <div class="vseh-sb-io">
+        <button type="button" id="vseh-sb-export">⬇️ Exportera inställningar</button>
+        <div id="vseh-sb-drop" class="vseh-dropzone">📄 Dra och släpp exportfil här (eller klicka)</div>
+        <input type="file" id="vseh-sb-file" accept="application/json" style="display:none;">
+      </div>
+      <hr class="vseh-divider">
+      ${SETTINGS_BOX_FIELDS.map(f => `
+        <div class="vseh-row"><label>${f.label}</label>
+          <input type="text" id="${f.id}" class="vseh-key" placeholder="${f.ph}" autocomplete="off" spellcheck="false"></div>`).join('')}
+      <hr class="vseh-divider">
+      <div class="vseh-row"><label>Utseende</label>
+        <label class="vseh-sb-theme"><input type="checkbox" id="vseh-sb-theme" style="width:auto;">
+          Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
+    `;
+    document.body.appendChild(box);
+    box.querySelector('.vseh-sb-close').addEventListener('click', () => { box.style.display = 'none'; });
+    SETTINGS_BOX_FIELDS.forEach(f => {
+      const el = document.getElementById(f.id);
+      el.addEventListener('change', () => GM_setValue(f.gm, el.value.trim()));
+    });
+    wireThemeToggle('vseh-sb-theme');
+    wireSettingsImportExport('vseh-sb-export', 'vseh-sb-drop', 'vseh-sb-file');
+  }
+  function toggleSettingsBox() {
+    buildSettingsBox();
+    const box = document.getElementById('vseh-setbox');
+    const open = box.style.display === 'none' || !box.style.display;
+    if (open) {
+      SETTINGS_BOX_FIELDS.forEach(f => {
+        const el = document.getElementById(f.id);
+        if (el) el.value = GM_getValue(f.gm, '');
+      });
+    }
+    box.style.display = open ? 'block' : 'none';
+  }
+  // Bildsidorna (SBR-IMG/VS-IMG) har ingen bar alls — en liten flytande
+  // kugghjulsknapp längst ned till höger öppnar samma inställningslåda.
+  function ensureSettingsCogButton() {
+    if (document.getElementById('vseh-cogbtn')) return;
+    ensureSettingsBoxStyle();
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'vseh-cogbtn';
+    btn.title = 'Eventbot — Inställningar';
+    btn.textContent = '⚙️';
+    btn.addEventListener('click', toggleSettingsBox);
+    document.body.appendChild(btn);
   }
 
   // ==== [SBR] buildSbrPanel — "Eventbot SBR.se" ==============================
@@ -4500,8 +4614,10 @@
         bar.innerHTML = `
           <button type="button" id="vseh-guide-toggle">📋 Guide-lista</button>
           <span id="vseh-guide-count"></span>
+          <button type="button" id="vseh-guide-setbtn" title="Inställningar">⚙️</button>
         `;
         insertBarAtTop(bar);
+        document.getElementById('vseh-guide-setbtn').addEventListener('click', toggleSettingsBox);
         const panel = document.createElement('div');
         panel.id = 'vseh-guide-panel';
         panel.style.display = 'none';
@@ -5391,9 +5507,11 @@
           <span id="vseh-draft-ts"></span>
           <span id="vseh-draft-progress"></span>
           <button type="button" id="vseh-draft-logbtn" title="Visa logg">📋 Logg</button>
+          <button type="button" id="vseh-draft-setbtn" title="Inställningar">⚙️</button>
         `;
         insertBarAtTop(bar);
         document.getElementById('vseh-draft-fetch-btn').addEventListener('click', loadDedupForDraft);
+        document.getElementById('vseh-draft-setbtn').addEventListener('click', toggleSettingsBox);
         // Samma fristående logwrap-mönster som EDIT-sidans #vseh-edit-logbtn
         // (draftvyn har liksom EDIT ingen egen flytande panel att lägga
         // loggrutan i) — bekräftat saknades helt här (2026-09-29).
@@ -5690,8 +5808,10 @@
           <span id="vseh-edit-title">Eventbot: EDIT</span>
           <span id="vseh-issues-summary" style="color:#e0a052;font-weight:600;"></span>
           <button type="button" id="vseh-edit-logbtn" title="Visa logg">📋 Logg</button>
+          <button type="button" id="vseh-edit-setbtn" title="Inställningar">⚙️</button>
         `;
         anchor.parentNode.insertBefore(bar, anchor.nextSibling);
+        document.getElementById('vseh-edit-setbtn').addEventListener('click', toggleSettingsBox);
         const logWrap = document.createElement('div');
         logWrap.id = 'vseh-logwrap';
         logWrap.style.display = 'none';
