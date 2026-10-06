@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.97.6
+// @version      7.97.7
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -21,6 +21,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_listValues
 // @grant        GM_download
 // @connect      app.ticketmaster.com
 // @connect      api.mistral.ai
@@ -71,7 +72,48 @@
   function GM_setValue(key, val) {
     try { globalThis.GM_setValue(key, val); } catch {}
     try { localStorage.setItem('vsehg_' + key, JSON.stringify(val)); } catch {}
+    try {
+      const reg = JSON.parse(localStorage.getItem('vsehg___keys') || '[]');
+      if (!reg.includes(key)) { reg.push(key); localStorage.setItem('vsehg___keys', JSON.stringify(reg)); }
+    } catch {}
   }
+  // Tvåvägssynkronisering vid varje skriptstart (v7.97.7). Problemet den löser:
+  // skripthanterare kan rensa GM-lagret vid uppdatering/ominstallulation, och
+  // localStorage speglade bara värden SPARADE EFTER v7.97.5 — all äldre data
+  // (API-nycklar, CACHE_CAL/CACHE_TM-kalendrarna, Hanterat-markeringar) fanns
+  // kvar i GM men aldrig i localStorage, och försvann när GM rensades.
+  // Nu: (a) allt som finns i GM speglas till localStorage vid start, (b) allt
+  // som finns i localStorage men SAKNAS i GM skrivs tillbaka till GM — vilket
+  // lager än rensas återställs det från det andra, och scriptet (som bara läser
+  // via funktionerna ovan) ser alltid den unionen. Nyckelregistret krävs för
+  // att GM_getValue inte kan lista nycklar själv; GM_listValues används som
+  // bonus om hanteraren stödjer det.
+  function syncStorageLayers() {
+    const keys = new Set();
+    try {
+      JSON.parse(localStorage.getItem('vsehg___keys') || '[]').forEach(k => keys.add(k));
+    } catch {}
+    try {
+      if (typeof globalThis.GM_listValues === 'function') globalThis.GM_listValues().forEach(k => keys.add(k));
+    } catch {}
+    let restored = 0, mirrored = 0;
+    keys.forEach(key => {
+      if (key === '__keys') return;
+      let gmVal = null;
+      try { const v = globalThis.GM_getValue(key); if (v !== undefined && v !== null && v !== '') gmVal = v; } catch {}
+      let lsVal = null;
+      try { const ls = localStorage.getItem('vsehg_' + key); if (ls !== null) lsVal = JSON.parse(ls); } catch {}
+      if (!gmVal && lsVal !== null && lsVal !== '') {
+        try { globalThis.GM_setValue(key, lsVal); restored++; } catch {}
+      } else if (gmVal !== null && (lsVal === null || lsVal === '')) {
+        try { localStorage.setItem('vsehg_' + key, JSON.stringify(gmVal)); mirrored++; } catch {}
+      }
+    });
+    if (restored || mirrored) {
+      try { console.log('VSEH lagringssync: ' + restored + ' nycklar återställda till GM-lagret, ' + mirrored + ' speglade till localStorage (' + keys.size + ' nycklar totalt).'); } catch {}
+    }
+  }
+  try { syncStorageLayers(); } catch {}
 
   // Deklareras FÖRST i scriptet (inte bara före användning) så att den globala
   // unhandledrejection-lyssnaren (som kan triggas av VILKET löfte som helst på
