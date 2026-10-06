@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.6
+// @version      7.98.7
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -641,7 +641,15 @@
           return withTimeout(() => fetch(prox).then(r => {
             if (!r.ok) throw new Error('Nortic: proxy HTTP ' + r.status);
             return r.text();
-          }), 30000, 'Nortic-proxy');
+          }), 30000, 'Nortic-proxy').catch(e3 => {
+            // Andra proxy-reserven: codetabs (om allorigins är nere/blockerad).
+            vlog('Nortic: allorigins misslyckades (' + e3.message + ') — försöker codetabs-proxy…');
+            const prox2 = 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url);
+            return withTimeout(() => fetch(prox2).then(r => {
+              if (!r.ok) throw new Error('Nortic: proxy HTTP ' + r.status);
+              return r.text();
+            }), 30000, 'Nortic-proxy2');
+          });
         });
       }
       throw e;
