@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.3
+// @version      7.98.4
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -354,6 +354,19 @@
       );
     });
   }
+  // fetchGetJson: reserv för gmGet när GM-bryggan är död (samma mönster som
+  // fetchPost/gmPost). Kalender-API:erna (Ticketmaster, Billetto, Tickster,
+  // Nortic) skickar alla CORS-rubriker som tillåter fetch() direkt från
+  // sidan, så en död SBR-bot-bakgrundsbrygga ("Could not establish
+  // connection") inte längre behöver stoppa hela kalenderhämtningen —
+  // bekräftat 2026-10-06: alla fyra källorna misslyckades med "Nätverksfel".
+  async function fetchGetJson(url) {
+    const resp = await fetch(url);
+    if (resp.status === 401) throw new Error('401 – ogiltig nyckel');
+    if (resp.status === 429) throw new Error('429 – för många anrop, vänta lite');
+    if (resp.status < 200 || resp.status >= 300) throw new Error('HTTP ' + resp.status);
+    try { return await resp.json(); } catch { throw new Error('Ogiltig JSON'); }
+  }
   function gmGet(url) {
     return withTimeout(() => new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -367,6 +380,12 @@
         onerror: () => reject(new Error('Nätverksfel')),
         ontimeout: () => reject(new Error('Timeout')), timeout: 25000
       });
+    }).catch(e => {
+      if (/Nätverksfel|Timeout/.test(e.message)) {
+        vlog('GM-bryggan svarade inte (' + e.message + ') — hämtar via fetch-reserv: ' + url.slice(0, 80));
+        return fetchGetJson(url);
+      }
+      throw e;
     }), 25000 + 5000, 'Hämtning');
   }
   // fetchPost är reserv för gmPost/gmGet när GM-bryggan är död ("Could not
@@ -450,6 +469,19 @@
         onerror: () => reject(new Error('nätverksfel')),
         ontimeout: () => reject(new Error('timeout')), timeout: 20000
       });
+    }).catch(e => {
+      if (/nätverksfel|timeout/.test(e.message)) {
+        vlog('Datasynk: GM-bryggan svarade inte — hämtar via fetch-reserv…');
+        return fetch('https://api.github.com/repos/' + GITHUB_DATA_OWNER + '/' + GITHUB_DATA_REPO + '/contents/' + path,
+          { headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json' } })
+          .then(r => {
+            if (r.status === 404) return { json: { records: [] }, sha: null };
+            if (r.status === 401) throw new Error('401 – ogiltig GitHub-PAT');
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json().then(data => ({ json: JSON.parse(base64ToUtf8(data.content.replace(/\n/g, ''))), sha: data.sha }));
+          });
+      }
+      throw e;
     });
   }
   // sha=null (utelämnas helt ur body:n, inte satt till null — Content-API:et
@@ -474,6 +506,27 @@
         onerror: () => reject(new Error('nätverksfel')),
         ontimeout: () => reject(new Error('timeout')), timeout: 20000
       });
+    }).catch(e => {
+      if (/nätverksfel|timeout/.test(e.message)) {
+        vlog('Datasynk: GM-bryggan svarade inte — skriver via fetch-reserv…');
+        return fetch('https://api.github.com/repos/' + GITHUB_DATA_OWNER + '/' + GITHUB_DATA_REPO + '/contents/' + path,
+          {
+            method: 'PUT',
+            headers: {
+              'Authorization': 'Bearer ' + token,
+              'Accept': 'application/vnd.github+json',
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(body)
+          })
+          .then(r => {
+            if (r.status === 409) { const err = new Error('409 – konflikt'); err.conflict = true; throw err; }
+            if (r.status === 401) throw new Error('401 – ogiltig GitHub-PAT');
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          });
+      }
+      throw e;
     });
   }
   // Lägger till/tar bort EN nyckel i en delad post-lista. Fire-and-forget
@@ -539,6 +592,20 @@
         onerror: () => reject(new Error('Billetto: nätverksfel')),
         ontimeout: () => reject(new Error('Billetto: timeout')), timeout: 25000
       });
+    }).catch(e => {
+      if (/nätverksfel|timeout/.test(e.message)) {
+        vlog('Billetto: GM-bryggan svarade inte — försöker igen via fetch…');
+        return fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: JSON.stringify(body)
+        }).then(r => {
+          if (r.status === 429) throw new Error('Billetto: 429 – för många anrop, vänta lite');
+          if (!r.ok) throw new Error('Billetto: HTTP ' + r.status);
+          return r.json();
+        });
+      }
+      throw e;
     });
   }
   // Hämtar en HTML-sida av nortic.se/stad/stockholm som text (ingen API-nyckel
@@ -556,6 +623,16 @@
         onerror: () => reject(new Error('Nortic: nätverksfel')),
         ontimeout: () => reject(new Error('Nortic: timeout')), timeout: 25000
       });
+    }).catch(e => {
+      if (/nätverksfel|timeout/.test(e.message)) {
+        vlog('Nortic: GM-bryggan svarade inte — försöker igen via fetch…');
+        return fetch(url, { headers: { 'Accept': 'text/html' } }).then(r => {
+          if (r.status === 429) throw new Error('Nortic: 429 – för många anrop, vänta lite');
+          if (!r.ok) throw new Error('Nortic: HTTP ' + r.status);
+          return r.text();
+        });
+      }
+      throw e;
     });
   }
   function sameOriginGet(url) {
