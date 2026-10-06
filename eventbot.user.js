@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.97.9
+// @version      7.98.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5964,9 +5964,46 @@
   // Rewrite-agent, guide-tag-regler, kontaktinfo-flaggning, språkparssync.
   // Anropas från initEventEditAutomation() nedan. Se dispatcher-kommentaren
   // längst ned i filen för hela MAIN/SBR/DRAFT/EDIT/GUIDE-schemat.
+  // "Mejla arrangör"-knapp under submitted_by_email-fältet (v7.98.0, på
+  // begäran 2026-10-06): ett klick öppnar ett mejlutkast till arrangörens
+  // adress med eventets titel i ämnesraden och en kort svensk malltext.
+  // Idempotent — återinfogas inte om redan närvarande, och knappen läser
+  // mejladressen vid KLICK-tillfället (inte vid inmatning) så en ändring i
+  // fältet alltid respekteras.
+  function installMailArrangorButton() {
+    const field = document.getElementById('id_submitted_by_email');
+    if (!field || document.getElementById('vseh-mail-arrangor')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'vseh-mail-arrangor';
+    btn.textContent = '✉️ Mejla arrangör';
+    btn.style.cssText = 'display:block; margin:6px 0 10px; padding:6px 12px; font-size:12.5px; ' +
+      'font-weight:600; border:1px solid var(--vd-line, #3a3f4b); border-radius:6px; cursor:pointer; ' +
+      'background:var(--vd-accent, #4a9fe0); color:#fff;';
+    btn.addEventListener('click', () => {
+      const email = (field.value || '').trim();
+      if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+        vlog('Mejla arrangör: fältet innehåller ingen giltig mejladress ("' + (email || 'tomt') + '").', 'err');
+        btn.textContent = '✉️ Ingen adress i fältet';
+        setTimeout(() => btn.textContent = '✉️ Mejla arrangör', 1800);
+        return;
+      }
+      const titleEl = document.getElementById('id_title_sv') || document.getElementById('id_title_en');
+      const title = (titleEl && titleEl.value || 'ert event').trim();
+      const subject = 'Er evenemangsannons: ' + title;
+      const body = 'Hej!%0D%0A%0D%0AVi har publicerat er evenemangsannons "' + encodeURIComponent(title) +
+        '" på visitstockholm.com och vill dubbelkolla att all information står rätt.%0D%0A%0D%0A' +
+        'Titta gärna över datum, tider, beskrivning och bild, och svara på det här mejlet om något behöver ändras.%0D%0A%0D%0A' +
+        'Vänliga hälsningar%0D%0AVisit Stockholm';
+      window.location.href = 'mailto:' + encodeURIComponent(email) + '?subject=' + encodeURIComponent(subject) + '&body=' + body;
+      vlog('Mejla arrangör: öppnade mejlutkast till ' + email + '.', 'ok');
+    });
+    field.insertAdjacentElement('afterend', btn);
+  }
   function initEventChecker() {
     vlog('EventChecker: Initierar på edit-sida');
     ensureEditBarStyle();
+    installMailArrangorButton();
     if (!dedupIndex) loadCache();
     wireManualImageUploadAutomation();
     wireDateFixBox();
