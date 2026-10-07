@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.8
+// @version      7.98.9
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3708,6 +3708,8 @@
     .vseh-row input, .vseh-row select { width:100%; font-size:13px; padding:8px 10px; border:1px solid var(--vd-line); border-radius:7px; font-family:inherit; background:var(--vd-bg); color:var(--vd-txt); }
     .vseh-row input:focus, .vseh-row select:focus { outline:2px solid var(--vd-accent); outline-offset:-1px; }
     .vseh-key { font-family:monospace; font-size:12px !important; }
+    .vseh-name-warn { display:none; font-size:10.5px; color:#ff6b6b; margin-top:4px; }
+    .vseh-name-warn.on { display:block; }
     .vseh-two { display:flex; gap:9px; } .vseh-two > div { flex:1; }
     .vseh-divider { border:none; border-top:1px solid var(--vd-line); margin:16px 0; }
     .vseh-dropzone { flex:1; border:1.5px dashed var(--vd-line); border-radius:7px; padding:8px 10px;
@@ -3917,7 +3919,7 @@
     sbr_mistral_key:   { label: 'Mistral API-nyckel (SBR)', ids: ['sbr-mkey', 'vseh-sb-sbrmkey'] },
     sbr_mistral_agent: { label: 'Mistral agent-ID (SBR)', ids: ['sbr-magent', 'vseh-sb-sbrmag'] },
     github_data_pat:   { label: 'GitHub-PAT (delad datasynk)', ids: ['vseh-ghpat', 'sbr-ghpat', 'vseh-sb-ghpat'] },
-    vseh_user_name:    { label: 'Ditt namn', ids: ['vseh-username', 'sbr-username', 'vseh-sb-uname'] }
+    vseh_user_name:    { label: 'Initialer', ids: ['vseh-username', 'sbr-username', 'vseh-sb-uname'] }
   };
   function exportSettingsFile() {
     const data = {};
@@ -3995,8 +3997,16 @@
     { gm: 'sbr_mistral_key',    id: 'vseh-sb-sbrmkey', label: 'SBR Mistral API-nyckel', ph: 'Mistral API-nyckel (SBR-agent)' },
     { gm: 'sbr_mistral_agent',  id: 'vseh-sb-sbrmag',  label: 'SBR Mistral agent-ID', ph: 'ag_…' },
     { gm: 'github_data_pat',    id: 'vseh-sb-ghpat',   label: 'GitHub PAT (data-repo)', ph: 'github_pat_…' },
-    { gm: 'vseh_user_name',     id: 'vseh-sb-uname',   label: 'Ditt namn', ph: 'Visas som &quot;markerat av&quot;' }
+    { gm: 'vseh_user_name',     id: 'vseh-sb-uname',   label: 'Initialer', ph: 'Visas som &quot;markerat av&quot;' }
   ];
+  function wireInitialsValidation(inputId, warnId) {
+    const input = document.getElementById(inputId);
+    const warn = document.getElementById(warnId);
+    if (!input || !warn) return;
+    const check = () => warn.classList.toggle('on', input.value.trim().length > 3);
+    input.addEventListener('input', check);
+    check();
+  }
   const SETTINGS_BOX_CSS = VSEH_THEME_VARS_CSS + `
     #vseh-setbox { position:fixed; top:14px; right:14px; z-index:100000; width:340px; max-width:calc(100vw - 28px);
       max-height:calc(100vh - 28px); overflow-y:auto; background:var(--vd-bg); color:var(--vd-txt);
@@ -4008,6 +4018,8 @@
       font-size:12px; font-weight:600; background:var(--vd-bg3); color:var(--vd-txt); }
     #vseh-setbox .vseh-hint { font-size:11px; color:var(--vd-txt3); margin:4px 0 10px; }
     #vseh-setbox .vseh-sb-io { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
+    #vseh-setbox .vseh-name-warn { display:none; font-size:10.5px; color:#ff6b6b; margin-top:4px; }
+    #vseh-setbox .vseh-name-warn.on { display:block; }
     #vseh-setbox .vseh-sb-export { font-size:11.5px; font-weight:600; padding:7px 11px; white-space:nowrap;
       border:1px solid var(--vd-line); background:var(--vd-bg2); color:var(--vd-accent); border-radius:7px; cursor:pointer; }
     #vseh-setbox .vseh-sb-export:hover { background:var(--vd-bg3); }
@@ -4051,7 +4063,8 @@
       <hr class="vseh-divider">
       ${SETTINGS_BOX_FIELDS.map(f => `
         <div class="vseh-row"><label>${f.label}</label>
-          <input type="text" id="${f.id}" class="vseh-key" placeholder="${f.ph}" autocomplete="off" spellcheck="false"></div>`).join('')}
+          <input type="text" id="${f.id}" class="vseh-key" placeholder="${f.ph}" autocomplete="off" spellcheck="false"${f.gm === 'vseh_user_name' ? ' maxlength="3"' : ''}>${f.gm === 'vseh_user_name' ? `
+          <div id="${f.id}-warn" class="vseh-name-warn">Endast initialer, inte namn (max 3 tecken)</div>` : ''}</div>`).join('')}
       <hr class="vseh-divider">
       <div class="vseh-row"><label>Utseende</label>
         <label class="vseh-sb-theme"><input type="checkbox" id="vseh-sb-theme" style="width:auto;">
@@ -4063,6 +4076,7 @@
       const el = document.getElementById(f.id);
       el.addEventListener('change', () => GM_setValue(f.gm, el.value.trim()));
     });
+    wireInitialsValidation('vseh-sb-uname', 'vseh-sb-uname-warn');
     wireThemeToggle('vseh-sb-theme');
     wireSettingsImportExport('vseh-sb-export', 'vseh-sb-drop', 'vseh-sb-file');
   }
@@ -4214,8 +4228,9 @@
             (eget privat repo, aronzabrahamsson-cmd/eventbot-data) — delas med huvudpanelen, sätts en gång.</div>
           <div class="vseh-row"><label>GitHub PAT (data-repo)</label>
             <input type="text" id="sbr-ghpat" class="vseh-key" placeholder="github_pat_…" autocomplete="off" spellcheck="false"></div>
-          <div class="vseh-row"><label>Ditt namn</label>
-            <input type="text" id="sbr-username" class="vseh-key" placeholder="Visas som \"markerat av\"" autocomplete="off" spellcheck="false"></div>
+          <div class="vseh-row"><label>Initialer</label>
+            <input type="text" id="sbr-username" class="vseh-key" placeholder="Visas som \"markerat av\"" autocomplete="off" spellcheck="false" maxlength="3">
+            <div id="sbr-username-warn" class="vseh-name-warn">Endast initialer, inte namn (max 3 tecken)</div></div>
           <hr class="vseh-divider">
           <div class="vseh-row"><label>Utseende</label>
             <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
@@ -4263,6 +4278,7 @@
     $('sbr-username').value = GM_getValue('vseh_user_name', '');
     $('sbr-ghpat').addEventListener('change', () => GM_setValue('github_data_pat', $('sbr-ghpat').value.trim()));
     $('sbr-username').addEventListener('change', () => GM_setValue('vseh_user_name', $('sbr-username').value.trim()));
+    wireInitialsValidation('sbr-username', 'sbr-username-warn');
     wireThemeToggle('sbr-theme-toggle');
     wireSettingsImportExport('sbr-settings-export', 'sbr-settings-drop', 'sbr-settings-file');
     wireManualImageUploadAutomation();
@@ -4461,8 +4477,9 @@
             (eget privat repo, aronzabrahamsson-cmd/eventbot-data) — delas med SBR-panelen, sätts en gång.</div>
           <div class="vseh-row"><label>GitHub PAT (data-repo)</label>
             <input type="text" id="vseh-ghpat" class="vseh-key" placeholder="github_pat_…" autocomplete="off" spellcheck="false"></div>
-          <div class="vseh-row"><label>Ditt namn</label>
-            <input type="text" id="vseh-username" class="vseh-key" placeholder="Visas som &quot;markerat av&quot;" autocomplete="off" spellcheck="false"></div>
+          <div class="vseh-row"><label>Initialer</label>
+            <input type="text" id="vseh-username" class="vseh-key" placeholder="Visas som &quot;markerat av&quot;" autocomplete="off" spellcheck="false" maxlength="3">
+            <div id="vseh-username-warn" class="vseh-name-warn">Endast initialer, inte namn (max 3 tecken)</div></div>
           <hr class="vseh-divider">
           <div class="vseh-row"><label>Utseende</label>
             <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:pointer;">
@@ -5195,6 +5212,7 @@
     // Delad datasynk — samma GM-nycklar som SBR-panelens motsvarande fält.
     $('vseh-ghpat').addEventListener('change', () => GM_setValue('github_data_pat', $('vseh-ghpat').value.trim()));
     $('vseh-username').addEventListener('change', () => GM_setValue('vseh_user_name', $('vseh-username').value.trim()));
+    wireInitialsValidation('vseh-username', 'vseh-username-warn');
     wireThemeToggle('vseh-theme-toggle');
     wireSettingsImportExport('vseh-settings-export', 'vseh-settings-drop', 'vseh-settings-file');
     $('vseh-fetch-tix').addEventListener('click', runTickster);
