@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.7
+// @version      7.98.8
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -611,6 +611,34 @@
   }
   // Hämtar en HTML-sida av nortic.se/stad/stockholm som text (ingen API-nyckel
   // eller specialheaders behövs — det är samma sida en vanlig besökare öppnar).
+  // Nortic via offentlig CORS-proxy när både GM-bryggan och fetch är döda.
+  // Allorigins har hård rate-gräns (~1 anrop/min) och codetabs är inte
+  // hållbar i långden, så vi ROTERAR mellan båda + långsam pace på
+  // följande sidor i loppet (bekräftat 2026-10-07: sida 1 via allorigins OK,
+  // sida 2 rate-limitad direkt).
+  let norticProxyToggle = 0;
+  const NORTIC_PROXIES = [
+    u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+    u => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u)
+  ];
+  async function fetchViaProxy(url) {
+    for (let attempt = 0; attempt < NORTIC_PROXIES.length * 2; attempt++) {
+      const proxy = NORTIC_PROXIES[norticProxyToggle % NORTIC_PROXIES.length];
+      norticProxyToggle++;
+      const name = proxy === NORTIC_PROXIES[0] ? 'allorigins' : 'codetabs';
+      try {
+        const html = await withTimeout(() => fetch(proxy(url)).then(r => {
+          if (!r.ok) throw new Error('proxy HTTP ' + r.status);
+          return r.text();
+        }), 30000, 'Nortic-proxy');
+        vlog('Nortic: proxy ' + name + ' levererade (' + html.length + ' tecken).');
+        return html;
+      } catch (e) {
+        vlog('Nortic: proxy ' + name + ' misslyckades (' + e.message + ') — försöker nästa…');
+      }
+    }
+    throw new Error('Nortic: alla proxy-reserver misslyckades');
+  }
   function gmGetNorticHtml(url) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -633,23 +661,10 @@
           return r.text();
         }).catch(e2 => {
           // nortic.se skickar inga CORS-rubriker, så fetch från sidkontext blockeras
-          // ("Failed to fetch"). Sista utväg: offentlig CORS-proxy (allorigins),
-          // som hämtar sidan i sitt eget kontext och returnerar innehållet med
-          // CORS-rubriker. Körs bara när BÅDE GM-bryggan och direkta fetch är döda.
-          vlog('Nortic: fetch blockeras av CORS — hämtar via proxy-reserv (allorigins)…');
-          const prox = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
-          return withTimeout(() => fetch(prox).then(r => {
-            if (!r.ok) throw new Error('Nortic: proxy HTTP ' + r.status);
-            return r.text();
-          }), 30000, 'Nortic-proxy').catch(e3 => {
-            // Andra proxy-reserven: codetabs (om allorigins är nere/blockerad).
-            vlog('Nortic: allorigins misslyckades (' + e3.message + ') — försöker codetabs-proxy…');
-            const prox2 = 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url);
-            return withTimeout(() => fetch(prox2).then(r => {
-              if (!r.ok) throw new Error('Nortic: proxy HTTP ' + r.status);
-              return r.text();
-            }), 30000, 'Nortic-proxy2');
-          });
+          // ("Failed to fetch"). Sista utväg: offentliga CORS-proxyn — roterar
+          // allorigins/codetabs med omförsök (se fetchViaProxy).
+          vlog('Nortic: fetch blockeras av CORS — hämtar via proxy-reserv…');
+          return fetchViaProxy(url);
         });
       }
       throw e;
@@ -1160,7 +1175,9 @@
       totalPages = tp;
       items.forEach(it => { all = all.concat(norticItemToOccurrences(it)); });
       page++;
-      if (page <= totalPages) await new Promise(r => setTimeout(r, 200));
+      // Proxyn har rate-gränser — håll lugn pace mellan sidor när vi går via
+      // proxy (GM-bryggan påverkas inte märkbart av några sekunder extra).
+      if (page <= totalPages) await new Promise(r => setTimeout(r, 2500));
     }
     if (page > NORTIC_MAX_PAGES && page <= totalPages) {
       vlog('OBS: Nortic-hämtningen stoppades efter ' + NORTIC_MAX_PAGES + ' sidor (säkerhetsspärr) — fler event kan saknas.', 'err');
