@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.9
+// @version      7.98.10
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -7185,9 +7185,36 @@
   // angivna — hoppas över"-varningen (från en rad utan kategori/nyckelord/
   // datum, avsiktligt hoppad) annars loggades på VARJE sida scriptet laddas
   // på, inklusive SBR-lägets sidor där guide-taggning inte ens är relevant.
+  // Tillgänglighets-regeln (2026-10-07, på begäran) — EGEN match-logik, inte
+  // en GUIDE_TAG_ROWS-rad: svenska sammansättningar ("rullstolsvänlig",
+  // "handikappanpassad") kräver substring-matchning (se radkommentaren vid
+  // GUIDE_TAG_ROWS ovan), medan "handicap"-golf-uteslutningen kräver
+  // ordgräns + exclude i EN kombination som cell-syntaxen inte kan uttrycka
+  // för bara EN av termerna. Nyckelorden ärSubstring-baserade (a-ö),
+  // skiftlägesokänsliga, på buildGuideTagContext()s `text` (titlar +
+  // beskrivningar + venue, båda språken). "handicap" matchar ordgränsat
+  // (så det inte träffar t.ex. ett hypothetiskt "handicap-free"-ord)
+  // men stängs av om golf/tee/par finns i texten — samma uteslutnings-
+  // semantik som parseOrAndCell:s `-`-termer, bara för denna term.
+  const ACCESSIBILITY_GUIDE_EN = 'Stockholm for everyone – a guide to an accessible visit';
+  const ACCESSIBILITY_GUIDE_SV = 'Stockholm för alla – guide till ett tillgängligt besök';
+  const ACCESSIBILITY_KEYWORDS = ['rullstol', 'wheelchair', 'funktionsnedsättning', 'funkis', 'tillgänglighet', 'handikapp'];
+  function accessibilityRuleMatch(ctx) {
+    const text = ctx.text || '';
+    if (ACCESSIBILITY_KEYWORDS.some(k => text.includes(k))) return true;
+    if (!new RegExp(wordBoundaryPattern('handicap'), 'i').test(text)) return false;
+    const golfRe = [wordBoundaryPattern('golf'), wordBoundaryPattern('tee'), wordBoundaryPattern('par')].map(p => new RegExp(p, 'i'));
+    return !golfRe.some(re => re.test(text));
+  }
+  const ACCESSIBILITY_GUIDE_RULE = {
+    name: 'accessibility',
+    match: accessibilityRuleMatch,
+    guideEn: ACCESSIBILITY_GUIDE_EN,
+    guideSv: ACCESSIBILITY_GUIDE_SV
+  };
   let _guideTagRules = null;
   function getGuideTagRules() {
-    if (!_guideTagRules) _guideTagRules = GUIDE_TAG_ROWS.map(buildGuideRuleFromRow).filter(Boolean);
+    if (!_guideTagRules) _guideTagRules = GUIDE_TAG_ROWS.map(buildGuideRuleFromRow).filter(Boolean).concat([ACCESSIBILITY_GUIDE_RULE]);
     return _guideTagRules;
   }
 
@@ -7237,6 +7264,58 @@
 
   const guideTagRulesFired = new Set();
   const guidesAlreadyTagged = new Set();
+  // Manuellt borttagna guider (2026-10-07, på begäran): om en admin tar bort
+  // en guide ur related_guides-fältet — oavsett om den sattes av automatiken
+  // eller valdes manuellt — ska automatiken INTE försöka lägga tillbaka den.
+  // Upptäckten sker genom att jämföra fältets titellista mot förra poll-tick:
+  // en titel som fanns i förra tick och nu är borta (och som vi inte själva
+  // skrev in i just det ögonblicket) är en manuell borttagning. Listan sparas
+  // dessutom i GM-lagret per edit-URL (create-sidors id skiljer sig åt) så den
+  // överlever en sidomladdning under samma session. guidesAlreadyTagged är
+  // borttagen till förmån för detta — se markGuideAsManuallyRemoved() och
+  // runGuideTagRules() nedan.
+  const manuallyRemovedGuides = new Set();
+  let lastSeenRelatedGuideTitles = null;
+  let suppressRemovalDetectionUntil = 0;
+  function guideRemovalStorageKey() {
+    return 'vseh_removed_guides:' + location.pathname;
+  }
+  function loadManuallyRemovedGuides() {
+    try {
+      const raw = GM_getValue(guideRemovalStorageKey(), '[]');
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) arr.forEach(t => manuallyRemovedGuides.add(String(t).toLowerCase()));
+    } catch {}
+  }
+  function markGuideAsManuallyRemoved(title) {
+    const key = (title || '').trim().toLowerCase();
+    if (!key) return;
+    manuallyRemovedGuides.add(key);
+    try { GM_setValue(guideRemovalStorageKey(), JSON.stringify([...manuallyRemovedGuides])); } catch {}
+    vlog('EventEdit: "' + title + '" togs bort manuellt — återinförs INTE av automatiken (sparat för denna sida).', 'ok');
+  }
+  function isGuideManuallyRemoved(title) {
+    return manuallyRemovedGuides.has((title || '').trim().toLowerCase());
+  }
+  // Anropas varje poll-tick från runEditPageChecks(). Om en tidigare sedd
+  // guide-titel försvunnit ur fältet (och vi inte står mitt i en egen
+  // autocomplete-inskrivning, som momentarily tömmer/ändrar fältet) markeras
+  // den som manuellt borttagen. Titeljämförelsen är fuzzy (titleMatches) så
+  // små skillnader i stavning mellan fältets live-titel och regelns titel
+  // inte gör att en borttagen guide släpps igen.
+  function detectManuallyRemovedGuides() {
+    if (Date.now() < suppressRemovalDetectionUntil) return;
+    const liveTitles = currentRelatedGuideTitles();
+    if (lastSeenRelatedGuideTitles === null) {
+      lastSeenRelatedGuideTitles = liveTitles;
+      return;
+    }
+    lastSeenRelatedGuideTitles.forEach(prev => {
+      if (liveTitles.some(t => titleMatches(t, prev))) return;
+      markGuideAsManuallyRemoved(prev);
+    });
+    lastSeenRelatedGuideTitles = liveTitles;
+  }
   // Fältets sök filtrerar redan bra på bara de första orden av guidetiteln —
   // ingen anledning att skriva in HELA (ofta långa) titeln tecken för tecken
   // (på begäran 2026-09-19: kortare inskrivning = snabbare och mindre yta
@@ -7289,13 +7368,12 @@
       const counterpart = titleMatches(liveTitle, pairRow.en) ? pairRow.sv : pairRow.en;
       if (liveTitles.some(t => titleMatches(t, counterpart))) continue;
       const counterpartKey = counterpart.toLowerCase();
-      guidesAlreadyTagged.add(counterpartKey);
+      if (isGuideManuallyRemoved(counterpart)) continue;
       const ok = await selectAutocompleteValue('id_related_guides', counterpart, guideSearchPrefix(counterpart));
+      suppressRemovalDetectionUntil = Date.now() + 8000;
       if (ok) {
         vlog('EventEdit: Taggade "' + counterpart + '" automatiskt (språkpar till "' + liveTitle + '").', 'ok');
         liveTitles.push(counterpart);
-      } else {
-        guidesAlreadyTagged.delete(counterpartKey);
       }
     }
   }
@@ -7326,14 +7404,16 @@
         const applied = [];
         for (const g of [rule.guideEn, rule.guideSv]) {
           if (!g) continue;
+          if (isGuideManuallyRemoved(g)) { vlog('EventEdit: Guiden "' + g + '" är manuellt borttagen — hoppar över.', 'ok'); continue; }
           const key = g.toLowerCase();
           if (guidesAlreadyTagged.has(key)) continue;
-          // Märks som taggad/loggas bara vid FAKTISK träff — tidigare
+          // Mårks som taggad/loggas bara vid FAKTISK träff — tidigare
           // markerades och loggades den som klar oavsett resultat, så ett
           // misslyckat/avbrutet val (t.ex. korrupt text från race-buggen
           // ovan) rapporterades som lyckat i loggen trots att inget
           // faktiskt valdes i fältet.
           const ok = await selectAutocompleteValue('id_related_guides', g, guideSearchPrefix(g));
+          suppressRemovalDetectionUntil = Date.now() + 8000;
           if (ok) {
             guidesAlreadyTagged.add(key);
             applied.push(g);
@@ -7558,6 +7638,7 @@
     checkIdenticalDescriptions();
     checkResaleUrl();
     autofillLinkText();
+    detectManuallyRemovedGuides();
     runGuideTagRules().catch(() => {});
   }
 
@@ -7578,6 +7659,7 @@
     if (mainEditStyleChecksStarted) { runEditPageChecks(); return; }
     mainEditStyleChecksStarted = true;
     installResaleSubmitGuard();
+    loadManuallyRemovedGuides();
     runEditPageChecks();
     setInterval(runEditPageChecks, 1500);
     vlog('Efterbehandling (samma automatik som EDIT-sidan) startad — pollar var 1.5s.', 'ok');
@@ -7666,6 +7748,7 @@
     const startAutomation = () => {
       initEventChecker();
       installResaleSubmitGuard();
+      loadManuallyRemovedGuides();
       runEditPageChecks();
       // Formuläret uppdaterar sina dolda fält utan DOM-mutationer vi enkelt
       // kan observera (Draftails onChange, autocompletens val-klick) — en
