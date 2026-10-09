@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.13
+// @version      7.98.14
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1498,6 +1498,28 @@
     }
 
     const evDates = ev.dates.map(d => d.date).filter(Boolean);
+
+    // Nästan identisk titel (tSim≥0.9) med exakt datumträff men annan plats
+    // (vSim<0.5): samma event kan vara inlagt med annan venue — fel vid
+    // inrapportering eller flyttad plats. Ratas av det strikta kravet
+    // (tSim≥tröskel OCH vSim≥0.5) men ska inte listas som helt "ej inlagt";
+    // markeras "osäker" så syns raden och kanertas manuellt (fallet
+    // "Saint Levant - AFANDI WORLD TOUR": Annexet/Globentorget 2 i källan
+    // mot Fållan/Stora Skorstensgatan 6 i CMS, 2026-11-21, 2026-08-14).
+    if (evHasPlace && !tvRows.length && nearMisses.length) {
+      const titleOnlyHits = nearMisses.filter(nm => nm.tSim >= 0.9 &&
+        evDates.some(d => !nm.row.isSpan && nm.row.start === d));
+      if (titleOnlyHits.length) {
+        titleOnlyHits.sort((a, b) => b.tSim - a.tSim);
+        const best = titleOnlyHits[0];
+        return {
+          key: 'unsure',
+          detail: 'identisk titel + datum men annan plats ("' + (best.row.title || '') +
+            '" @ ' + (best.row.venue_name || best.row.address || '?') + ') — kan vara fel venue vid inrapportering eller flyttad plats',
+          matches: titleOnlyHits.map(nm => nm.row)
+        };
+      }
+    }
 
     // Adress+datum-baserad match: fångar par där titlarna delar NOLL ord
     // (olika språk) och därför aldrig blev kandidater via titel-tokens.
