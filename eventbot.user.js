@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.12
+// @version      7.98.13
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -6142,6 +6142,11 @@
     #vseh-consent-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer; font-size:13px; font-weight:600; }
     #vseh-consent-yes { background:#1f7a4d; color:#fff; }
     #vseh-consent-no { background:#787e8a; color:#fff; }
+    .vseh-gl-box .vseh-gl-check { visibility:hidden; margin-right:6px; cursor:pointer; flex-shrink:0; }
+    .vseh-gl-box:hover .vseh-gl-check { visibility:visible; }
+    .vseh-gl-box .vseh-gl-row { display:flex; align-items:flex-start; }
+    .vseh-gl-box .vseh-gl-item { flex:1; }
+    .vseh-gl-box .vseh-gl-item.unchecked { opacity:.45; }
   `;
   function ensureEditBarStyle() {
     if (document.getElementById('vseh-edit-css')) return;
@@ -6495,6 +6500,24 @@
       note.style.cssText = 'font-size:13px;margin:4px 0;';
       wrap.insertBefore(note, wrap.firstChild);
     }
+    // Hovringsspärr (2026-10-09): checkboxarna i Åtgärder-rutan syns bara när
+    // musen är över rutan, men pollingen (var 1.5s) skriver om hela innerHTML —
+    // då försvinner checkboxen under musen och klicket landar i tomrummet.
+    // Skippar omritningen så länge muspekaren står över noten; senast
+    // renderade html sparas och skrivs när musen lämnar rutan (mouseleave).
+    if (note.matches(':hover')) {
+      note.dataset.pendingHtml = html;
+      if (!note.dataset.hoverWired) {
+        note.dataset.hoverWired = '1';
+        note.addEventListener('mouseleave', () => {
+          if (note.dataset.pendingHtml !== undefined) {
+            note.innerHTML = note.dataset.pendingHtml;
+            delete note.dataset.pendingHtml;
+          }
+        });
+      }
+      return;
+    }
     note.innerHTML = html;
   }
 
@@ -6601,25 +6624,40 @@
         // 2026-09-19). Rubrik + en rad per fel, med en typspecifik emoji
         // (GUIDELINE_ISSUE_EMOJI) och etiketten i fetstil, följt av
         // förklaringen på egen rad i vanlig vikt (utan kolon).
-        html += '<div style="background:var(--vd-bg2);border:1px solid #ff3b3b;border-radius:7px;padding:8px 10px;color:var(--vd-txt);">' +
+        // Checkboxar (2026-10-09, på begäran): osynliga tills hovring över
+        // rutan, alla förikryssade — urkryssad åtgärd skickas INTE till
+        // Mistral (t.ex. låta platsnamnet stå kvar). Bara fixbara
+        // avvikelser (GUIDELINE_FIXES) får checkbox; bedömningsflaggor
+        // ("Möjlig otillåten eventtyp") är inget Mistral kan åtgärda.
+        html += '<div class="vseh-gl-box" style="background:var(--vd-bg2);border:1px solid #ff3b3b;border-radius:7px;padding:8px 10px;color:var(--vd-txt);">' +
           '<div style="font-weight:700;margin-bottom:6px;">⚠️ Åtgärder</div>' +
-          fieldIssues.map(i =>
-            '<div style="margin-bottom:6px;">' +
-            '<div style="font-weight:700;text-decoration:underline;text-decoration-color:' + (GUIDELINE_ISSUE_COLOR[i.label] || '#ff3b3b') + ';text-decoration-thickness:2px;text-underline-offset:2px;">' + (GUIDELINE_ISSUE_EMOJI[i.label] || '⚠️') + ' ' + esc(i.label) + '</div>' +
-            '<div>' + esc(i.msg) + '</div>' +
-            '</div>'
-          ).join('');
+          fieldIssues.map(i => {
+            const fixable = !!GUIDELINE_FIXES[i.label];
+            const unchecked = guidelineFixUnchecked(lang, i.label);
+            const check = fixable
+              ? '<input type="checkbox" class="vseh-gl-check" data-lang="' + lang + '" data-label="' + esc(i.label) + '"' + (unchecked ? '' : ' checked') + '>'
+              : '<span class="vseh-gl-check" style="visibility:hidden;"></span>';
+            return '<div class="vseh-gl-row" style="margin-bottom:6px;">' + check +
+              '<div class="vseh-gl-item' + (fixable && unchecked ? ' unchecked' : '') + '" style="font-weight:700;text-decoration:underline;text-decoration-color:' + (GUIDELINE_ISSUE_COLOR[i.label] || '#ff3b3b') + ';text-decoration-thickness:2px;text-underline-offset:2px;">' + (GUIDELINE_ISSUE_EMOJI[i.label] || '⚠️') + ' ' + esc(i.label) + '</div>' +
+              '</div>' +
+              '<div style="margin-bottom:6px;margin-left:' + (fixable ? '22px' : '0') + ';">' + esc(i.msg) + '</div>';
+          }).join('');
         // Samma text som fältet, men med varje flaggad term understruken i
         // sin flaggas färg — ett snabbt "var i texten?"-facit utan att
         // behöva läsa varje förklaringsrad för sig (på uttrycklig begäran).
         html += highlightedTextPreview(text, fieldIssues, venueNames, addressRaw);
         if (fixLabels.length) {
-          const frags = [...new Set(fixLabels.map(l => GUIDELINE_FIXES[l].frag))];
+          // Bara IKRYSSADE åtgärder skickas till Mistral (2026-10-09) — den
+          // urkryssade platsinfo-raden ska inte generera en "ta bort platsnamn"-
+          // instruktion i prompten. Fragment-texten under knappen speglar
+          // samma urval så man ser exakt vad anropet kommer att göra.
+          const activeFixLabels = fixLabels.filter(l => !guidelineFixUnchecked(lang, l));
+          const frags = [...new Set(activeFixLabels.map(l => GUIDELINE_FIXES[l].frag))];
           const fragText = frags.length > 1
             ? frags.slice(0, -1).join(', ') + ' och ' + frags[frags.length - 1]
-            : frags[0];
+            : (frags[0] || 'inga åtgärder — kryssa i minst en');
           html += '<div style="margin-top:6px;">' +
-            '<button type="button" class="vseh-guideline-fix-btn" data-lang="' + lang + '" data-fix="' + esc(fixLabels.join('|')) + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (åtgärdar riktlinjer)</button>' +
+            '<button type="button" class="vseh-guideline-fix-btn" data-lang="' + lang + '" data-fix="' + esc(activeFixLabels.join('|')) + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (åtgärdar riktlinjer)</button>' +
             '<div style="font-size:11px;color:var(--vd-txt3);margin-top:3px;">Mistral ' + esc(fragText) + '.</div>' +
             '</div>';
         }
@@ -6637,13 +6675,75 @@
         draftailWarned.delete('id_description_' + btn.dataset.lang);
         const orig = btn.textContent;
         btn.textContent = 'Anropar Mistral…';
-        await rewriteGuidelineIssues(btn.dataset.lang, btn.dataset.fix.split('|'));
+        // data-fix uppdateras live av checkbox-wire:n nedan och innehåller
+        // bara de åtgärder som fortfarande är ikryssade i just det ögonblicket.
+        const active = (btn.dataset.fix || '').split('|').filter(Boolean);
+        if (!active.length) {
+          btn.disabled = false;
+          btn.textContent = orig;
+          vlog('Riktlinje-omskrivning: alla åtgärder är urkryssade — inget anrop skickas.', 'err');
+          return;
+        }
+        await rewriteGuidelineIssues(btn.dataset.lang, active);
         btn.disabled = false;
         btn.textContent = orig;
       });
     });
+    // Checkbox-wire (2026-10-09): toggla GM-state + uppdatera radens stil
+    // och knappens data-fix/frågetext LIVE, utan att vänta på nästa poll-tick
+    // (som annars ritar om rutan och nollställer hover-läget).
+    document.querySelectorAll('.vseh-gl-check[type="checkbox"]').forEach(chk => {
+      if (chk.dataset.wired) return;
+      chk.dataset.wired = '1';
+      chk.addEventListener('change', () => {
+        const lang = chk.dataset.lang, label = chk.dataset.label;
+        const uncheckedNow = !chk.checked;
+        toggleGuidelineFixUnchecked(lang, label, uncheckedNow);
+        const item = chk.closest('.vseh-gl-row')?.querySelector('.vseh-gl-item');
+        if (item) item.classList.toggle('unchecked', uncheckedNow);
+        // Uppdatera knappens data-fix + fragment-texten i samma ruta.
+        const box = chk.closest('.vseh-gl-box');
+        if (box) {
+          const activeLabels = [...box.querySelectorAll('.vseh-gl-check[type="checkbox"]:checked')]
+            .map(c => c.dataset.label).filter(l => GUIDELINE_FIXES[l]);
+          const btn = box.querySelector('.vseh-guideline-fix-btn');
+          if (btn) btn.dataset.fix = activeLabels.join('|');
+          const fragDiv = box.querySelector('.vseh-guideline-fix-btn')?.nextElementSibling;
+          if (fragDiv) {
+            const frags = [...new Set(activeLabels.map(l => GUIDELINE_FIXES[l].frag))];
+            fragDiv.textContent = 'Mistral ' + (frags.length > 1
+              ? frags.slice(0, -1).join(', ') + ' och ' + frags[frags.length - 1]
+              : (frags[0] || 'inga åtgärder — kryssa i minst en')) + '.';
+          }
+        }
+        vlog('Riktlinjer: "' + label + '" (' + lang + ') ' + (uncheckedNow ? 'urkryssat — åtgärden skickas inte till Mistral.' : 'ikryssat — åtgärden ingår i Mistral-anropet.'), 'ok');
+      });
+    });
   }
 
+  // Urkryssade riktlinjeåtgärder (2026-10-09): per språk+etikett sparade i GM-
+  // lagret, så de överlever sidladdning — användaren som vill låta platsnamnet
+  // stå kvar i en text ska inte behöva krysa ur varje gång rutan ritas om
+  // (checkGuidelineIssues kör var 1.5s).
+  function guidelineUncheckedStorageKey() { return 'vseh_gl_unchecked'; }
+  function getGuidelineUnchecked() {
+    try {
+      const arr = JSON.parse(GM_getValue(guidelineUncheckedStorageKey(), '[]'));
+      return new Set(Array.isArray(arr) ? arr : []);
+    } catch { return new Set(); }
+  }
+  function setGuidelineUnchecked(set) {
+    GM_setValue(guidelineUncheckedStorageKey(), JSON.stringify([...set]));
+  }
+  function guidelineFixUnchecked(lang, label) {
+    return getGuidelineUnchecked().has(lang + '::' + label);
+  }
+  function toggleGuidelineFixUnchecked(lang, label, unchecked) {
+    const set = getGuidelineUnchecked();
+    const key = lang + '::' + label;
+    if (unchecked) set.add(key); else set.delete(key);
+    setGuidelineUnchecked(set);
+  }
   // Skickar EXAKT de riktlinjeavvikelser som upptäckts (GUIDELINE_FIXES) som
   // redigeringsinstruktioner till Mistral — samma raka chat/completions-anrop
   // som translateDescription() redan använder, eftersom detta bara ska
