@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.16
+// @version      7.98.17
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2182,14 +2182,37 @@
           'Expandera alltid en period till varje enskild dag inom den, exkludera angivna veckodagar. Klockslag alltid 24-timmarsformat "HH:MM". ' +
           'Om varken texten eller kontexten nedan ger dig ett klockslag, lämna start_time/end_time tomma strängar för det tillfället hellre än att hitta på ett. ' +
           'Om du inte kan avgöra någon period alls (varken från texten eller kontexten), svara med en tom lista. ' +
+          'Dagens datum är ' + new Date().toISOString().slice(0, 10) + '. Tolka ALDRIG fram datum i det förflutna eller med ett annat år än texten/kontexten anger — om texten anger år explicit (t.ex. "2026") använd exakt det året. ' +
           'Svara ENBART med JSON: {"occurrences":[{"date":"YYYY-MM-DD","start_time":"HH:MM","end_time":"HH:MM"}, ...]}. Ingen text utanför JSON.' },
         { role: 'user', content: contextLines + 'Fritext att tolka:\n' + freeText }
       ]
     };
     const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, payload);
     const text = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+    vlog('Datum-omtolkning: råsvar från Mistral: ' + (typeof text === 'string' ? text : JSON.stringify(text || '')));
     const data = extractJSON(typeof text === 'string' ? text : JSON.stringify(text || ''));
-    return Array.isArray(data?.occurrences) ? data.occurrences : [];
+    const occurrences = Array.isArray(data?.occurrences) ? data.occurrences : [];
+    // Validering: giltigt YYYY-MM-DD, inte äldre än 30 dagar bakåt från idag
+    // (fångar hallucinerade år som 2023-11-03, bekräftat 2026-10-09) och
+    // inte mer än 3 år framåt i tiden.
+    const today = new Date(); today.setHours(0,0,0,0);
+    const minMs = today.getTime() - 30*24*3600*1000;
+    const maxMs = today.getTime() + 3*365.25*24*3600*1000;
+    const valid = [], rejected = [];
+    for (const occ of occurrences) {
+      const m = /^\s*(\d{4})-(\d{2})-(\d{2})\s*$/.exec(String(occ?.date || ''));
+      const ts = m ? new Date(+m[1], +m[2]-1, +m[3]).getTime() : NaN;
+      if (!m || isNaN(ts) || ts < minMs || ts > maxMs) rejected.push(occ);
+      else valid.push({ date: m[1]+'-'+m[2]+'-'+m[3], start_time: String(occ.start_time || ''), end_time: String(occ.end_time || '') });
+    }
+    if (rejected.length) {
+      vlog('Datum-omtolkning: AVVISADE ' + rejected.length + ' tillfälle(n) från Mistral (ogiltigt datum eller utanför rimlig tid): ' +
+        rejected.map(o => JSON.stringify(o)).join(', '), 'err');
+    }
+    if (valid.length && valid.length < occurrences.length) {
+      vlog('Datum-omtolkning: behåller ' + valid.length + ' av ' + occurrences.length + ' tillfälle(n).', 'ok');
+    }
+    return valid;
   }
 
   // Sorterar kronologiskt (samma princip som fillDateBlocksFromCSV ovan).
