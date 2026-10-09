@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.15
+// @version      7.98.16
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2747,7 +2747,7 @@
     }
     const map = [
       [IMG_FIELDS.title,       titleVal],
-      [IMG_FIELDS.title_sv,    document.getElementById('id_title_sv')?.value || ''],
+      [IMG_FIELDS.title_sv,    (document.getElementById('id_title_sv')?.value || '').trim() || titleVal],
       [IMG_FIELDS.description, altSv || placeholder],
       [IMG_FIELDS.credit,      creditPair.credit],
       [IMG_FIELDS.credit_sv,   creditPair.creditSv],
@@ -3037,7 +3037,7 @@
     if (creditPair.reused) vlog('Kreditrad återanvänd mellan språken: "' + creditPair.credit + '".', 'ok');
     const map = [
       [IMG_FIELDS.title,       data.title_sv || data.title_en || ''],
-      [IMG_FIELDS.title_sv,    data.title_sv || ''],
+      [IMG_FIELDS.title_sv,    data.title_sv || data.title_en || ''],
       [IMG_FIELDS.description, altSv],
       [IMG_FIELDS.credit,      creditPair.credit],
       [IMG_FIELDS.credit_sv,   creditPair.creditSv],
@@ -7984,6 +7984,103 @@
     });
   }
 
+  // Om ÄVEN titlarna är identiska mellan språken (utöver description-
+  // fälten, se checkIdenticalDescriptions) visas översätt-knappar ÄVEN vid
+  // titelfälten — knapparna vid titel och vid textruta gör samma sak:
+  // översätter BÅDE titel och description till målspråket i ett klick
+  // (på begäran 2026-10-09). Vid översättning från svenska till engelska
+  // läggs "(in Swedish)" längst bak i rubriken och
+  // "NOTE: The event is in Swedish." i engelska description-fältet.
+  function checkIdenticalTitlesAndDescriptions() {
+    const titleEn = (document.getElementById('id_title_en')?.value || '').trim();
+    const titleSv = (document.getElementById('id_title_sv')?.value || '').trim();
+    const descEn = readDraftailText('id_description_en').trim();
+    const descSv = readDraftailText('id_description_sv').trim();
+    const identical = !!titleEn && !!titleSv &&
+      titleEn.toLowerCase() === titleSv.toLowerCase() &&
+      !!descEn && !!descSv && descEn.toLowerCase() === descSv.toLowerCase();
+    ['en', 'sv'].forEach(lang => {
+      const titleEl = document.getElementById('id_title_' + lang);
+      const descEl = document.getElementById('id_description_' + lang);
+      if (!identical) {
+        setFieldNote(titleEl, 'translatetitle', '');
+        setFieldNote(descEl, 'translatetitle', '');
+        return;
+      }
+      const label = lang === 'en' ? 'engelska' : 'svenska';
+      const html =
+        '<span style="color:#4a9fe0;">🌍 Samma rubrik och text i båda fälten — </span>' +
+        '<button type="button" class="vseh-translate-td-btn" data-lang="' + lang + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Översätt till ' + label + '</button>';
+      setFieldNote(descEl, 'translate', '');
+      setFieldNote(titleEl, 'translatetitle', html);
+      setFieldNote(descEl, 'translatetitle', html);
+    });
+    document.querySelectorAll('.vseh-translate-td-btn').forEach(btn => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = '1';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true; btn.textContent = 'Översätter…';
+        await translateTitleAndDescription(btn.dataset.lang);
+      });
+    });
+  }
+
+  // Översätter BÅDE titel och description till targetLang. Två separata
+  // chat-anrop (titeln behöver en striktare "ENDAST titeln"-prompt för att
+  // inte få med förklarande text). Sv→en lägger till "(in Swedish)" sist i
+  // rubriken och "NOTE: The event is in Swedish." först i description.
+  async function translateTitleAndDescription(targetLang) {
+    const sourceLang = targetLang === 'en' ? 'sv' : 'en';
+    const sourceText = readDraftailText('id_description_' + sourceLang);
+    const sourceTitle = (document.getElementById('id_title_' + sourceLang)?.value || '').trim();
+    const mistralKey = GM_getValue('mistral_key', '');
+    if (!mistralKey) { vlog('Översättning: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
+    const targetName = mistralLangName(targetLang);
+    try {
+      vlog('Översättning: Skickar rubrik och text till Mistral (→ ' + targetName + ')…');
+      const payload = {
+        model: 'mistral-small-latest',
+        messages: [
+          { role: 'system', content: 'Du är en professionell översättare. Översätt EXAKT texten användaren ger till ' + targetName + '. Svara UTESLUTANDE på ' + targetName + ', oavsett vad källtexten är skriven på. Svara ENDAST med den översatta texten — ingen kommentar, inga citattecken, ingen extra formatering.' + NO_EMDASH_RULE },
+          { role: 'user', content: sourceText }
+        ]
+      };
+      const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
+      const translated = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+      if (!translated) throw new Error('Tomt svar från Mistral');
+      const oldTargetText = readDraftailText('id_description_' + targetLang);
+      if (oldTargetText) vlog('Översättning: Ersätter text i id_description_' + targetLang + ' — gammal text: "' + oldTargetText + '"');
+      let newDesc = stripEmDashes(translated.trim());
+      if (targetLang === 'en' && !/^NOTE:\s*The event is in Swedish\./im.test(newDesc)) {
+        newDesc = 'NOTE: The event is in Swedish.\n\n' + newDesc;
+      }
+      await updateDraftail('id_description_' + targetLang, newDesc);
+
+      if (sourceTitle) {
+        const titlePayload = {
+          model: 'mistral-small-latest',
+          messages: [
+            { role: 'system', content: 'Du är en professionell översättare. Översätt EXAKT titeln användaren ger till ' + targetName + '. Svara UTESLUTANDE på ' + targetName + '. Svara ENDAST med den översatta titeln — ingen kommentar, inga citattecken.' + NO_EMDASH_RULE },
+            { role: 'user', content: sourceTitle }
+          ]
+        };
+        const tResp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, titlePayload);
+        let translatedTitle = tResp && tResp.choices && tResp.choices[0] && tResp.choices[0].message && tResp.choices[0].message.content;
+        if (!translatedTitle) throw new Error('Tomt svar från Mistral för titeln');
+        translatedTitle = stripEmDashes(translatedTitle.trim());
+        if (targetLang === 'en' && !/\(in Swedish\)\s*$/i.test(translatedTitle)) {
+          translatedTitle += ' (in Swedish)';
+        }
+        const titleEl = document.getElementById('id_title_' + targetLang);
+        if (titleEl) simulateInput(titleEl, translatedTitle);
+        vlog('Översättning: Klar rubrik (' + targetName + '): "' + translatedTitle + '"', 'ok');
+      }
+      vlog('Översättning: Klar (' + targetName + ').', 'ok');
+    } catch (e) {
+      vlog('Översättning: Fel — ' + e.message, 'err');
+    }
+  }
+
   // Mistral har ingen egen "översättnings-endpoint" — det är samma
   // chat/completions-anrop som resten av scriptet redan använder (MISTRAL_CHAT),
   // bara med en översättningsprompt istället för agentens egna instruktioner
@@ -8091,6 +8188,7 @@
     stripDescriptionEmoji();
     checkGuidelineIssues();
     checkIdenticalDescriptions();
+    checkIdenticalTitlesAndDescriptions();
     checkResaleUrl();
     autofillLinkText();
     detectManuallyRemovedGuides();
