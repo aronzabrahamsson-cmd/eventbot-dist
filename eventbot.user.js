@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.21
+// @version      7.98.22
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4160,6 +4160,16 @@
           <input type="text" id="${f.id}" class="vseh-key" placeholder="${f.ph}" autocomplete="off" spellcheck="false"${f.gm === 'vseh_user_name' ? ' maxlength="3"' : ''}>${f.gm === 'vseh_user_name' ? `
           <div id="${f.id}-warn" class="vseh-name-warn">Endast initialer, inte namn (max 3 tecken)</div>` : ''}</div>`).join('')}
       <hr class="vseh-divider">
+      <div id="vseh-sb-mainfields" style="display:none;">
+        <div class="vseh-two" style="display:flex; gap:10px;">
+          <div class="vseh-row" style="flex:1;"><label>Kategori</label>
+            <select id="vseh-sb-cat"><option value="">Alla</option><option value="music">Musik</option>
+              <option value="arts &amp; theatre">Scen &amp; teater</option><option value="family">Familj</option><option value="sports">Sport</option></select></div>
+          <div class="vseh-row" style="flex:1;"><label>Sidor att hämta</label>
+            <select id="vseh-sb-pages"><option value="1">1</option><option value="3">3</option><option value="5">5</option><option value="10">10</option><option value="20">20</option></select></div>
+        </div>
+        <hr class="vseh-divider">
+      </div>
       <div class="vseh-row"><label>Utseende</label>
         <label class="vseh-sb-theme"><input type="checkbox" id="vseh-sb-theme" style="width:auto;">
           Ljust läge (icke-mörkt) — gäller alla EventBot-widgets</label></div>
@@ -4170,6 +4180,21 @@
       const el = document.getElementById(f.id);
       el.addEventListener('change', () => GM_setValue(f.gm, el.value.trim()));
     });
+    // MAIN:s Ticketmaster-inställningar (kategori + sidor) i lådan — bara på
+    // Visit-domänerna (på begäran 2026-10-09: alla Visit-widgets ska se samma
+    // inställningsvy som MAIN; SBR orört). Värdena delas via GM så en ändring
+    // i lådan gäller även MAIN-panelens nästa hämtning (och tvärtom).
+    const onVisit = /(^|\.)visitstockholm\.(com|se)$/.test(location.hostname);
+    const sbMain = document.getElementById('vseh-sb-mainfields');
+    if (sbMain && onVisit) {
+      sbMain.style.display = 'block';
+      const catEl = document.getElementById('vseh-sb-cat');
+      const pagesEl = document.getElementById('vseh-sb-pages');
+      catEl.value = GM_getValue('tm_classification', '') || '';
+      pagesEl.value = String(GM_getValue('tm_max_pages', '10') || '10');
+      catEl.addEventListener('change', () => GM_setValue('tm_classification', catEl.value));
+      pagesEl.addEventListener('change', () => GM_setValue('tm_max_pages', pagesEl.value));
+    }
     wireInitialsValidation('vseh-sb-uname', 'vseh-sb-uname-warn');
     wireThemeToggle('vseh-sb-theme');
     wireSettingsImportExport('vseh-sb-export', 'vseh-sb-drop', 'vseh-sb-file');
@@ -4628,6 +4653,13 @@
       <div id="vseh-logwrap" style="display:none;"><div class="vseh-loghdr">Diagnostiklogg <span style="display:flex;gap:5px;"><button type="button" id="vseh-logjson" title="Kopiera hämtad JSON">JSON</button><button type="button" id="vseh-logcopy" title="Kopiera loggen">📋 Kopiera</button><button type="button" id="vseh-logclose" title="Stäng">✕</button></span></div><div id="vseh-log"></div></div>
     `;
     document.body.appendChild(p);
+    // Kategori/sidor delas nu med den delade inställningslådan (GM) —
+    // initieras från lagrat värde och sparas vid ändring så båda vyerna
+    // alltid visar samma (på begäran 2026-10-09).
+    const savedCat = GM_getValue('tm_classification', '');
+    const savedPages = String(GM_getValue('tm_max_pages', '10') || '10');
+    if (savedCat && $('vseh-cat')) $('vseh-cat').value = savedCat;
+    if (savedPages && $('vseh-pages')) $('vseh-pages').value = savedPages;
     $('vseh-key').value = GM_getValue('tm_key', '');
     $('vseh-mkey').value = GM_getValue('mistral_key', '');
     $('vseh-magent').value = GM_getValue('mistral_agent', '');
@@ -5343,6 +5375,8 @@
           dr.disabled = false; dr.textContent = '🔬 Rådata (1 sida)';
         }
       }); }
+    if ($('vseh-cat')) $('vseh-cat').addEventListener('change', () => GM_setValue('tm_classification', $('vseh-cat').value));
+    if ($('vseh-pages')) $('vseh-pages').addEventListener('change', () => GM_setValue('tm_max_pages', $('vseh-pages').value));
     $('vseh-key').addEventListener('change', () => GM_setValue('tm_key', $('vseh-key').value.trim()));
     $('vseh-mkey').addEventListener('change', () => GM_setValue('mistral_key', $('vseh-mkey').value.trim()));
     $('vseh-magent').addEventListener('change', () => GM_setValue('mistral_agent', $('vseh-magent').value.trim()));
@@ -6299,12 +6333,37 @@
     btnYes.addEventListener('click', () => {
       const titleEl = document.getElementById('id_title_sv') || document.getElementById('id_title_en');
       const title = (titleEl && titleEl.value || 'ert event').trim();
+      // Taggade related guider som lista (på begäran 2026-10-09): varje
+      // språkpar på egen rad med "- " framför, sv / en ordning, separerade
+      // med " / ", INGA språktaggar. Matchar fältets live-titlar mot regelmotorns
+      // språkpar (titleMatches hanterar årstalsskillnader i titlarna).
+      let guideList = '';
+      try {
+        const liveTitles = currentRelatedGuideTitles();
+        const seen = new Set();
+        const lines = [];
+        for (const t of liveTitles) {
+          const pairRow = getGuideLangPairRows().find(r => titleMatches(t, r.sv) || titleMatches(t, r.en));
+          let line = null;
+          if (pairRow) {
+            line = [pairRow.sv, pairRow.en].filter(Boolean).join(' / ');
+          } else {
+            line = t;
+          }
+          const key = (line || '').toLowerCase();
+          if (line && !seen.has(key)) { seen.add(key); lines.push('- ' + line); }
+        }
+        if (lines.length) {
+          guideList = '%0D%0A%0D%0AEvenemanget finns även i våra guider:%0D%0A' +
+            lines.map(l => encodeURIComponent(l)).join('%0D%0A');
+        }
+      } catch {}
       // Godkännandemall (på begäran 2026-10-06).
       mailto(title + ' publicerad på Visit Stockholm',
         'Hej!%0D%0A%0D%0A' +
         'Tack för att ni skickar in till kalendern 😊 %0D%0A%0D%0A' +
-        'Nu är ' + encodeURIComponent(title) + ' publicerad.%0D%0A%0D%0A' +
-        'Allt gott,%0D%0A%0D%0A' +
+        'Nu är ' + encodeURIComponent(title) + ' publicerad.' + guideList +
+        '%0D%0A%0D%0AAllt gott,%0D%0A%0D%0A' +
         'Redaktionen,%0D%0A' +
         'Stockholm Business Region');
     });
