@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.11
+// @version      7.98.12
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3715,6 +3715,16 @@
     .vseh-dropzone { flex:1; border:1.5px dashed var(--vd-line); border-radius:7px; padding:8px 10px;
       font-size:11px; color:var(--vd-txt3); text-align:center; cursor:pointer; transition:border-color .12s, background .12s; }
     .vseh-dropzone.vseh-drop-hover { border-color:var(--vd-accent); background:var(--vd-bg3); color:var(--vd-txt); }
+    #vseh-guide-list { display:flex; flex-direction:column; gap:6px; }
+    .vseh-guide-item { display:flex; gap:8px; align-items:flex-start; padding:8px 10px; border:1px solid var(--vd-line); border-radius:7px; background:var(--vd-bg2); }
+    .vseh-guide-item.off { opacity:.55; }
+    .vseh-guide-item .vseh-guide-meta { flex:1; min-width:0; }
+    .vseh-guide-item .vseh-guide-title { font-size:12px; font-weight:600; color:var(--vd-txt); }
+    .vseh-guide-item .vseh-guide-cond { font-size:10.5px; color:var(--vd-txt3); margin-top:2px; font-family:monospace; }
+    .vseh-guide-item button { background:var(--vd-bg3); border:1px solid var(--vd-line); color:var(--vd-txt); border-radius:6px; font-size:11px; padding:4px 8px; cursor:pointer; flex-shrink:0; }
+    .vseh-guide-item button:hover { color:var(--vd-accent); }
+    #vseh-guide-test-result .vseh-guide-hit { font-size:12px; padding:6px 10px; margin-bottom:4px; border-radius:7px; background:var(--vd-bg2); border:1px solid var(--vd-accent); color:var(--vd-txt); }
+    #vseh-guide-test-result .vseh-guide-nohit { font-size:11.5px; color:var(--vd-txt3); padding:4px 2px; }
     #vseh-settings-export, #sbr-settings-export { font-size:11.5px; font-weight:600; padding:7px 11px;
       border:1px solid var(--vd-line); background:var(--vd-bg2); color:var(--vd-accent); border-radius:7px;
       cursor:pointer; white-space:nowrap; }
@@ -4361,6 +4371,7 @@
         <button type="button" class="vseh-tab active" data-tab="cal">📆 Kalendrar</button>
         <button type="button" class="vseh-tab" data-tab="url">🔗 URL</button>
         <button type="button" class="vseh-tab" data-tab="dup">🎭 Dubbletter <span id="vseh-dup-count"></span></button>
+        <button type="button" class="vseh-tab" data-tab="guides">📚 Guider</button>
         <button type="button" class="vseh-tab" data-tab="set">⚙️</button>
       </div>
       <div id="vseh-scroll"><div id="vseh-inner">
@@ -4445,6 +4456,48 @@
           <div id="vseh-cleanbody"><div class="vseh-empty">Ladda er kalender, klicka sedan "Sök dubbletter".</div></div>
         </div>
 
+        <!-- FLIK: GUIDER (2026-10-08) -->
+        <div class="vseh-tabpane" data-pane="guides">
+          <div class="vseh-fetch-h">Guide-regler — auto-taggning av related_guides</div>
+          <div class="vseh-hint">Varje regel kopplar villkor (kategori + nyckelord/venue + datum) till en guide. Kategori och nyckelord kombineras med
+            <b>+</b> = OCH, <b>,</b> = ELLER, <b>-</b> framför = får INTE finnas. Venue-namn skrivs som nyckelord — de matchar mot eventets text inkl. venue-fältet.
+            "ENDAST SVENSKA"/"ENDAST ENGELSKA" i en guide-cell = tagga bara andra språket. Ändringar sparas lokalt direkt och kan delas med kollegor via GitHub-knappen.</div>
+          <div id="vseh-guide-sync" style="display:flex; gap:8px; margin-bottom:10px;">
+            <button type="button" id="vseh-guide-pull" title="Hämta delade regler från data-repot (skriver över lokala ändringar)">⬇️ Hämta delade</button>
+            <button type="button" id="vseh-guide-push" title="Dela dina regler med alla kollegor via data-repot">⬆️ Dela med alla</button>
+            <span class="vseh-fetch-ts" id="vseh-guide-sync-ts">—</span>
+          </div>
+          <div id="vseh-guide-list"></div>
+          <div class="vseh-guide-edit" id="vseh-guide-edit" style="display:none; margin-top:12px;">
+            <div class="vseh-fetch-h" id="vseh-guide-edit-h">Redigera regel</div>
+            <div class="vseh-row"><label>Kategori (tom = alla)</label>
+              <input type="text" id="vseh-guide-cat" class="vseh-key" placeholder="t.ex. Music eller Music+Festivals (tom = alla)"></div>
+            <div class="vseh-row"><label>Nyckelord / venues</label>
+              <input type="text" id="vseh-guide-kw" class="vseh-key" placeholder='t.ex. nalen, debaser eller &quot;free admission&quot;+gratis, -&quot;kungliga slottet&quot;'></div>
+            <div class="vseh-row"><label>Datumspann (valfritt)</label>
+              <input type="text" id="vseh-guide-date" class="vseh-key" placeholder="[YYYY-05-24-YYYY-09-03] (tom = hela året)"></div>
+            <div class="vseh-row"><label>Guide — engelska</label>
+              <input type="text" id="vseh-guide-en" class="vseh-key" placeholder="Guide-titel EN, eller ENDAST SVENSKA"></div>
+            <div class="vseh-row"><label>Guide — svenska</label>
+              <input type="text" id="vseh-guide-sv" class="vseh-key" placeholder="Guide-titel SV, eller ENDAST ENGELSKA"></div>
+            <div style="display:flex; gap:8px;">
+              <button type="button" id="vseh-guide-save">💾 Spara regel</button>
+              <button type="button" id="vseh-guide-cancel">Avbryt</button>
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; margin-top:12px;">
+            <button type="button" id="vseh-guide-add">➕ Ny regel</button>
+          </div>
+          <hr class="vseh-divider">
+          <div class="vseh-fetch-h">Prova texten</div>
+          <div class="vseh-hint">Klistra in titel + beskrivning (+ venue) för ett event och se vilka guider som skulle taggas — innan du sparar en regel.</div>
+          <textarea id="vseh-guide-test-text" rows="5" style="width:100%; font-family:inherit; font-size:12px; padding:8px; background:var(--vd-bg); color:var(--vd-txt); border:1px solid var(--vd-line); border-radius:7px;" placeholder="Klistra in eventets titel + beskrivning här…"></textarea>
+          <div style="display:flex; gap:8px; margin:6px 0 10px;">
+            <input type="text" id="vseh-guide-test-cat" class="vseh-key" placeholder="Kategorier, kommaseparerade (t.ex. Music)" style="flex:1;">
+            <button type="button" id="vseh-guide-test-run">Testa</button>
+          </div>
+          <div id="vseh-guide-test-result"></div>
+        </div>
         <!-- FLIK: INSTÄLLNINGAR -->
         <div class="vseh-tabpane" data-pane="set">
           <div class="vseh-hint">Dela alla API-nycklar m.m. med en kollega: exportera som fil,
@@ -4501,6 +4554,7 @@
     if (mb) mb.classList.add('on');
     wire();
     wireManualImageUploadAutomation();
+    wireGuideRulesGui();
     startMainAlwaysOnChecks();
     vlog('Panel byggd. Läge: ' + mode);
   }
@@ -7221,9 +7275,93 @@
     guideEn: ACCESSIBILITY_GUIDE_EN,
     guideSv: ACCESSIBILITY_GUIDE_SV
   };
+  // ---- Guide-regler: externt redigerbara (2026-10-08, på begäran) ----------
+  // Reglerna kan numera redigeras i GUI (fliken "Guider" i MAIN-panelen) utan
+  // kod. Formatet är samma rad-syntax som GUIDE_TAG_ROWS (celler: kategori,
+  // nyckelord, datum, guide EN, guide SV) — GUI:t serialiserar/deserialiserar
+  // rader av exakt den formen. Arkitekturen:
+  //   1. Builtin: GUIDE_TAG_ROWS + ACCESSIBILITY_GUIDE_RULE (koden ovan).
+  //   2. GM-cache `vseh_custom_guide_rows`: användarens egna/ändrade rader —
+  //      OM den finns (icke-tom sträng) ERSÄTTER den builtin-rader som den
+  //      täcker (matchat på guide-titel) och LÄGGER TILL sina nya. PÅ/AV-
+  //      status per rad finns i `vseh_disabled_guide_names`.
+  //   3. GitHub-datasynk (`data/guide-rules.json` i eventbot-data-repot,
+  //      samma PAT/mechanism som "Hanterat"-markeringarna): delar reglerna
+  //      mellan alla kollegor. Filen innehåller hela radlistan; en hemtagning
+  //      skriver över GM-cachen (efter bekräftelse i GUI).
+  // ACCESSIBILITY-regeln har EGEN match-logik (substring + handicap/golf-
+  // uteslutning) som inte kan uttrycks i rad-syntaxen — den följer därför
+  // MED som en fast rad i GUI:t (redigerbar på samma sätt, men med `custom:
+  // true`-flagg i serialiseringen) och matchas alltid via sin egen funktion.
+  function guideRuleStorageKey() { return 'vseh_custom_guide_rows'; }
+  function guideDisabledStorageKey() { return 'vseh_disabled_guide_names'; }
+  function getCustomGuideRows() {
+    try {
+      const raw = GM_getValue(guideRuleStorageKey(), '');
+      if (!raw) return null;
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr : null;
+    } catch { return null; }
+  }
+  function setCustomGuideRows(rows) {
+    GM_setValue(guideRuleStorageKey(), JSON.stringify(rows || []));
+    _guideTagRules = null;
+    _guideLangPairRows = null;
+  }
+  function getDisabledGuideNames() {
+    try {
+      const arr = JSON.parse(GM_getValue(guideDisabledStorageKey(), '[]'));
+      return new Set(Array.isArray(arr) ? arr : []);
+    } catch { return new Set(); }
+  }
+  function setDisabledGuideNames(names) {
+    GM_setValue(guideDisabledStorageKey(), JSON.stringify([...names]));
+    _guideTagRules = null;
+    _guideLangPairRows = null;
+  }
+  // Serialiserar accessibility-regeln till/fån rad-format — `match` kan inte
+  // serialiseras, så raden känns igen på keyword-cellen 'ACCESSIBILITY-SPECIAL'
+  // och mapping sker i buildEditableGuideRule() nedan.
+  function accessibilityRow() {
+    return ['ACCESSIBILITY', 'ACCESSIBILITY-SPECIAL', null, ACCESSIBILITY_GUIDE_EN, ACCESSIBILITY_GUIDE_SV];
+  }
+  function buildEditableGuideRule(row, idx) {
+    if (row[0] === 'ACCESSIBILITY') {
+      return { name: 'accessibility', match: accessibilityRuleMatch, guideEn: row[3], guideSv: row[4], source: 'builtin', idx };
+    }
+    const r = buildGuideRuleFromRow(row, idx);
+    if (r) r.source = 'builtin';
+    return r;
+  }
+  // Mergar builtin-rader med custom-rader: en custom-rad med SAMMA guide-
+  // titel (EN eller SV, fuzzy via titleMatches) som en builtin-rad ERSÄTTER
+  // den; annars läggs den till som ny regel sist. Accessibility-raden känns
+  // igen på kategori-cellen och behåller sin special-matchning.
+  function mergeCustomGuideRows(builtinRows, customRows) {
+    if (!customRows || !customRows.length) return builtinRows;
+    const result = builtinRows.slice();
+    customRows.forEach(cRow => {
+      const cEn = resolveGuideTitle(cRow[3]);
+      const cSv = resolveGuideTitle(cRow[4]);
+      const replaceIdx = result.findIndex(bRow =>
+        (cEn && (bRow[3] === cEn || titleMatches(bRow[3] || '', cEn))) ||
+        (cSv && (bRow[4] === cSv || titleMatches(bRow[4] || '', cSv))));
+      if (replaceIdx >= 0) result[replaceIdx] = cRow;
+      else result.push(cRow);
+    });
+    return result;
+  }
   let _guideTagRules = null;
   function getGuideTagRules() {
-    if (!_guideTagRules) _guideTagRules = GUIDE_TAG_ROWS.map(buildGuideRuleFromRow).filter(Boolean).concat([ACCESSIBILITY_GUIDE_RULE]);
+    if (!_guideTagRules) {
+      const builtinRows = GUIDE_TAG_ROWS.concat([accessibilityRow()]);
+      const mergedRows = mergeCustomGuideRows(builtinRows, getCustomGuideRows());
+      const disabled = getDisabledGuideNames();
+      _guideTagRules = mergedRows
+        .map(buildEditableGuideRule)
+        .filter(Boolean)
+        .filter(r => !disabled.has(r.name));
+    }
     return _guideTagRules;
   }
 
@@ -7262,6 +7400,187 @@
     return !!na && !!nb && (na === nb || na.includes(nb) || nb.includes(na));
   }
 
+  // ---- Guide-regel-GUI (fliken "Guider", 2026-10-08) -----------------------
+  // Renderar + wire:ar fliken. Både builtin-rader (GUIDE_TAG_ROWS, med källa-
+  // markör 'builtin') och användarens egna rader (GM-cachen, 'custom') visas i
+  // EN lista. Redigering av en builtin-rad kopierar den till custom-cachen
+  // (mergeCustomGuideRows ersätter vid samma guide-titel), vilket betyder att
+  // man kan både ändra befintliga regler och lägga till nya utan kod.
+  let guideGuiEditingIdx = null; // index i den renderade listan (null = ny)
+  function guideGuiAllRows() {
+    const builtinRows = GUIDE_TAG_ROWS.concat([accessibilityRow()]);
+    const customRows = getCustomGuideRows() || [];
+    const customTitles = new Set(customRows.flatMap(r => [r[3], r[4]].filter(Boolean)));
+    const base = builtinRows.filter(r => !(r[3] && customTitles.has(r[3])) && !(r[4] && customTitles.has(r[4])));
+    return base.map(r => ({ row: r, source: 'builtin' }))
+      .concat(customRows.map(r => ({ row: r, source: 'custom' })));
+  }
+  function guideGuiDescribeRow(row) {
+    const parts = [];
+    if (row[0] && row[0] !== 'ACCESSIBILITY') parts.push('kat: ' + row[0]);
+    if (row[0] === 'ACCESSIBILITY') parts.push('tillgänglighet (specialregel)');
+    if (row[1] && row[1] !== 'ACCESSIBILITY-SPECIAL') parts.push('ord: ' + row[1]);
+    if (row[2]) parts.push('datum: ' + row[2]);
+    return parts.length ? parts.join(' · ') : 'inga villkor';
+  }
+  function renderGuideRulesGui() {
+    const list = document.getElementById('vseh-guide-list');
+    if (!list) return;
+    const disabled = getDisabledGuideNames();
+    const all = guideGuiAllRows();
+    list.innerHTML = all.map((item, i) => {
+      const row = item.row;
+      const en = row[3] === 'ENDAST SVENSKA' ? '' : (row[3] || '');
+      const sv = row[4] === 'ENDAST ENGELSKA' ? '' : (row[4] || '');
+      const titles = [en, sv].filter(Boolean).join(' / ') || '(namnlös)';
+      const ruleName = row[0] === 'ACCESSIBILITY' ? 'accessibility' : ('row' + GUIDE_TAG_ROWS.indexOf(row));
+      const isOff = disabled.has(ruleName);
+      const src = item.source === 'custom' ? '✏️' : '·';
+      return `<div class="vseh-guide-item${isOff ? ' off' : ''}" data-i="${i}">
+        <div class="vseh-guide-meta">
+          <div class="vseh-guide-title">${esc(titles)} <span style="color:var(--vd-txt3); font-weight:400; font-size:10px;">${src}</span></div>
+          <div class="vseh-guide-cond">${esc(guideGuiDescribeRow(row))}</div>
+        </div>
+        <button type="button" class="vseh-guide-toggle" data-i="${i}">${isOff ? '⏸ AV' : '✅ PÅ'}</button>
+        <button type="button" class="vseh-guide-editbtn" data-i="${i}">✎</button>
+        <button type="button" class="vseh-guide-del" data-i="${i}" title="${item.source === 'custom' ? 'Ta bort regel' : 'Kopiera till redigering (builtin kan inte tas bort — sätt AV istället)'}">${item.source === 'custom' ? '🗑' : '⧉'}</button>
+      </div>`;
+    }).join('') || '<div class="vseh-empty">Inga regler — lägg till en med "Ny regel".</div>';
+    list.querySelectorAll('.vseh-guide-toggle').forEach(b => b.addEventListener('click', () => guideGuiToggle(parseInt(b.dataset.i, 10))));
+    list.querySelectorAll('.vseh-guide-editbtn').forEach(b => b.addEventListener('click', () => guideGuiEdit(parseInt(b.dataset.i, 10))));
+    list.querySelectorAll('.vseh-guide-del').forEach(b => b.addEventListener('click', () => guideGuiDelete(parseInt(b.dataset.i, 10))));
+  }
+  function guideGuiToggle(i) {
+    const all = guideGuiAllRows();
+    const item = all[i];
+    if (!item) return;
+    const row = item.row;
+    const ruleName = row[0] === 'ACCESSIBILITY' ? 'accessibility' : ('row' + GUIDE_TAG_ROWS.indexOf(row));
+    const disabled = getDisabledGuideNames();
+    if (disabled.has(ruleName)) disabled.delete(ruleName); else disabled.add(ruleName);
+    setDisabledGuideNames(disabled);
+    renderGuideRulesGui();
+    vlog('Guider: regel "' + (row[3] || row[4] || ruleName) + '" ' + (disabled.has(ruleName) ? 'avstängd' : 'påslagen') + '.', 'ok');
+  }
+  function guideGuiEdit(i) {
+    const all = guideGuiAllRows();
+    const item = all[i];
+    if (!item) return;
+    guideGuiEditingIdx = i;
+    const row = item.row;
+    const box = document.getElementById('vseh-guide-edit');
+    document.getElementById('vseh-guide-edit-h').textContent = item.source === 'custom' ? 'Redigera egen regel' : 'Redigera (skapar kopia av builtin-regel)';
+    document.getElementById('vseh-guide-cat').value = row[0] === 'ACCESSIBILITY' ? '' : (row[0] || '');
+    document.getElementById('vseh-guide-kw').value = row[1] === 'ACCESSIBILITY-SPECIAL' ? '' : (row[1] || '');
+    document.getElementById('vseh-guide-date').value = row[2] || '';
+    document.getElementById('vseh-guide-en').value = (row[3] === 'ENDAST SVENSKA' ? '' : row[3]) || '';
+    document.getElementById('vseh-guide-sv').value = (row[4] === 'ENDAST ENGELSKA' ? '' : row[4]) || '';
+    box.style.display = 'block';
+    box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+  function guideGuiDelete(i) {
+    const all = guideGuiAllRows();
+    const item = all[i];
+    if (!item) return;
+    if (item.source !== 'custom') { guideGuiEdit(i); return; }
+    const customRows = (getCustomGuideRows() || []).filter(r => r !== item.row);
+    setCustomGuideRows(customRows);
+    renderGuideRulesGui();
+    vlog('Guider: egen regel borttagen.', 'ok');
+  }
+  function guideGuiSave() {
+    const cat = document.getElementById('vseh-guide-cat').value.trim();
+    const kw = document.getElementById('vseh-guide-kw').value.trim();
+    const date = document.getElementById('vseh-guide-date').value.trim();
+    let en = document.getElementById('vseh-guide-en').value.trim();
+    let sv = document.getElementById('vseh-guide-sv').value.trim();
+    if (!en && sv) en = 'ENDAST SVENSKA';
+    if (!sv && en) sv = 'ENDAST ENGELSKA';
+    if (!en || en === 'ENDAST SVENSKA') { if (!sv || sv === 'ENDAST ENGELSKA') { vlog('Guider: ange minst en guide-titel.', 'err'); return; } }
+    if (!cat && !kw && !date) { vlog('Guider: ange minst ett villkor (kategori, nyckelord eller datum).', 'err'); return; }
+    const newRow = [cat || null, kw || null, date || null, en || null, sv || null];
+    const customRows = (getCustomGuideRows() || []).slice();
+    if (guideGuiEditingIdx !== null) {
+      const oldItem = guideGuiAllRows()[guideGuiEditingIdx];
+      if (oldItem && oldItem.source === 'custom') {
+        const oldIdx = customRows.indexOf(oldItem.row);
+        if (oldIdx >= 0) customRows[oldIdx] = newRow; else customRows.push(newRow);
+      } else customRows.push(newRow);
+    } else customRows.push(newRow);
+    setCustomGuideRows(customRows);
+    document.getElementById('vseh-guide-edit').style.display = 'none';
+    guideGuiEditingIdx = null;
+    renderGuideRulesGui();
+    vlog('Guider: regel sparad (gäller direkt på edit-sidor).', 'ok');
+  }
+  function guideGuiTest() {
+    const text = (document.getElementById('vseh-guide-test-text').value || '').toLowerCase();
+    const cats = (document.getElementById('vseh-guide-test-cat').value || '').split(',').map(s => s.trim()).filter(Boolean);
+    const out = document.getElementById('vseh-guide-test-result');
+    const ctx = { categories: cats, categoriesLower: cats.map(c => c.toLowerCase()), venue: '', text, dates: [] };
+    const hits = getGuideTagRules().filter(r => { try { return r.match(ctx); } catch { return false; } });
+    const uniq = [];
+    hits.forEach(r => [r.guideEn, r.guideSv].filter(Boolean).forEach(t => { if (!uniq.includes(t)) uniq.push(t); }));
+    out.innerHTML = uniq.length
+      ? uniq.map(t => '<div class="vseh-guide-hit">📌 ' + esc(t) + '</div>').join('')
+      : '<div class="vseh-guide-nohit">Inga guider triggas av texten.</div>';
+  }
+  // GitHub-delning av regler (samma data-repo/PAT som "Hanterat"-synken).
+  const GUIDE_RULES_SYNC_PATH = 'data/guide-rules.json';
+  async function guideGuiPull() {
+    if (!githubDataToken()) { vlog('Guider: ingen GitHub-PAT satt (fliken Inställningar).', 'err'); return; }
+    const ts = document.getElementById('vseh-guide-sync-ts');
+    if (ts) ts.textContent = 'hämtar…';
+    try {
+      const res = await githubDataGet(GUIDE_RULES_SYNC_PATH);
+      const rows = res.json && Array.isArray(res.json.rows) ? res.json.rows : null;
+      if (!rows) { vlog('Guider: filen i data-repot innehåller inga rader.', 'err'); if (ts) ts.textContent = '—'; return; }
+      setCustomGuideRows(rows);
+      renderGuideRulesGui();
+      if (ts) ts.textContent = new Date().toLocaleTimeString();
+      vlog('Guider: hämtade ' + rows.length + ' delade regler från data-repot.', 'ok');
+    } catch (e) {
+      vlog('Guider: hämtning misslyckades — ' + e.message, 'err');
+      if (ts) ts.textContent = '—';
+    }
+  }
+  async function guideGuiPush() {
+    if (!githubDataToken()) { vlog('Guider: ingen GitHub-PAT satt (fliken Inställningar).', 'err'); return; }
+    const ts = document.getElementById('vseh-guide-sync-ts');
+    if (ts) ts.textContent = 'delar…';
+    const rows = (getCustomGuideRows() || []);
+    if (!rows.length) { vlog('Guider: inga egna regler att dela — skapa/redigera först (builtin-rader delas via koden).', 'err'); if (ts) ts.textContent = '—'; return; }
+    try {
+      let current;
+      try { current = await githubDataGet(GUIDE_RULES_SYNC_PATH); } catch { current = { sha: null }; }
+      await githubDataPut(GUIDE_RULES_SYNC_PATH, { rows }, current.sha, 'Guide rules update by ' + githubDataUserName());
+      if (ts) ts.textContent = new Date().toLocaleTimeString();
+      vlog('Guider: delade ' + rows.length + ' regler till data-repot.', 'ok');
+    } catch (e) {
+      vlog('Guider: delning misslyckades — ' + e.message, 'err');
+      if (ts) ts.textContent = '—';
+    }
+  }
+  function wireGuideRulesGui() {
+    renderGuideRulesGui();
+    const add = document.getElementById('vseh-guide-add');
+    if (add) add.addEventListener('click', () => {
+      guideGuiEditingIdx = null;
+      document.getElementById('vseh-guide-edit-h').textContent = 'Ny regel';
+      ['vseh-guide-cat', 'vseh-guide-kw', 'vseh-guide-date', 'vseh-guide-en', 'vseh-guide-sv'].forEach(id => document.getElementById(id).value = '');
+      document.getElementById('vseh-guide-edit').style.display = 'block';
+    });
+    const save = document.getElementById('vseh-guide-save');
+    if (save) save.addEventListener('click', guideGuiSave);
+    const cancel = document.getElementById('vseh-guide-cancel');
+    if (cancel) cancel.addEventListener('click', () => { document.getElementById('vseh-guide-edit').style.display = 'none'; guideGuiEditingIdx = null; });
+    const test = document.getElementById('vseh-guide-test-run');
+    if (test) test.addEventListener('click', guideGuiTest);
+    const pull = document.getElementById('vseh-guide-pull');
+    if (pull) pull.addEventListener('click', () => guideGuiPull().catch(() => {}));
+    const push = document.getElementById('vseh-guide-push');
+    if (push) push.addEventListener('click', () => guideGuiPush().catch(() => {}));
+  }
   // related_guides-fältets dolda JSON följer samma [{"pk":…,"title":"…"}]-
   // mönster som categories (bekräftat via fältkartläggningen 2026-09-19).
   function currentRelatedGuideTitles() {
