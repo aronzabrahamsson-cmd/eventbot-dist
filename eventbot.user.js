@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.20
+// @version      7.98.21
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1756,18 +1756,17 @@
     document.execCommand('selectAll', false, null);
     document.execCommand('insertText', false, String(text));
     if (await waitLanded()) return true;
-    // Sista reserven: skriv Draft.js-JSON direkt i det dolda input-fältet och
-    // eldare en input-händelse — Wagtail/Draftail plockar upp det vid sparning.
-    try {
-      const hidden = document.getElementById(fieldId);
-      if (hidden) {
-        hidden.value = JSON.stringify({ blocks: [{ key: 'vseh0', text: String(text), type: 'unstyled', depth: 0, inlineStyleRanges: [], entityRanges: [], data: {} }], entityMap: {} });
-        hidden.dispatchEvent(new Event('input', { bubbles: true }));
-        hidden.dispatchEvent(new Event('change', { bubbles: true }));
-        vlog('Beskrivning: paste/execCommand verifierades inte — skrev Draft.js-JSON direkt i det dolda fältet (' + fieldId + '). Fältet kan behöva redigeras efter sparning.', 'err');
-        return true;
-      }
-    } catch {}
+    // TIDLIGARE SISTA RESERV (borttagen 2026-10-09): att skriva Draft.js-JSON
+    // direkt i det dolda input-fältet skapade en split-brain — React/Draftails
+    // internal state uppdaterades aldrig, fältet blev oredigerbart vid nästa
+    // tangenttryckning, och efter sparning kunde originaltexten komma tillbaka
+    // eftersom skärmen visade Reacts state medan det dolda fältet innehöll
+    // något annat. En TYDIG misslyckande (fältet lämnas orört, användaren
+    // klistrar in manuellt) är mycket bättre än en tyst osynkad skrivning.
+    warnDraftailOnce(fieldId, 'Beskrivning: kunde INTE skriva till ' + fieldId +
+      ' automatiskt (varken paste eller insättning verifierades) — fältet är orört, klistra in texten manuellt.');
+    vlog('Beskrivning: AUTOMATISK IFYLLNING MISSLYCKADES för ' + fieldId +
+      ' — fältet lämnas orört (ingen dold JSON-skrivning längre). Klistra in manuellt.', 'err');
     return false;
   }
   async function updateDraftail(fieldId, text) {
