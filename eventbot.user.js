@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.22
+// @version      7.98.23
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -6640,8 +6640,24 @@
     if (!note) {
       note = document.createElement('div');
       note.className = 'vseh-field-note vseh-field-note-' + key;
-      note.style.cssText = 'font-size:13px;margin:4px 0;';
-      wrap.insertBefore(note, wrap.firstChild);
+      // Riktlinjenoter (guideline) visas som FLYTANDE kort till HÖGER om
+      // fältet (på begäran 2026-10-10) — att de tidigare stacks in över
+      // fältet gjorde att alla fält under hoppade upp/ned var 1.5s när
+      // noten dök upp/försvann i pollingarna. Ett absolut-positionerat
+      // överlägg påverkar inte layouten alls: inget rör sig. Alla andra
+      // nottyper (caps/datetime/toolong/translate/resale/emdash) ligger
+      // kvar i det vanliga flödet överst i wrappern — de försvinner inte
+      // lika ofta och deras knappar behöver plats.
+      if (key === 'guideline') {
+        note.style.cssText = 'position:absolute;right:calc(100% + 10px);top:0;width:280px;max-width:40vw;' +
+          'background:var(--vd-bg2,#2a3142);border:1px solid var(--vd-line,#3a4356);border-radius:8px;' +
+          'padding:10px 12px;font-size:12.5px;z-index:9999;box-shadow:0 4px 14px rgba(0,0,0,.35);';
+        if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+        wrap.appendChild(note);
+      } else {
+        note.style.cssText = 'font-size:13px;margin:4px 0;';
+        wrap.insertBefore(note, wrap.firstChild);
+      }
     }
     // Hovringsspärr (2026-10-09): checkboxarna i Åtgärder-rutan syns bara när
     // musen är över rutan, men pollingen (var 1.5s) skriver om hela innerHTML —
@@ -6943,6 +6959,50 @@
 
   // Tar bort emojis direkt ur title_en/title_sv (vanliga textfält — säkert
   // att skriva om via simulateInput, syns direkt, lätt att ångra manuellt).
+  // Em-dash (—) i synliga textfält ersätts automatiskt med en-dash (– )
+  // med mellanslag runt (på begäran 2026-10-10). Samma policy som
+  // NO_EMDASH_RULE/stripEmDashes (Mistral-nätet) men då för text som kommit
+  // in i fälten på annan väg: manuellt klistrad AI-text, arranger som
+  // skriver — själva, gamla utkast. Gäller titlar (EN/SV), beskrivningar
+  // (EN/SV) och länktext. När en ersättning görs visas en GRÖN, kursiv
+  // inforuta under fältet; den stannar tills fältet sparas/laddas om
+  // (setFieldNote töms vid poll när texten inte längre innehåller —,
+  // men vi behåller noten separat via emdashReplaced-per-field tills
+  // sidan laddas om, eftersom själva ersättningen bara sker EN gång).
+  const emdashReplaced = new Set();
+  function stripEmDashesFromFields() {
+    // Titlar + länktext: vanliga input-fält
+    ['id_title_en', 'id_title_sv', 'id_link_text'].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el || !el.value || !el.value.includes('—')) return;
+      const fixed = el.value.replace(/\s*—\s*/g, ' – ').replace(/ {2,}/g, ' ').trim();
+      simulateInput(el, fixed);
+      emdashReplaced.add(id);
+      vlog('Em-dash: ersatte — i ' + id + ' (texten är antagligen AI-bearbetad).', 'ok');
+    });
+    // Beskrivningar: Draftail (contenteditable)
+    ['id_description_en', 'id_description_sv'].forEach(id => {
+      const text = readDraftailText(id);
+      if (!text || !text.includes('—')) return;
+      const fixed = text.replace(/\s*—\s*/g, ' – ').replace(/ {2,}/g, ' ').trim();
+      updateDraftail(id, fixed).then(ok => {
+        if (ok) {
+          emdashReplaced.add(id);
+          vlog('Em-dash: ersatte — i ' + id + ' (texten är antagligen AI-bearbetad).', 'ok');
+        }
+      }).catch(() => {});
+    });
+    // Rita ut gröna noten för varje fält där ersättning gjorts (kvar tills
+    // sidan laddas om — dvs "tills sparat", eftersom en omstart av edit-
+    // sidan alltid följer på en sparning).
+    const NOTE = '<div style="color:#1f7a4d;font-style:italic;font-weight:500;">OBS: Em-dash ersatt med tankstreck – texten är antagligen AI-bearbetad.</div>';
+    [['id_title_en', 'id_title_en'], ['id_title_sv', 'id_title_sv'], ['id_link_text', 'id_link_text'],
+     ['id_description_en', 'id_description_en'], ['id_description_sv', 'id_description_sv']].forEach(([id]) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      setFieldNote(el, 'emdash', emdashReplaced.has(id) ? NOTE : '');
+    });
+  }
   function stripEmojisFromTitles() {
     ['id_title_en', 'id_title_sv'].forEach(id => {
       const el = document.getElementById(id);
@@ -7426,7 +7486,18 @@
     [null, '"slow fashion"', null, 'Slow Fashion District – second hand and vintage in Stockholm', 'Slow Fashion District – second hand och vintage på Södermalm'],
     ['Eat & Drink+Fairs', null, null, 'Delicious events in Stockholm', 'Smakfulla evenemang i Stockholm'],
     [null, 'slaktkyrkan, fållan, slaktis, slakthusområdet', null, 'Sunrise over Slakthusområdet', 'Solen går upp över Slakthusområdet'],
-    [null, 'Golf', null, 'Tee Up On Your Vacation', 'Spela golf på semestern'],
+    // Golf-regeln (2026-10-10, på begäran): "golf" + kategorin Sports &
+    // Wellbeing tillsammans → golf-guideparet. Tidigare rad krävde bara
+    // nyckelordet "Golf" oavsett kategori — nu samlöper båda villkoren
+    // (cell-syntax: kategori + nyckelord = OCH).
+    ['Sports & Wellbeing', 'golf', null, 'Tee Up On Your Vacation', 'Spela golf på semestern'],
+    // House of Q (2026-10-10, på begäran): alla event med venue House of Q
+    // taggas med HBTQI-guideparet, oavsett kategori/nyckelord i övrig text.
+    // Venue-namnen ingår i buildGuideTagContext()s `text`, så nyckelords-
+    // matchning räcker. Ordgränsad så "House of Q" inte träffar t.ex. en
+    // hypotetisk "House of Quartet" (buildKeywordTest använder
+    // wordBoundaryPattern per term).
+    [null, '"house of q"', null, 'LGBTQ+ Events & Clubs', 'HBTQI-evenemang och klubbar'],,
     [null, 'nörd, "tv-spel", rollspel, fantasy, "sci-fi", "cosplay"', null, 'Stockholm ❤️ Nerds', 'Stockholm ❤️ Nördar'],
     [null, 'teenager, teens, youth, ungdomar, tonåringar, "för unga"', null, "The Teenager's Guide to Stockholm", 'Stockholm för tonårsfamiljen'],
     ['Guided tours & Lectures', 'Film', null, 'Stockholm in the Movies', 'Stockholm i filmens värld'],
@@ -8298,6 +8369,7 @@
     activateAddressGeotag();
     autoPublishStatus();
     stripEmojisFromTitles();
+    stripEmDashesFromFields();
     checkTitleCasing();
     checkDateTimeInTitle();
     checkTitleTooLong();
