@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.24
+// @version      7.98.25
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2202,8 +2202,12 @@
       messages: [
         { role: 'system', content:
           'Du tolkar fritext om ett events datum/öppettider till en lista av ENSKILDA tillfällen (aldrig datumspann/intervall som ett enda block). ' +
-          'Texten kan vara en uppräkning av datum, ELLER en instruktion som anger en period och undantagna veckodagar (t.ex. "closed all mondays", "stängt måndagar"). ' +
-          'Expandera alltid en period till varje enskild dag inom den, exkludera angivna veckodagar. Klockslag alltid 24-timmarsformat "HH:MM". ' +
+          'Texten kan vara en uppräkning av datum, ELLER en instruktion som anger en period och villkor på veckodagar — bÅDE UNDANTAGANDE ("closed all mondays", "stängt måndagar") och INKLUDERANDE ("Friday through Sunday", "fre-lör-sön", "endast helger"). ' +
+          'Vid en INKLUDERANDE veckodags-formulering ska listan INNEHÅLLA BARA dessa veckodagar — varje annan veckodag inom perioden UTELÅTAS helt. ' +
+          'Vid en UNDANTAGANDE formulering expanderas hela perioden och de undantagna veckodagarna stryks. ' +
+          'Klockslag kan vara olika per veckodag (t.ex. "Fridays+Sundays 10-16, Saturdays 10-17") — använd då rätt klockslag för varje enskilt datum enligt dess veckodag, aldrig ett växlande mönster. ' +
+          'Expandera ALLTID hela perioden fram till slutdatumet — avsluta aldrig listan i förtid. Kontrollera att sista tillfället ligger på eller strax före periodens slutdatum. ' +
+          'Klockslag alltid 24-timmarsformat "HH:MM". ' +
           'Om varken texten eller kontexten nedan ger dig ett klockslag, lämna start_time/end_time tomma strängar för det tillfället hellre än att hitta på ett. ' +
           'Om du inte kan avgöra någon period alls (varken från texten eller kontexten), svara med en tom lista. ' +
           'Dagens datum är ' + new Date().toISOString().slice(0, 10) + '. Tolka ALDRIG fram datum i det förflutna eller med ett annat år än texten/kontexten anger — om texten anger år explicit (t.ex. "2026") använd exakt det året. ' +
