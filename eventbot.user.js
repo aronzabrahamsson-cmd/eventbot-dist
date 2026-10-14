@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.28
+// @version      7.98.29
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1578,6 +1578,24 @@
       if (vSim < 0.9) return;
       const dateHit = evDates.some(d => !row.isSpan && row.start === d);
       if (!dateHit) return;
+      // Titel-stöd (2026-10-14, Brahms-fallet): adress+datum-grenen hoppade
+      // tidigare över titeljämförelsen HELT — det är hela poängen med grenen
+      // (återfånga översättningspar som delar NOLL titel-tokens), men det
+      // betydde också att två HELT ORELATERADE event på samma adress samma
+      // dag matchade (Brahms Requiem på Kungsholms kyrka vs ett utkast med
+      // adress Högbergsgatan 13 där kalenderpostens adress råkade vara samma
+      // — och då venue-namnen JÄMFÖRDES ALDRIG). Minsta titel-överlapp
+      // krävs nu (tSim ≥ 0.5, långt under huvud-grenens 0.7 men bevisar
+      // åtminstone SLÄKTSKAP): "Brahms: Ein Deutsches Requiem" vs "Brahms
+      // Requiem" delar båda orden — riktiga översättningspar delar alltid
+      // något — medan t.ex. "Julmarknad" vs "Luciakonsert" på samma adress
+      // inte delar något alls och inte längre matchar.
+      const addrTsim = Math.max(titleSim(ev.title, row.title), ev.title_sv ? titleSim(ev.title_sv, row.title) : 0);
+      if (addrTsim < 0.5) {
+        vlog('Adress+datum-TRÄFF UTAN TITELSTÖD avvisad: "' + ev.title + '" vs "' + row.title +
+          '" — tSim=' + addrTsim.toFixed(2) + ' < 0.5 (olika event, bara samma plats/datum).', 'ok');
+        return;
+      }
       if (!tvRows.includes(row)) {
         tvRows.push(row);
         vlog('Adress+datum-match (olika titelspråk, ingen delad titel-token): "' + ev.title +
@@ -6157,6 +6175,16 @@
       if (!rowData || !rowData.title) return;
       checked++;
       const st = matchStatus(rowData, { strict: true });
+      // Felsökningslogg (2026-10-14): visa exakt vilka kalenderrader ett
+      // flaggat utkast matchat + platsdata, så falska positiv är synliga
+      // direkt i loggen utan att öppna varje jämförelse.
+      if (st.matches.length) {
+        st.matches.forEach(m => {
+          vlog('DEDUP-MATCH: utkast "' + rowData.title + '" (adress="' + (rowData.address || 'tomt') +
+            '") → kalender "' + m.title + '" (venue="' + (m.venue_name || 'tomt') +
+            '", adress="' + (m.address || 'tomt') + '")', 'ok');
+        });
+      }
       const info = draftBadgeInfo(st);
       if (!info) return;
       counts[info.label] = (counts[info.label] || 0) + 1;
@@ -6253,7 +6281,8 @@
               ${m.href ? `<a class="vseh-edit" href="${esc(m.href)}" target="_blank" rel="noopener">🔍 Granska</a>` : ''}
             </div>
             <div class="vseh-item-title">${esc(m.title)}</div>
-            <div class="vseh-item-row"><span class="lab">Plats</span> ${esc(m.venue_name || m.address) || '–'}</div>
+            <div class="vseh-item-row"><span class="lab">Plats</span> ${esc(m.venue_name) || '–'}</div>
+            <div class="vseh-item-row"><span class="lab">Adress</span> ${esc(m.address) || '–'}</div>
             <div class="vseh-item-row"><span class="lab">Datum</span> ${datePresent('cal', m.isSpan ? null : [m.start], m.isSpan, m.start, m.end, 'draftcal-' + pk + '-' + mi)}</div>
           </div>`).join('') + `</div>`;
     }
