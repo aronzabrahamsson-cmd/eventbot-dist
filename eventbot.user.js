@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.30
+// @version      7.98.31
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -6733,6 +6733,76 @@
     catch { return ''; }
   }
 
+  // Understryknings-overlay på Draftail-fältet (2026-10-14, på begäran):
+  // ritar varje flaggad terms understrykning DIREKT PÅ fältets text, i
+  // flaggans färg, via Range-API mot editorns EGEN textnoder — editorns
+  // data rörs aldrig (overlay:n är pointer-events:none och ligger bara
+  // visuellt ovanpå). Rensas automatiskt när inga issues finns.
+  function clearGuidelineUnderlines(fieldId) {
+    const hidden = document.getElementById(fieldId);
+    const wrap = hidden && (hidden.closest('.w-field, .w-panel, [data-field]') || hidden.parentElement);
+    const old = wrap && wrap.querySelector('.vseh-gl-overlay');
+    if (old) old.remove();
+  }
+  function drawGuidelineUnderlines(fieldId, text, fieldIssues, venueNames, addressRaw) {
+    clearGuidelineUnderlines(fieldId);
+    if (!fieldIssues.length) return;
+    const hidden = document.getElementById(fieldId);
+    const wrap = hidden && (hidden.closest('.w-field, .w-panel, [data-field]') || hidden.parentElement);
+    const editor = wrap && (wrap.querySelector('.Draftail-Editor') || wrap.querySelector('.DraftEditor-root'));
+    if (!wrap || !editor) return;
+    // Samla alla (start, end, color)-markeringar från issues — positioner i
+    // DEN SAMMANSLAGNA texten readDraftailText() returnerar (block join \n).
+    const marks = [];
+    fieldIssues.forEach(issue => {
+      const color = GUIDELINE_ISSUE_COLOR[issue.label] || '#ff3b3b';
+      guidelineIssueRanges(text, issue.label, venueNames, addressRaw)
+        .forEach(([s, e]) => marks.push({ s, e, color }));
+    });
+    if (!marks.length) return;
+    // Overlay:n: en div ovanpå editorn (pointer-events:none) med absolut-
+    // positionerade smala linjer på Range-rect-positioner.
+    const overlay = document.createElement('div');
+    overlay.className = 'vseh-gl-overlay';
+    overlay.style.cssText = 'position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none;overflow:hidden;';
+    const eRect = editor.getBoundingClientRect();
+    // Hitta DOM-textnoder + offset i editorn för varje markering. Draftail
+    // renderar varje block som ett <p>/div med en textnod — vi kartlägger
+    // texten nod för nod mot readDraftailText()-strängen (samma ordning).
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+    let node, off = 0; const nodes = [];
+    while ((node = walker.nextNode())) { nodes.push({ node, start: off, end: off + node.textContent.length }); off += node.textContent.length; }
+    const totalLen = off;
+    let placed = 0;
+    marks.forEach(({ s, e, color }) => {
+      if (e > totalLen) return;
+      // Markeringen kan spänna flera noder — en Range per nod-segment.
+      nodes.forEach(({ node: n, start: ns }) => {
+        const ne = ns + n.textContent.length;
+        const segS = Math.max(s, ns), segE = Math.min(e, ne);
+        if (segS >= segE) return;
+        try {
+          const range = document.createRange();
+          range.setStart(n, segS - ns); range.setEnd(n, segE - ns);
+          const rects = range.getClientRects();
+          for (const r of rects) {
+            const line = document.createElement('div');
+            line.style.cssText = 'position:absolute;left:' + (r.left - eRect.left + editor.scrollLeft) + 'px;' +
+              'top:' + (r.bottom - eRect.top - 1) + 'px;width:' + r.width + 'px;height:2px;' +
+              'background:' + color + ';border-radius:1px;';
+            overlay.appendChild(line);
+            placed++;
+          }
+        } catch {}
+      });
+    });
+    if (placed) {
+      if (getComputedStyle(editor).position === 'static') editor.style.position = 'relative';
+      editor.appendChild(overlay);
+    } else {
+      overlay.remove();
+    }
+  }
   function setFieldNote(el, key, html) {
     const wrap = fieldWrapper(el);
     if (!wrap) return;
@@ -6749,21 +6819,17 @@
       // nottyper (caps/datetime/toolong/translate/resale/emdash) ligger
       // kvar i det vanliga flödet överst i wrappern — de försvinner inte
       // lika ofta och deras knappar behöver plats.
-      if (key === 'guideline') {
-        // Läggs till HÖGER om fältet: right:calc(100%+10px) placerar den
-        // VÄNSTER om wrappern — på Wagtails breda formulär hamnar den
-        // utanför vyn (bekräftat 2026-10-13). left:calc placerar den
-        // till höger; den är flytande (position:absolute) så den påverkar
-        // inte layouten, och max-width + overflow-skydd håller den på skärmen.
-        note.style.cssText = 'position:absolute;left:calc(100% + 10px);top:0;width:280px;max-width:calc(100vw - 40px);' +
-          'background:var(--vd-bg2,#2a3142);border:1px solid var(--vd-line,#3a4356);border-radius:8px;' +
-          'padding:10px 12px;font-size:12.5px;z-index:9999;box-shadow:0 4px 14px rgba(0,0,0,.35);';
-        if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
-        wrap.appendChild(note);
-      } else {
-        note.style.cssText = 'font-size:13px;margin:4px 0;';
-        wrap.insertBefore(note, wrap.firstChild);
-      }
+      // Riktlinjenoterna visas OVANFÖR fältet igen (2026-10-14, på begäran):
+      // den flytande höger-rutan visade sig svår att förhålla sig till —
+      // den duplicerande text-preview-rutan är borttagen (understrykning-
+      // arna ritas nu DIREKT PÅ Draftail-fältet via overlay, se
+      // drawGuidelineUnderlines()) så noten är nu smal: bara de färg-under-
+      // strukna etiketterna + Åtgärder-rutan. Layoutpåverkan (att fält
+      // under hoppar när noten dyker upp/försvinner) minimeras av att
+      // checkGuidelineIssues håller noten så länge något är flaggat och
+      // städarnas emdash/caps-noter ligger i separata note-element.
+      note.style.cssText = 'font-size:13px;margin:4px 0;';
+      wrap.insertBefore(note, wrap.firstChild);
     }
     // Hovringsspärr (2026-10-09): checkboxarna i Åtgärder-rutan syns bara när
     // musen är över rutan, men pollingen (var 1.5s) skriver om hela innerHTML —
@@ -6825,7 +6891,7 @@
       const fieldId = 'id_description_' + lang;
       const el = document.getElementById(fieldId);
       const text = readDraftailText(fieldId);
-      if (!text) { setFieldNote(el, 'guideline', ''); return; }
+      if (!text) { setFieldNote(el, 'guideline', ''); clearGuidelineUnderlines(fieldId); return; }
       const lower = text.toLowerCase();
       const fieldIssues = [];
 
@@ -6907,10 +6973,8 @@
               '</div>' +
               '<div style="margin-bottom:6px;margin-left:' + (fixable ? '22px' : '0') + ';">' + esc(i.msg) + '</div>';
           }).join('');
-        // Samma text som fältet, men med varje flaggad term understruken i
-        // sin flaggas färg — ett snabbt "var i texten?"-facit utan att
-        // behöva läsa varje förklaringsrad för sig (på uttrycklig begäran).
-        html += highlightedTextPreview(text, fieldIssues, venueNames, addressRaw);
+        // Preview-rutan borttagen (2026-10-14, på begäran) — understrykningarna
+        // ritas nu DIREKT PÅ Draftail-fältet via drawGuidelineUnderlines()
         if (fixLabels.length) {
           // Bara IKRYSSADE åtgärder skickas till Mistral (2026-10-09) — den
           // urkryssade platsinfo-raden ska inte generera en "ta bort platsnamn"-
@@ -6929,6 +6993,11 @@
         html += '</div>';
       }
       setFieldNote(el, 'guideline', html);
+      if (fieldIssues.length) {
+        drawGuidelineUnderlines(fieldId, text, fieldIssues, venueNames, addressRaw);
+      } else {
+        clearGuidelineUnderlines(fieldId);
+      }
       allIssues.push(...fieldIssues);
     });
     renderGuidelineSummary(allIssues);
