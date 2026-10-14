@@ -1485,8 +1485,24 @@
       // bara ETT språks titel (se kommentaren vid kandidatinsamlingen ovan).
       const tSim = Math.max(titleSim(ev.title, row.title), ev.title_sv ? titleSim(ev.title_sv, row.title) : 0);
       const vSim = placeSim(ev.venue_name, ev.address, row.venue_name, row.address);
+      // Plats-tröskel (2026-10-13, Brahms-fallet): när KÄLLAN/utkastet bara
+      // har en ADRESS (inget venue-namn) men kalenderraden har ett venue-namn,
+      // är adressjämförelsen vårt ENDA platsbevis — venue-jämförelsen är
+      // omöjlig (tomt mot 'Kungsholms kyrka' = 0 oavsett). En halvbra
+      // adress-träff (VENUE_THRESHOLD=0.5) räcker inte då: en adress
+      // som delar ETT ord (även husnummer-tokens före v7.98.26) med en
+      // annan gata på en helt annan plats ger falsk dubblett. Krav höjs
+      // då till 0.9 (nästan identisk adress) — samma nivå som
+      // adress+datum-grenen nedan redan kräver. När källan har venue-namn
+      // (vanliga källdata) gäller ordinär tröskel; Ticketmaster-fallet
+      // (tomt venue på KÄLLAN men full venue i kalendern) träffas av samma
+      // högre krav och skyddas också av titel+datum-kraven.
+      const evHasVenue = !!normText(ev.venue_name);
+      const placeThreshold = evHasPlace
+        ? (evHasVenue ? VENUE_THRESHOLD : (normText(row.venue_name) ? 0.9 : VENUE_THRESHOLD))
+        : 0;
       const match = evHasPlace
-        ? (tSim >= simThreshold && vSim >= VENUE_THRESHOLD)
+        ? (tSim >= simThreshold && vSim >= placeThreshold)
         : (tSim >= Math.max(simThreshold, NO_PLACE_TITLE_THRESHOLD));
       if (match) tvRows.push(row);
       else nearMisses.push({ row, tSim, vSim });
@@ -1509,7 +1525,7 @@
           ') mot kalenderrad "' + top.row.title + '" (venue="' + (top.row.venue_name || '(tomt)') +
           '", adress="' + (top.row.address || '(tomt)') + '") — tSim=' + top.tSim.toFixed(2) +
           ', vSim=' + top.vSim.toFixed(2) + ', krav: ' +
-          (evHasPlace ? ('tSim≥' + simThreshold + ' OCH vSim≥' + VENUE_THRESHOLD) : ('tSim≥' + Math.max(simThreshold, NO_PLACE_TITLE_THRESHOLD))), 'err');
+          (evHasPlace ? ('tSim≥' + simThreshold + ' OCH vSim≥' + placeThreshold) : ('tSim≥' + Math.max(simThreshold, NO_PLACE_TITLE_THRESHOLD))), 'err');
       }
     }
 
@@ -5676,7 +5692,8 @@
               ${m.href ? `<a class="vseh-edit" href="${esc(m.href)}" target="_blank" rel="noopener">🔍 Granska</a>` : ''}
             </div>
             <div class="vseh-item-title">${esc(m.title)}</div>
-            <div class="vseh-item-row"><span class="lab">Plats</span> ${esc(m.venue_name || m.address) || '–'}</div>
+            <div class="vseh-item-row"><span class="lab">Plats</span> ${esc(m.venue_name || '–')}</div>
+            <div class="vseh-item-row"><span class="lab">Adress</span> ${esc(m.address) || '–'}</div>
             <div class="vseh-item-row"><span class="lab">Datum</span> ${datePresent('cal', m.isSpan ? null : [m.start], m.isSpan, m.start, m.end, 'cal-' + evIdx + '-' + mi)}</div>
           </div>`).join('') + `</div>`;
     }
