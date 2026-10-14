@@ -6529,7 +6529,16 @@
   // ":-" efter ett tal ("200:-", "50 :-") är en vanlig svensk prisnotation.
   // "krona"/"kronor" (utskrivet, t.ex. engelska "200 Swedish krona") täcks
   // inte av den korta "kr"-förkortningen ovan — på uttrycklig begäran (2026-09-29).
-  const PRICE_WORD_RE = /\b(sek|kr|krona|kronor|eur)\b|€|\d+\s?:-/gi;
+  // "kr"-flaggning (fixad 2026-10-07): \b är ASCII-baserad och ser INTE
+  // åäö som bokstäver, så \bkr\b träffade "kräver", "ökr", "krön" m.m.
+  // (bekräftat via test) — "kr" räknades som fristående ord trots att det
+  // satt ihop med svenska bokstäver. Nu krävs att "kr" omges av
+  // mellanslag/skiljetecken (eller strängens start/slut) på BÅDA sidor —
+  // skiljetecken inkluderar .,:;-!?) och siffror på vänster sida räknas
+  // INTE som gräns ("200kr" är redan en prisnotation och täcks av
+  // \d+\s?:- alternativt ändå av sek/krona-termerna, men "kr" ska inte
+  // flaggas ur ett sammansatt "200kr"-ord).
+  const PRICE_WORD_RE = /\b(sek|krona|kronor|eur)\b|€|\d+\s?:-|(?:^|[\s.,;:!?–—])kr(?=$|[\s.,;:!?–—])/gi;
   const EMOJI_RE = /\p{Extended_Pictographic}/gu;
   // Klockslag i löptext ("18:00", "kl 19", "kl. 19", "klockan 20") — tid ska
   // stå i datumfälten, inte i beskrivningen.
@@ -7511,7 +7520,19 @@
   function buildKeywordTest(cell) {
     const { orGroups, exclude } = parseOrAndCell(cell);
     if (!orGroups.length && !exclude.length) return null;
-    const termRe = term => new RegExp(wordBoundaryPattern(term), 'i');
+    // En term som slutar med * är ett PREFIX: ingen höger-gräns, så svenska
+    // sammansättningar träffar ("bibliotek*" → biblioteksvän/biblioteksälskare,
+    // "författar*" → författarsamtal). Vänster-gränsen behålls alltid
+    // (samma ASCII-lookaround som wordBoundaryPattern) så termen inte
+    // matcher mitt i ett annat ord. Utan * gäller ordgräns på båda sidor.
+    const termRe = term => {
+      if (term.endsWith('*')) {
+        const stem = term.slice(0, -1);
+        const esc = stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp('(?<![' + WORD_CHAR_CLASS + '])' + esc, 'i');
+      }
+      return new RegExp(wordBoundaryPattern(term), 'i');
+    };
     const excludeRe = exclude.map(termRe);
     const orGroupsRe = orGroups.map(group => group.map(termRe));
     return text => {
@@ -7572,7 +7593,13 @@
     [null, 'äventyr, adrenalin', null, 'ENDAST SVENSKA', 'Aktiviteter för den äventyrlige'],
     ['Family+Stage & Film, Family+Exhibitions', null, null, 'Stockholm for Kids', 'Aktiviteter med barn i Stockholm'],
     [null, 'sauna, bastu', null, 'Sauna in Stockholm', 'Bada bastu i Stockholm'],
-    [null, 'läsa, bok, författar', null, 'Find a good read: Bookshops in Stockholm', 'Bibliotek och bokaffärer i Stockholm – hitta läslust'],
+    // Bok-guide-nyckelord (2026-10-07, på begäran): author, reader, bokfestival,
+    // library, bibliotek, författar. Svenskorna slutar med * = PREFIX-matchning
+    // (nytt i buildKeywordTest, samma tillägg) så svenska sammansättningar
+    // träffar: "bibliotek*" → bibliotekskväll/biblioteksälskare, "författar*" →
+    // författare/författarsamtal. Engelska korta ord (author, reader, library)
+    // behåller ordgräns på båda sidor. bokfestival är långt nog för ordgräns.
+    [null, 'author, reader, bokfestival, library, bibliotek*, författar*', null, 'Find a good read: Bookshops in Stockholm', 'Bibliotek och bokaffärer i Stockholm – hitta läslust'],
     [null, 'kräftor, crayfish', null, "It's time for crayfish!", 'Dags för kräftor!'],
     [null, 'vegan, vegetarian, plant-based, växtbaserad', null, 'Plant-based and vegetarian restaurants in Stockholm 2026', 'De bästa veganska och vegetariska restaurangerna i Stockholm 2026'],
     ['Festivals', null, null, 'The biggest Stockholm events', 'De största evenemangen i Stockholm'],
