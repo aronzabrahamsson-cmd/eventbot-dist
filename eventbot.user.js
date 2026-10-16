@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.35
+// @version      7.99.0
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2179,6 +2179,70 @@
     }
   }
 
+  // (2026-10-16) Samma block-mekanik som insertAndFillDateBlock, men väljer
+  // "date span" i streamfield-comboboxen och fyller date_from/date_to. Används
+  // när agenten inte gav tydliga klockslag — ett span med samma start- och
+  // slutdatum fungerar även för enskilda dagar. Fält-id:n följer Wagtails
+  // id_<prefix>-<n>-value-<field>-konvention (date_from/date_to).
+  async function insertAndFillDateSpanBlock({ date_from, date_to }) {
+    const addBtn = findDateAdminAddButton();
+    if (!addBtn) {
+      vlog(`Datum: hittade ingen "lägg till datum"-knapp — hoppar över span ${date_from}–${date_to}.`, 'err');
+      return;
+    }
+    const knownNames = new Set(
+      [...document.querySelectorAll('input[name^="date_admin-"][name$="-value-date_from"]')].map(el => el.name)
+    );
+    addBtn.click();
+    const pickedSpan = await new Promise((resolve) => {
+      let tries = 0;
+      const interval = setInterval(() => {
+        const opts = Array.from(document.querySelectorAll(".w-combobox__option-text"));
+        const spanOpt = opts.find(
+          (el) => /date (span|range)/i.test(el.textContent.trim())
+        );
+        if (spanOpt) {
+          spanOpt.click();
+          clearInterval(interval);
+          resolve(true);
+        } else if (++tries > 50) {
+          clearInterval(interval);
+          resolve(false);
+        }
+      }, 100);
+    });
+    if (!pickedSpan) {
+      vlog(`Datum: valet "Date span"/"Date range" dök aldrig upp i comboboxen (väntade 5s) — spanet ${date_from}–${date_to} kan sakna rätt typ.`, 'err');
+      return;
+    }
+    const filled = await new Promise((resolve) => {
+      let tries = 0;
+      const interval = setInterval(() => {
+        const dateInputs = [...document.querySelectorAll(
+          'input[name^="date_admin-"][name$="-value-date_from"]'
+        )];
+        const fresh = dateInputs.filter(el => !knownNames.has(el.name));
+        const target = fresh.length ? fresh[fresh.length - 1] : null;
+        const nblock = target?.name.match(/^date_admin-(\d+)-value-date_from$/)?.[1];
+        const fromInput = nblock ? document.getElementById(`date_admin-${nblock}-value-date_from`) : null;
+        const toInput = nblock ? document.getElementById(`date_admin-${nblock}-value-date_to`) : null;
+        if (fromInput && toInput) {
+          simulateInput(fromInput, date_from);
+          simulateInput(toInput, date_to || date_from);
+          clearInterval(interval);
+          resolve(nblock);
+        } else if (++tries > 120) {
+          clearInterval(interval);
+          resolve(-1);
+        }
+      }, 100);
+    });
+    if (filled >= 0) {
+      vlog(`Datum-span ifyllt: block ${filled} → ${date_from}–${date_to || date_from}.`, 'ok');
+    } else {
+      vlog(`Datum: hittade inte date_from/date_to-fälten efter 12s — spanet ${date_from}–${date_to} lämnas tomt.`, 'err');
+    }
+  }
   async function fillDateBlocksFromCSV(data) {
     if (data.occurrences && data.occurrences !== "MANUAL_DATES_REQUIRED") {
       const occurrences = data.occurrences.split("|").map((str) => str.trim()).filter(Boolean);
@@ -2190,6 +2254,22 @@
         return keyOf(a).localeCompare(keyOf(b));
       });
       vlog(`Fyller ${occurrences.length} datumtillfälle(n) (kronologiskt, äldst först)…`);
+      // (2026-10-16) Tidslös agentdata: en "single date" med 00:00–00:00 är
+      // meningslös i det publika gränssnittet. Har agenten INTE gett tydliga
+      // klockslag (tomt eller 00:00) läggs tillfället in som ett date span
+      // med samma start- och slutdatum i stället.
+      const hasRealTimes = occurrences.some(occ => {
+        const [, t] = occ.split(";").map((v) => v.trim().replace(/^"|"$/g, ""));
+        return t && t !== "00:00";
+      });
+      if (!hasRealTimes) {
+        vlog('Datum: agenten gav inga tydliga tider — lägger in ' + occurrences.length + ' datum som date span (samma start/slutdatum).', 'ok');
+        for (const occ of occurrences) {
+          const [date] = occ.split(";").map((v) => v.trim().replace(/^"|"$/g, ""));
+          if (date) await insertAndFillDateSpanBlock({ date_from: date, date_to: date });
+        }
+        return;
+      }
       for (const occ of occurrences) {
         const [date, start_time, , end_time] = occ
           .split(";").map((v) => v.trim().replace(/^"|"$/g, ""));
@@ -3175,10 +3255,18 @@
     const uploadTab = await waitFor('#tab-label-upload', 8000);
     if (!uploadTab) { vlog('Bildmodalen dök ej upp.', 'err'); return; }
 
-    // Om ingen pressbild: använd fallback-bilden ur bildbanken via Sök-fliken.
+    // (2026-10-16) Ingen fallback-bild finns längre. Utan pressbild söks
+    // bildbanken i stället på EVENTETS VENUE-NAMN (t.ex. "Kistamässan") —
+    // en bild på platsen är rätt bild även när arrangören inte levererat en.
     if (!imageUrl) {
-      vlog('Ingen pressbild — använder fallback-bild via Sök.');
-      await useFallbackImage();
+      // (2026-10-16) Venue-namnet: agentens schema skiljer sig mellan flöden
+      // (TM: venue_name_sv/en, URL/SBR: venue_name) — sista utvägen läser
+      // det redan ifyllda formulärfältet.
+      const venueForImg = (data.venue_name_sv || data.venue_name_en || data.venue_name ||
+        (document.getElementById('id_venue_name_sv')?.value || '') ||
+        (document.getElementById('id_venue_name_en')?.value || '')).trim();
+      vlog('Ingen pressbild — söker bildbanken på eventets venue-namn i stället.');
+      await useVenueImageSearch(venueForImg);
       return;
     }
 
@@ -3195,6 +3283,8 @@
     );
     if (creditPair.reused) vlog('Kreditrad återanvänd mellan språken: "' + creditPair.credit + '".', 'ok');
     const map = [
+      // (2026-10-16) Bildens engelska titel dupliceras även till svenska
+      // titel-fältet — samma bild tillhör båda språkversionerna.
       [IMG_FIELDS.title,       data.title_sv || data.title_en || ''],
       [IMG_FIELDS.title_sv,    data.title_sv || data.title_en || ''],
       [IMG_FIELDS.description, altSv],
@@ -3227,6 +3317,29 @@
     }
   }
 
+  // (2026-10-16) Söker bildbanken på venue-namnet och väljer första träffen.
+  // Den gamlla "fallback"-sökningen är borttagen — ingen fallback-bild finns.
+  async function useVenueImageSearch(venueName) {
+    if (!venueName || !venueName.trim()) {
+      vlog('Ingen pressbild och inget venue-namn att söka på — välj bild manuellt.', 'err');
+      return;
+    }
+    const searchTab = document.getElementById(IMG_SEARCH_TAB);
+    if (!searchTab) { vlog('Sök-fliken hittades ej.', 'err'); return; }
+    searchTab.click();
+    await new Promise(r => setTimeout(r, 400));
+    let searchInput = document.getElementById(IMG_SEARCH_INPUT) ||
+      document.querySelector('#tab-search input[type="text"], [id^="tab-search"] input[type="text"]');
+    if (!searchInput) { vlog('Bildsök-fältet hittades ej — välj bild manuellt.', 'err'); return; }
+    setNativeValue(searchInput, venueName.trim());
+    vlog('Söker "' + venueName.trim() + '" i bildbanken…');
+    await new Promise(r => setTimeout(r, 1200));
+    const result = document.querySelector(
+      '#tab-search a[class*="image"], #tab-search .chooser__image, #tab-search ul li a, [id^="tab-search"] a[href*="/images/"]'
+    );
+    if (result) { result.click(); vlog('Venue-bild vald ("' + venueName.trim() + '").', 'ok'); }
+    else vlog('Hittade ingen bild på "' + venueName.trim() + '" — välj manuellt.', 'err');
+  }
   // Fallback: växla till Sök-fliken, sök "fallback", välj enda träffen.
   async function useFallbackImage() {
     const searchTab = document.getElementById(IMG_SEARCH_TAB);
@@ -3501,6 +3614,34 @@
     }
   }
 
+  // (2026-10-16) Organizer-namnet ur agentens svar — SBR-formulärets
+  // organizer-fält heter id_organizer (fylls redan av fillFieldsFromData),
+  // men href/text-fälten kräver namnet separat.
+  function sbrOrganizerName(data) {
+    return (data.organizer || data.promoter || '').toString().trim() || '';
+  }
+  // Huvuddomänen från en URL ("https://www.kistamassan.se/evenemang" →
+  // "https://www.kistamassan.se").
+  function homepageFromUrl(u) {
+    try { const p = new URL(u); return p.protocol + '//' + p.hostname; }
+    catch { return ''; }
+  }
+  // Letar right org:s about-us-sida: länkar på event-sidans EGEN domän vars
+  // path matchar vanliga about-mönster. Returnerar absolut URL eller ''.
+  async function findOrganizerAboutUrl(eventUrl) {
+    try {
+      const main = await fetchRawPage(eventUrl);
+      const host = new URL(eventUrl).hostname;
+      const re = /about[-_/]?(us|s)?|om[-_]?oss|om[-_]?us|info|fakta/i;
+      const hit = (main.links || []).find(link => {
+        try {
+          const u = new URL(link);
+          return u.hostname === host && re.test(u.pathname);
+        } catch { return false; }
+      });
+      return hit || '';
+    } catch { return ''; }
+  }
   // ---- Delad efterbearbetning: fotocred, bildrättighet, alt-text, formulär,
   //      forecast, bildautomation, slutstatus. Används av BÅDE createEvent()
   //      (kalenderlistan) och createEventFromUrl() (URL-fliken).
@@ -3586,6 +3727,19 @@
         return;
       }
       vlog('Svaret innehöll ändå en titel — fyller i formuläret, men dubbelkolla extra noga (se flaggan i slutstatusen).', 'err');
+    }
+
+    // (2026-10-16) Organizer href: i första hand organisationens about-us-sida,
+    // i andra hand enbart huvuddomänen. Hittas via huvudsidans länkar — om
+    // agentens egna länkar inte avslöjar det, används huvuddomänen rakt av.
+    // Href-texten blir alltid "[organizer] hemsida/webpage".
+    const orgName = sbrOrganizerName(data);
+    if (orgName) {
+      const srcUrl = (ev.external_website_url || '').trim();
+      const aboutUrl = srcUrl ? await findOrganizerAboutUrl(srcUrl) : '';
+      data.organizer_href = aboutUrl || (data.organizer_website || (srcUrl ? homepageFromUrl(srcUrl) : ''));
+      data.organizer_href_text = orgName + ' hemsida/webpage';
+      vlog('Organizer href satt: "' + data.organizer_href + '" (text: "' + data.organizer_href_text + '").', 'ok');
     }
 
     // Fyll create-formuläret PÅ PLATS i denna flik.
@@ -3745,6 +3899,11 @@
          'måste utläsas ur texten ovan, inklusive occurrences (var extra noggrann — inget facit skriver ' +
          'över dina datum här, så sätt dates_uncertain="true" om du är minsta osäker).\n\n' +
          NO_EMDASH_RULE + '\n\n' +
+         'SPECIALTECKEN: Behåll ALLTID exakta specialtecken och diakriter från källan (ü, é, å, ä, ö, ñ, ç osv.) ' +
+         'i venue-namn, adresser, titlar och organisationsnamn — skriv ALDRIG "Münchenbryggeriet" som ' +
+         '"Munchenbryggeriet" eller "Cirkus" som "Cirkus" med translittererade tecken. Kopiera stavningen rakt av.\n\n' +
+         'ADRESSFÄLT: Fyll i address, zip_code och city så fullständigt som källtexten tillåter — ' +
+         'de lämnas ofta tomma annars. postcode/postnummer står ofta nära venue-namnet i källtexten.\n\n' +
          'Returnera ENBART JSON-objektet enligt ditt schema.')
       : ('EVENT-URL: ' + url + '\n\n' +
          'Scriptet kunde inte hämta sidans text i förväg — du måste läsa URL:en själv. ' +
@@ -3872,9 +4031,9 @@
     .vseh-fetch-h { font-size:11px; font-weight:600; color:var(--vd-txt2); text-transform:uppercase; letter-spacing:.04em; margin-bottom:7px; }
     .vseh-fetch-divider { border-bottom:1px solid var(--vd-line); margin:2px 0 10px; }
     .vseh-url-warn { font-size:11px; font-weight:600; color:#ffcf6b; background:#332a17; border:1px solid #6a5620; border-radius:7px; padding:8px 10px; margin-top:9px; line-height:1.5; }
-    #vseh-url-create { width:100%; background:var(--vd-accent); color:#0d1520; border:none; border-radius:7px; padding:10px; font-size:13px; font-weight:650; cursor:pointer; }
-    #vseh-url-create:hover:not(:disabled) { filter:brightness(1.1); }
-    #vseh-url-create:disabled { background:var(--vd-line); color:var(--vd-txt3); cursor:not-allowed; }
+    #vseh-url-create { width:100%; background:transparent; color:var(--vd-accent); border:1px solid var(--vd-accent); border-radius:7px; padding:10px; font-size:13px; font-weight:650; cursor:pointer; }
+    #vseh-url-create:hover:not(:disabled) { background:var(--vd-accent); color:#0d1520; }
+    #vseh-url-create:disabled { border-color:var(--vd-line); color:var(--vd-txt3); cursor:not-allowed; opacity:.7; }
     #vseh-url-copyjson { width:100%; background:var(--vd-bg2); border:1px solid var(--vd-line); color:var(--vd-txt); border-radius:7px; padding:8px; font-size:12px; font-weight:600; cursor:pointer; }
     #vseh-url-copyjson:hover { background:var(--vd-bg3); }
     .vseh-fetch-line { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
@@ -4386,6 +4545,11 @@
             <button type="button" id="sbr-crm-export">📤 Exportera</button>
             <button type="button" id="sbr-crm-clear">🗑 Rensa</button>
           </div>
+          <div class="vseh-fetch-line" style="margin-top:10px;">
+            <button type="button" id="sbr-crm-visitcal-btn">Hämta Visit-kalendern</button>
+            <span class="vseh-fetch-ts" id="sbr-crm-visitcal-ts">ej hämtad</span>
+          </div>
+          <div class="vseh-hint" style="margin-bottom:6px;">Samma kalendercache som MAIN/DRAFT-vyerna (CACHE_CAL) — hämtas här, i MAIN eller i DRAFT, gäller överallt.</div>
           <div id="vseh-filters" style="margin-top:10px;">
             <button type="button" class="crm-f active" data-f="all">Alla (<span id="crm-count-all">0</span>)</button>
             <button type="button" class="crm-f" data-f="in_visit">Visit (<span id="crm-count-in_visit">0</span>)</button>
@@ -4519,6 +4683,27 @@
     $('sbr-cal-fetch').addEventListener('click', fetchVisibleSbrEvents);
 
     // ---- CRM-import ----
+    // (2026-10-16) Visit-kalendern kan hämtas direkt i SBR-vyn och delar
+    // cache (CACHE_CAL) + tidsstämpel med MAIN/DRAFT — hämtad var som helst
+    // gäller här också. Hydrerar först från cache, sen manuell hämtning.
+    if (!dedupIndex) loadCache();
+    { const ts = GM_getValue('vs_fetched_ts', 0); const el = $('sbr-crm-visitcal-ts');
+      if (el) el.textContent = ts ? fmtStamp(ts) : 'ej hämtad'; }
+    $('sbr-crm-visitcal-btn').addEventListener('click', async () => {
+      const btn = $('sbr-crm-visitcal-btn');
+      btn.disabled = true;
+      try {
+        const rows = await buildDedupIndex(m => vlog(m), null);
+        dedupIndex = buildIndexFromRows(rows);
+        GM_setValue('vs_fetched_ts', Date.now());
+        saveCache();
+        { const el = $('sbr-crm-visitcal-ts'); if (el) el.textContent = fmtStamp(Date.now()); }
+        vlog('SBR: Visit-kalendern laddad — ' + rows.length + ' rader.', 'ok');
+        matchCrmEvents(); renderCrmEvents();
+      } catch (e) {
+        vlog('SBR: Visit-kalenderhämtning misslyckades — ' + e.message + ' (byggDedupIndex läser location.origin, som på SBR-domänen saknar API:t — hämta i MAIN/DRAFT om felet kvarstår).', 'err');
+      } finally { btn.disabled = false; }
+    });
     loadSbrCrmEvents();
     loadCrmHandled();
     pullAndMergeCrmHandled().then(renderCrmEvents).catch(() => {});
@@ -4967,13 +5152,26 @@
       ev.status = null;
       if (ev.end_date && ev.end_date < today) { ev.status = 'passed'; return; }
 
+      // (2026-10-16) Samma matchparametrar som MAIN/DRAFT-vyerna (matchStatus):
+      // SIM_THRESHOLD 0.5-titel + VENUE_THRESHOLD 0.5-plats i huvudgrenen,
+      // striktare trösklar när utkastet/platsen saknar data, exakt datumsync.
       let inVisit = false;
       if (dedupIndex && dedupIndex.rows) {
-        for (const row of dedupIndex.rows) {
+        const cand = new Set();
+        new Set(tokens(ev.title)).forEach(tok => {
+          const s = dedupIndex.byToken.get(tok);
+          if (s) s.forEach(i => cand.add(i));
+        });
+        const evHasPlace = !!normText(ev.venue);
+        for (const i of cand) {
+          const row = dedupIndex.rows[i];
+          if (isDismissed({ title: ev.title, venue_name: ev.venue, address: '' }, row)) continue;
           const tSim = titleSim(ev.title, row.title);
           const vSim = placeSim(ev.venue, '', row.venue_name, row.address);
-          if (tSim >= 0.75 && vSim >= 0.7 &&
-              crmDatesOverlap(ev.start_date, ev.end_date, row.start, row.end || row.start)) {
+          const match = evHasPlace
+            ? (tSim >= SIM_THRESHOLD && vSim >= VENUE_THRESHOLD)
+            : (tSim >= NO_PLACE_TITLE_THRESHOLD);
+          if (match && crmDatesOverlap(ev.start_date, ev.end_date, row.start, row.end || row.start)) {
             inVisit = true; break;
           }
         }
@@ -8366,6 +8564,16 @@
   let statusAutoPublished = false;
   function autoPublishStatus() {
     if (statusAutoPublished) return;
+    // SBR-läget (2026-10-16): statusfältet lämnas ALDRIG ifyllt av automatiken —
+    // eventet ska stanna på "Utkast" tills redaktören granskat det och själv
+    // väljer Publicerad. (Inget autospar finns; tvingade automatiken tidigare
+    // fältet till Publicerad, vilket publicerade ogranskat material så fort
+    // redaktören sparade.)
+    if (location.hostname === 'www.stockholmbusinessregion.se') {
+      statusAutoPublished = true;
+      vlog('SBR-läge: statusfältet lämnas på "Utkast" — publicering sker manuellt efter granskning.', 'ok');
+      return;
+    }
     const el = document.getElementById('id_status');
     if (!el || el.tagName !== 'SELECT') return;
     const target = [...el.options].find(o => /publ/i.test(o.textContent));
