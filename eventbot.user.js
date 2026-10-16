@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.98.34
+// @version      7.98.35
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1426,9 +1426,22 @@
     // IDENTISK titel (inte bara lik) är det snarare ett tecken på en äkta
     // dubblett än en översättning, så då flaggas paret ändå (t.ex. Opus13:
     // två rader med bokstavligen samma engelska titel, ingen svensk motpart).
+    // Utökat 2026-10-15, på begäran: ett 2-posters kluster med titlar där den
+    // ena (efter normalisering) ÄR en DELSTRÄNG av den andra flaggas också —
+    // det är mönstret för en äkta dubblett där den ena rubriken är den andra
+    // + extra ord (bekräftat fall: "HALLOWEEN PARTY – The Nightmare on
+    // Brunkebergstorg" vs "The Nightmare on Brunkebergstorg", samma
+    // adress+datum, hoppades över av den gamla regeln). Ett ÄKT språkpar
+    // (sv/en) delar sällan delsträng efter normalisering ("lucia in stockholm"
+    // innehåller inte "lucia i stockholm"), så falska positiver är osannolika.
+    const normTitle = t => normText(t);
     mergedByRoot.forEach(g => {
       if (g.length >= 3) { groups.push(g); return; }
-      if (g.length === 2 && normText(g[0].title) === normText(g[1].title)) groups.push(g);
+      if (g.length === 2) {
+        const na = normTitle(g[0].title), nb = normTitle(g[1].title);
+        if (na === nb) { groups.push(g); return; }
+        if (na && nb && (na.includes(nb) || nb.includes(na))) groups.push(g);
+      }
     });
 
     // Störst grupp först (flest övertaliga poster = mest misstänkt)
