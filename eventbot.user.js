@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.99.7
+// @version      7.99.8
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2274,30 +2274,34 @@
       vlog(`Datum: inget span-alternativ dök upp i comboboxen (väntade 5s) — spanet ${date_from}–${date_to} kan sakna rätt typ.`, 'err');
       return;
     }
-    // Fältnamnen för spann skiljer sig mellan Wagtail-mallar (date_from/
-    // date_to, start_date/end_date, from/to …). Vi väntar på ALLA nya
-    // date_admin-inputs i det nya blocket och klassificerar dem efter
-    // namnsuffix — och loggar de faktiska namnen om inget mönster träffar,
-    // så nästa rättning blir en enradsändring (2026-10-19).
+    // Fältnamn bekräftade via formkartläggning 2026-10-19 (SBR):
+    // date_admin-N-value-start_date / date_admin-N-value-end_date, blocktyp
+    // "date_range". Viktiga lärdomar: (a) det dolda räknarfältet
+    // date_admin-count dök upp som första "nya" fältet efter lägg-till-
+    // klicket och bröt den tidigare blocknummers-extraktionen — därför
+    // filtrerar vi nu BORT allt som inte matchar date_admin-<siffra>-value-;
+    // (b) alternativ-suffix (date_from/date_to etc.) behålls som reserv för
+    // andra Wagtail-mallar.
     const filled = await new Promise((resolve) => {
       let tries = 0;
       const interval = setInterval(() => {
         const allDateInputs = [...document.querySelectorAll('input[name^="date_admin-"]')];
-        const fresh = allDateInputs.filter(el => !knownNames.has(el.name));
+        const fresh = allDateInputs.filter(el =>
+          !knownNames.has(el.name) && /^date_admin-\d+-value-/.test(el.name));
         if (fresh.length) {
-          const nblock = fresh[0].name.match(/^date_admin-(\d+)-/)?.[1];
+          const nblock = fresh[0].name.match(/^date_admin-(\d+)-value-/)?.[1];
           const blockInputs = nblock
             ? [...document.querySelectorAll(`input[id^="date_admin-${nblock}-value-"]`)]
             : [];
           const bySuffix = re => blockInputs.find(el => re.test(el.name));
-          const fromInput = bySuffix(/-value-(date_from|start_date|from|date)$/) || bySuffix(/-value-date$/);
-          const toInput = bySuffix(/-value-(date_to|end_date|to)$/) || bySuffix(/-value-(date_to|end_date|to)$/);
+          const fromInput = bySuffix(/-value-(start_date|date_from|from|date)$/) || bySuffix(/-value-date$/);
+          const toInput = bySuffix(/-value-(end_date|date_to|to)$/);
           if (fromInput && toInput && fromInput !== toInput) {
             simulateInput(fromInput, date_from);
             simulateInput(toInput, date_to || date_from);
             clearInterval(interval);
             resolve(nblock);
-          } else if (fromInput && !toInput && !/(date_to|end_date|to)/.test(blockInputs.map(el => el.name).join('|'))) {
+          } else if (fromInput && !toInput && !/(end_date|date_to|to)/.test(blockInputs.map(el => el.name).join('|'))) {
             // Endast ETT datumfält i blocket — troligen inget spann- utan
             // ett single date-block trots combobox-valet. Fyll det och varna.
             simulateInput(fromInput, date_from);
@@ -2310,7 +2314,7 @@
             resolve(-1);
           }
         } else if (++tries > 120) {
-          vlog('Datum-span: inga nya date_admin-fält dök upp efter 12s.', 'err');
+          vlog('Datum-span: inga nya date_admin-value-fält dök upp efter 12s.', 'err');
           clearInterval(interval);
           resolve(-1);
         }
@@ -3815,10 +3819,25 @@
         o.split('/').some(part => v.includes(normVenueOpt(part)));
     });
     if (!hit) { vlog('Venue-rullgardin: "' + venueText + '" matchar ingen av de ' + SBR_VENUE_OPTIONS.length + ' stora SBR-lokalerna — lämnas orört.', 'ok'); return; }
-    const opt = [...sel.options].find(o => normVenueOpt(o.textContent) === normVenueOpt(hit) || normVenueOpt(o.value) === normVenueOpt(hit));
-    if (!opt) { vlog('Venue-rullgardin: matchade "' + hit + '" men alternativet finns inte i listan.', 'err'); return; }
+    // Exakt match först, sen fuzzy (alternativet innehåller matchningen
+    // eller vice versa) — rullgardinens alternativ stavas inte alltid
+    // exakt som listan (2026-10-19: "Stockholmsmässan" fanns som alternativ
+    // men med annan exakt stavning). Vid miss loggas listans alternativ.
+    let opt = [...sel.options].find(o => normVenueOpt(o.textContent) === normVenueOpt(hit) || normVenueOpt(o.value) === normVenueOpt(hit));
+    if (!opt) {
+      opt = [...sel.options].find(o => {
+        const t = normVenueOpt(o.textContent), v = normVenueOpt(o.value), h = normVenueOpt(hit);
+        return (t && (t.includes(h) || h.includes(t))) || (v && (v.includes(h) || h.includes(v)));
+      });
+      if (opt) vlog('Venue-rullgardin: exakt träff saknades — fuzzy-matchade "' + hit + '" mot alternativet "' + opt.textContent.trim() + '".', 'ok');
+    }
+    if (!opt) {
+      vlog('Venue-rullgardin: matchade "' + hit + '" men inget alternativ i listan matchar. Alternativ som finns: ' +
+        [...sel.options].map(o => '"' + o.textContent.trim() + '"').slice(0, 15).join(', '), 'err');
+      return;
+    }
     simulateInput(sel, opt.value);
-    vlog('Venue-rullgardin: valde "' + hit + '" (match mot "' + venueText + '").', 'ok');
+    vlog('Venue-rullgardin: valde "' + opt.textContent.trim() + '" (match mot "' + venueText + '").', 'ok');
   }
   // (2026-10-16) Organizer-namnet ur agentens svar — SBR-formulärets
   // organizer-fält heter id_organizer (fylls redan av fillFieldsFromData),
