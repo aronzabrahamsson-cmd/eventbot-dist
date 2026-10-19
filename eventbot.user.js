@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.99.3
+// @version      7.99.4
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -174,8 +174,25 @@
     try { vlog('JS-FEL: ' + (e.message || e.error) + ' @ ' + (e.filename||'').split('/').pop() + ':' + e.lineno, 'err'); } catch {}
   });
   window.addEventListener('unhandledrejection', e => {
-    try { vlog('PROMISE-FEL: ' + (e.reason && (e.reason.message || e.reason)), 'err'); } catch {}
+    try {
+      const msg = String(e.reason && (e.reason.message || e.reason) || '');
+      // (2026-10-19) "Could not establish connection" (död GM-brygga) är
+      // känd, har egen fetch-reserv i gmPost/gmGet och spammade loggen
+      // med identiska rader. Loggas EN gång per minut i stället.
+      if (/Could not establish connection/i.test(msg)) {
+        const now = Date.now();
+        gmConnErrLast = gmConnErrLast || 0;
+        gmConnErrCount = (gmConnErrCount || 0) + 1;
+        if (now - gmConnErrLast < 60000) return;
+        gmConnErrLast = now;
+        vlog('PROMISE-FEL (dämpad, ' + gmConnErrCount + ' st sen senaste loggen — GM-bryggan sover, fetch-reserven används): ' + msg, 'err');
+        gmConnErrCount = 0;
+        return;
+      }
+      vlog('PROMISE-FEL: ' + msg, 'err');
+    } catch {}
   });
+  let gmConnErrLast = 0, gmConnErrCount = 0;
 
   // Läses från userscript-metadatan (GM_info) istället för att hårdkodas här,
   // så den aldrig kan halka efter @version-raden i huvudet ovan.
@@ -3321,7 +3338,14 @@
 
     // 2) Vänta på modalen
     const uploadTab = await waitFor('#tab-label-upload', 8000);
-    if (!uploadTab) { vlog('Bildmodalen dök ej upp.', 'err'); return; }
+    if (!uploadTab) {
+      vlog('Bildmodalen dök ej upp.', 'err');
+      // (2026-10-19) Robusthet: en halvöppnad modal/backdrop (den grå "hinnan")
+      // kan annars ligga kvar och låsa sidan om bildmodulen redan var öppen
+      // eller knappen klickades mitt i annat. Stäng allt vi kan hitta.
+      cleanupStuckChooserModals();
+      return;
+    }
 
     // (2026-10-16) Ingen fallback-bild finns längre. Utan pressbild söks
     // bildbanken i stället på EVENTETS VENUE-NAMN (t.ex. "Kistamässan") —
@@ -3385,6 +3409,21 @@
     }
   }
 
+  // (2026-10-19) Robusthet: stänger kvarlämnade chooser-modaler/backdrops
+  // efter en misslyckad bildautomation — Esc + Wagtails egna stäng-knappar
+  // + ev. kvarbliven .modal-backdrop tas bort, så sidan inte låser sig bakom
+  // den grå hinnan.
+  function cleanupStuckChooserModals() {
+    try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true })); } catch {}
+    [...document.querySelectorAll('.modal-header .close, [data-modal-close], button[aria-label="Close"], .c-modal__close')]
+      .forEach(b => { try { b.click(); } catch {} });
+    document.querySelectorAll('.modal-backdrop, .ChooserModal-backdrop, .overlay-active')
+      .forEach(el => { try { el.remove(); } catch {} });
+    document.body.classList.remove('modal-open');
+    document.body.style.removeProperty('overflow');
+    document.body.style.removeProperty('padding-right');
+    vlog('Bildautomation: städade ev. kvarlämnad modal/backdrop (Esc + stäng-knappar).', 'ok');
+  }
   // (2026-10-16) Söker bildbanken på venue-namnet och väljer första träffen.
   // Den gamlla "fallback"-sökningen är borttagen — ingen fallback-bild finns.
   async function useVenueImageSearch(venueName) {
@@ -3682,11 +3721,47 @@
     }
   }
 
+  // (2026-10-19) SBR:s Venue-rullgardin: matchar eventets venue-namn (från
+  // agenten eller redan ifyllda fält) mot de stora SBR-lokalerna. Fältet
+  // hittas robust: först id_venue (Wagtail-konvention), annars den select
+  // vars omgivande etikett/overskrift innehåller "Venue". Matchningen är
+  // normaliserad (gemener, diakriter behålls men "3Arena" == "3arena").
+  const SBR_VENUE_OPTIONS = [
+    '3Arena', 'Avicii Arena', 'Kistamässan', 'Münchenbryggeriet',
+    'Stockholm Chamber of Commerce / Stockholms Handelskammare',
+    'Stockholmsmässan', 'Stockholm Waterfront'
+  ];
+  const normVenueOpt = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  async function selectSbrVenueDropdown(data) {
+    const sel = document.getElementById('id_venue') ||
+      [...document.querySelectorAll('select')].find(s => {
+        const scope = s.closest('li, fieldset, div');
+        return scope && /\bvenue\b/i.test(scope.textContent || '');
+      });
+    if (!sel) { vlog('Venue-rullgardin: hittade inget Venue-select-fält på sidan.', 'err'); return; }
+    const venueText = (data.venue_name_sv || data.venue_name_en || data.venue_name ||
+      (document.getElementById('id_venue_name_sv')?.value || '') ||
+      (document.getElementById('id_venue_name_en')?.value || '')).toString();
+    const v = normVenueOpt(venueText);
+    if (!v) { vlog('Venue-rullgardin: inget venue-namn att matcha mot.', 'err'); return; }
+    const hit = SBR_VENUE_OPTIONS.find(opt => {
+      const o = normVenueOpt(opt);
+      return v.includes(o) || o.includes(v) ||
+        o.split('/').some(part => v.includes(normVenueOpt(part)));
+    });
+    if (!hit) { vlog('Venue-rullgardin: "' + venueText + '" matchar ingen av de ' + SBR_VENUE_OPTIONS.length + ' stora SBR-lokalerna — lämnas orört.', 'ok'); return; }
+    const opt = [...sel.options].find(o => normVenueOpt(o.textContent) === normVenueOpt(hit) || normVenueOpt(o.value) === normVenueOpt(hit));
+    if (!opt) { vlog('Venue-rullgardin: matchade "' + hit + '" men alternativet finns inte i listan.', 'err'); return; }
+    simulateInput(sel, opt.value);
+    vlog('Venue-rullgardin: valde "' + hit + '" (match mot "' + venueText + '").', 'ok');
+  }
   // (2026-10-16) Organizer-namnet ur agentens svar — SBR-formulärets
   // organizer-fält heter id_organizer (fylls redan av fillFieldsFromData),
   // men href/text-fälten kräver namnet separat.
   function sbrOrganizerName(data) {
-    return (data.organizer || data.promoter || '').toString().trim() || '';
+    // (2026-10-19) Agentens schema heter organizer_name (bekräftat via
+    // rådata-logg) — organizer/promoter är äldre namn som behålls som reserv.
+    return (data.organizer_name || data.organizer || data.promoter || '').toString().trim() || '';
   }
   // Huvuddomänen från en URL ("https://www.kistamassan.se/evenemang" →
   // "https://www.kistamassan.se").
@@ -3806,8 +3881,18 @@
       const srcUrl = (ev.external_website_url || '').trim();
       const aboutUrl = srcUrl ? await findOrganizerAboutUrl(srcUrl) : '';
       data.organizer_href = aboutUrl || (data.organizer_website || (srcUrl ? homepageFromUrl(srcUrl) : ''));
-      data.organizer_href_text = orgName + ' hemsida/webpage';
+      // (2026-10-19, på begäran) Fast format: "Om [Organizer] / About the Organizer"
+      data.organizer_href_text = 'Om ' + orgName + ' / About the Organizer';
       vlog('Organizer href satt: "' + data.organizer_href + '" (text: "' + data.organizer_href_text + '").', 'ok');
+    }
+
+    // (2026-10-19, på begäran) SBR:s "Venue"-rullgardin (under Location):
+    // hålls eventet på en av de stora SBR-lokalerna väljs den i listan
+    // i stället för att lämnas tom — venue_name-fälten beskriver salen
+    // (t.ex. "Spegelsalen, Grand Hôtel") medan rullgardinen anger platsen.
+    if (location.hostname === 'www.stockholmbusinessregion.se') {
+      try { await selectSbrVenueDropdown(data); }
+      catch (e) { vlog('Venue-rullgardin: ' + e.message + ' (fältet lämnas orört).', 'err'); }
     }
 
     // Fyll create-formuläret PÅ PLATS i denna flik.
@@ -8547,6 +8632,11 @@
   let autoScrolledAfterGuideTagging = false;
   async function runGuideTagRules() {
     if (guideTagRulesRunning) return;
+    // (2026-10-19, på begäran) SBR:s formulär har inget related_guides-fält —
+    // guide-reglerna (däribland Afternoon Tea) ska INTE köras där, bara i
+    // Visit-widgets. Tidigare loggades t.ex. "GuideRegel #13 (Afternoon
+    // Tea): inga villkor angivna" på SBR-sidor trots att fältet saknas.
+    if (location.hostname === 'www.stockholmbusinessregion.se') return;
     guideTagRulesRunning = true;
     try {
       const ctx = buildGuideTagContext();
