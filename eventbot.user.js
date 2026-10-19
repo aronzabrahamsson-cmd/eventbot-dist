@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.99.8
+// @version      7.99.9
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3808,6 +3808,11 @@
         return scope && /\bvenue\b/i.test(scope.textContent || '');
       });
     if (!sel) { vlog('Venue-rullgardin: hittade inget Venue-select-fält på sidan.', 'err'); return; }
+    // (2026-10-19, på begäran) Logga alltid rullgardinens alternativ vid
+    // varje matchningsförsök — underlaget gör att listan SBR_VENUE_OPTIONS
+    // kan hållas korrekt mot det som faktiskt finns i CMS.
+    vlog('Venue-rullgardin: alternativ i listan: ' +
+      [...sel.options].map(o => '"' + o.textContent.trim() + '"').join(', '));
     const venueText = (data.venue_name_sv || data.venue_name_en || data.venue_name ||
       (document.getElementById('id_venue_name_sv')?.value || '') ||
       (document.getElementById('id_venue_name_en')?.value || '')).toString();
