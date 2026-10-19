@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.99.2
+// @version      7.99.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3032,7 +3032,7 @@
     }
     throw new Error('Ingen bild i urklippet — ta en skärmdump först (Win+Shift+S)');
   }
-  function ensureClipboardImageButton(fileInput) {
+  function ensureClipboardImageButton(fileInput, autofillFn) {
     if (!fileInput || fileInput.dataset.vsehClipBtnWired) return;
     fileInput.dataset.vsehClipBtnWired = '1';
     const btn = document.createElement('button');
@@ -3045,6 +3045,21 @@
       try {
         await injectClipboardImageInto(fileInput);
         btn.textContent = '✓ Skärmdump inlagd';
+        // (2026-10-16, på begäran) Trigga Mistral-bildifyllningen automatiskt
+        // direkt efter skärmdumpen — samma anrop som 🤖-knappen, med den
+        // nyss injicerade filen som source. Respektive vy skickar in sin egen
+        // autofill-funktion (fälten skiljer sig mellan vyerna).
+        if (typeof autofillFn === 'function') {
+          btn.textContent = 'Anropar Mistral…';
+          try {
+            const file = fileInput.files && fileInput.files[0];
+            if (file) await autofillFn({ file });
+            btn.textContent = '✓ Skärmdump + ifyllt';
+          } catch (e) {
+            vlog('Skärmdump: auto-ifyllning gav fel (skärmdumpen ligger kvar i fältet) — ' + e.message, 'err');
+            btn.textContent = 'Ifyllning misslyckades';
+          }
+        }
       } catch (e) {
         vlog('Skärmdump-knappen: ' + e.message, 'err');
         btn.textContent = 'Fel — se logg';
@@ -3061,7 +3076,7 @@
   // under samma sidladdning (ett nytt filfält = ingen dataset-flagga än).
   function ensureManualImageUploadButton() {
     const fileInput = document.getElementById(IMG_FIELDS.file);
-    ensureClipboardImageButton(fileInput);   // 🖼️ Senaste skärmdump (2026-10-16)
+    ensureClipboardImageButton(fileInput, autoFillManualImageUpload);   // 🖼️ Senaste skärmdump → auto-Mistral (2026-10-16)
     if (!fileInput || fileInput.dataset.vsehAutofillWired) return;
     fileInput.dataset.vsehAutofillWired = '1';
     const btn = document.createElement('button');
@@ -3154,7 +3169,7 @@
   }
   function ensureSbrImagePageButton() {
     const fileInput = document.getElementById(SBR_IMG_FIELDS.file);
-    ensureClipboardImageButton(fileInput);   // 🖼️ Senaste skärmdump (2026-10-16)
+    ensureClipboardImageButton(fileInput, autoFillSbrImagePage);   // 🖼️ Senaste skärmdump → auto-Mistral (2026-10-16)
     if (!fileInput || fileInput.dataset.vsehAutofillWired) return;
     fileInput.dataset.vsehAutofillWired = '1';
     const btn = document.createElement('button');
@@ -3257,7 +3272,7 @@
   }
   function ensureVsImagePageButton() {
     const fileInput = document.getElementById(VS_IMG_FIELDS.file);
-    ensureClipboardImageButton(fileInput);   // 🖼️ Senaste skärmdump (2026-10-16)
+    ensureClipboardImageButton(fileInput, autoFillVsImagePage);   // 🖼️ Senaste skärmdump → auto-Mistral (2026-10-16)
     if (!fileInput || fileInput.dataset.vsehAutofillWired) return;
     fileInput.dataset.vsehAutofillWired = '1';
     const btn = document.createElement('button');
