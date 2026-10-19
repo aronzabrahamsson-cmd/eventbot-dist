@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.99.6
+// @version      7.99.7
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2255,39 +2255,62 @@
       const interval = setInterval(() => {
         const opts = Array.from(document.querySelectorAll(".w-combobox__option-text"));
         const spanOpt = opts.find(
-          (el) => /date (span|range)/i.test(el.textContent.trim())
+          (el) => /date\s*(span|range)|datumspann|span\b/i.test(el.textContent.trim())
         );
         if (spanOpt) {
           spanOpt.click();
           clearInterval(interval);
           resolve(true);
         } else if (++tries > 50) {
+          // Logga comboboxens faktiska alternativ så ett felaktigt mönster
+          // kan rättas direkt ur loggen (2026-10-19).
+          vlog('Datum-span: combobox-alternativ som fanns: ' + (opts.map(o => '"' + o.textContent.trim() + '"').join(', ') || '(inga)'), 'err');
           clearInterval(interval);
           resolve(false);
         }
       }, 100);
     });
     if (!pickedSpan) {
-      vlog(`Datum: valet "Date span"/"Date range" dök aldrig upp i comboboxen (väntade 5s) — spanet ${date_from}–${date_to} kan sakna rätt typ.`, 'err');
+      vlog(`Datum: inget span-alternativ dök upp i comboboxen (väntade 5s) — spanet ${date_from}–${date_to} kan sakna rätt typ.`, 'err');
       return;
     }
+    // Fältnamnen för spann skiljer sig mellan Wagtail-mallar (date_from/
+    // date_to, start_date/end_date, from/to …). Vi väntar på ALLA nya
+    // date_admin-inputs i det nya blocket och klassificerar dem efter
+    // namnsuffix — och loggar de faktiska namnen om inget mönster träffar,
+    // så nästa rättning blir en enradsändring (2026-10-19).
     const filled = await new Promise((resolve) => {
       let tries = 0;
       const interval = setInterval(() => {
-        const dateInputs = [...document.querySelectorAll(
-          'input[name^="date_admin-"][name$="-value-date_from"]'
-        )];
-        const fresh = dateInputs.filter(el => !knownNames.has(el.name));
-        const target = fresh.length ? fresh[fresh.length - 1] : null;
-        const nblock = target?.name.match(/^date_admin-(\d+)-value-date_from$/)?.[1];
-        const fromInput = nblock ? document.getElementById(`date_admin-${nblock}-value-date_from`) : null;
-        const toInput = nblock ? document.getElementById(`date_admin-${nblock}-value-date_to`) : null;
-        if (fromInput && toInput) {
-          simulateInput(fromInput, date_from);
-          simulateInput(toInput, date_to || date_from);
-          clearInterval(interval);
-          resolve(nblock);
+        const allDateInputs = [...document.querySelectorAll('input[name^="date_admin-"]')];
+        const fresh = allDateInputs.filter(el => !knownNames.has(el.name));
+        if (fresh.length) {
+          const nblock = fresh[0].name.match(/^date_admin-(\d+)-/)?.[1];
+          const blockInputs = nblock
+            ? [...document.querySelectorAll(`input[id^="date_admin-${nblock}-value-"]`)]
+            : [];
+          const bySuffix = re => blockInputs.find(el => re.test(el.name));
+          const fromInput = bySuffix(/-value-(date_from|start_date|from|date)$/) || bySuffix(/-value-date$/);
+          const toInput = bySuffix(/-value-(date_to|end_date|to)$/) || bySuffix(/-value-(date_to|end_date|to)$/);
+          if (fromInput && toInput && fromInput !== toInput) {
+            simulateInput(fromInput, date_from);
+            simulateInput(toInput, date_to || date_from);
+            clearInterval(interval);
+            resolve(nblock);
+          } else if (fromInput && !toInput && !/(date_to|end_date|to)/.test(blockInputs.map(el => el.name).join('|'))) {
+            // Endast ETT datumfält i blocket — troligen inget spann- utan
+            // ett single date-block trots combobox-valet. Fyll det och varna.
+            simulateInput(fromInput, date_from);
+            vlog(`Datum-span: blocket hade bara ett datumfält (${fromInput.name}) — fyllde startdatum ${date_from}. Slutdatum ${date_to || date_from} måste läggas in manuellt.`, 'err');
+            clearInterval(interval);
+            resolve(nblock);
+          } else if (++tries > 120) {
+            vlog('Datum-span: blockets fält hittades inte — fältnamn i blocket: ' + (blockInputs.map(el => el.name).join(', ') || '(inga date_admin-fält alls)'), 'err');
+            clearInterval(interval);
+            resolve(-1);
+          }
         } else if (++tries > 120) {
+          vlog('Datum-span: inga nya date_admin-fält dök upp efter 12s.', 'err');
           clearInterval(interval);
           resolve(-1);
         }
@@ -2296,7 +2319,7 @@
     if (filled >= 0) {
       vlog(`Datum-span ifyllt: block ${filled} → ${date_from}–${date_to || date_from}.`, 'ok');
     } else {
-      vlog(`Datum: hittade inte date_from/date_to-fälten efter 12s — spanet ${date_from}–${date_to} lämnas tomt.`, 'err');
+      vlog(`Datum: kunde inte fylla spanet ${date_from}–${date_to} — lägg in manuellt.`, 'err');
     }
   }
   async function fillDateBlocksFromCSV(data) {
@@ -2319,10 +2342,13 @@
         return t && t !== "00:00";
       });
       if (!hasRealTimes) {
-        vlog('Datum: agenten gav inga tydliga tider — lägger in ' + occurrences.length + ' datum som date span (samma start/slutdatum).', 'ok');
+        vlog('Datum: agenten gav inga tydliga tider — lägger in ' + occurrences.length + ' datum som date span.', 'ok');
         for (const occ of occurrences) {
-          const [date] = occ.split(";").map((v) => v.trim().replace(/^"|"$/g, ""));
-          if (date) await insertAndFillDateSpanBlock({ date_from: date, date_to: date });
+          // Occurrences-formatet är start;start_tid;SLUTDATUM;sluttid — den
+          // tredje delen är slutdatum (agenten kan alltså leverera ett FLER-
+          // DAGARSSPANN i EN occurrence, t.ex. "2026-11-18;00:00;2026-11-20;00:00").
+          const [date, , endDate] = occ.split(";").map((v) => v.trim().replace(/^"|"$/g, ""));
+          if (date) await insertAndFillDateSpanBlock({ date_from: date, date_to: endDate || date });
         }
         return;
       }
@@ -3923,6 +3949,23 @@
       // (2026-10-19, på begäran) Fast format: "Om [Organizer] / About the Organizer"
       data.organizer_href_text = 'Om ' + orgName + ' / About the Organizer';
       vlog('Organizer href satt: "' + data.organizer_href + '" (text: "' + data.organizer_href_text + '").', 'ok');
+    }
+
+    // (2026-10-19, på begäran) Hybrid/digital-detektering: agenten svarar
+    // ofta is_digital="false" även för hybrid-event (bekräftat: ESCAIDE
+    // 2026, "hybrid event" i beskrivningen men false i svaret). Scriptet
+    // söker därför självt i titel/beskrivning/venue efter digitala signaler
+    // och skriver över is_digital till true i så fall — endast uppåt, aldrig
+    // ner (ett fysiskt event pårörs inte).
+    if (location.hostname === 'www.stockholmbusinessregion.se') {
+      const digitalSignals = /hybrid|online|virtuell|webinar|livestream|live stream|digitalt event|digital event|distans/i;
+      const scanText = [data.title_en, data.title_sv, data.description_en, data.description_sv,
+        data.venue_name_en, data.venue_name_sv, data.event_type].filter(Boolean).join(' ');
+      if (digitalSignals.test(scanText) && String(data.is_digital || '').toLowerCase() !== 'true') {
+        const agentSaid = String(data.is_digital || '(tomt)');
+        data.is_digital = 'true';
+        vlog('Hybrid/digital-detektering: hittade digital signal i texten — is_digital satt till true (agenten svarade "' + agentSaid + '" i rådata).', 'ok');
+      }
     }
 
     // (2026-10-19, på begäran) SBR:s "Venue"-rullgardin (under Location):
