@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.99.4
+// @version      7.99.5
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -355,6 +355,21 @@
     return obj;
   }
 
+  // (2026-10-19) GM-bryggans hälsostatus: när hanterarens bakgrundssida är
+  // död ("Could not establish connection") gör VARJE GM-anrop en hel
+  // 6-försöks-retry-cykel I HANTERAREN (där vi inte kan påverka loggningen)
+  // innan vi ens når vår egen onerror — det är därför konsolen spammades
+  // med "Uncaught (in promise)"-fel i hundratalet trots att fetch-reserven
+  // alltid räddade situationen. Efter det första konstaterade felet hoppas
+  // GM-lagret över HELT i 2 minuter (brygganTestasEfter), och efter det
+  // testas den igen med ett enda snabbt ping-anrop. Återhämtar sig hanteraren
+  // (omstart/ wakeup) märks det direkt; annars är kostnaden ett försök/2 min.
+  let gmBridgeDeadUntil = 0;
+  function gmBridgeIsDead() { return Date.now() < gmBridgeDeadUntil; }
+  function markGmBridgeDead() {
+    if (gmBridgeDeadUntil < Date.now() + 110000) gmBridgeDeadUntil = Date.now() + 120000;
+    try { console.log('VSEH: GM-bryggan svarar inte — använder fetch-reserv direkt i 2 min (hanterarens bakgrundssida sover).'); } catch {}
+  }
   // Skyddsnät för userscript-hanterare som inte respekterar timeout (t.ex.
   // SBR-bot saknar AbortController): own watchdog via Promise.race.
   function withTimeout(promiseFactory, ms, label) {
@@ -385,7 +400,14 @@
     try { return await resp.json(); } catch { throw new Error('Ogiltig JSON'); }
   }
   function gmGet(url) {
-    return withTimeout(() => new Promise((resolve, reject) => {
+    // (2026-10-19) Död brygga → fetch-reserv direkt, utan att trigga
+    // hanterarens retries (som spammar konsolen med promise-fel).
+    if (gmBridgeIsDead()) {
+      vlog('Hämtning via fetch-reserv (GM-bryggan markerad död nyligen): ' + url.slice(0, 80));
+      return fetchGetJson(url);
+    }
+    return withTimeout(() => new Promise((resolve, resolve2, reject) => {
+      reject = reject;
       GM_xmlhttpRequest({
         method: 'GET', url,
         onload: r => {
@@ -399,6 +421,7 @@
       });
     }).catch(e => {
       if (/Nätverksfel|Timeout/.test(e.message)) {
+        markGmBridgeDead();
         vlog('GM-bryggan svarade inte (' + e.message + ') — hämtar via fetch-reserv: ' + url.slice(0, 80));
         return fetchGetJson(url);
       }
@@ -420,6 +443,7 @@
     try { return JSON.parse(text); } catch { throw new Error('Mistral: ogiltig JSON i svaret'); }
   }
   function gmPost(url, headers, body) {
+    if (gmBridgeIsDead()) return fetchPost(url, headers, body);
     return withTimeout(() => new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST', url, headers, data: JSON.stringify(body),
@@ -438,6 +462,7 @@
       });
     }).catch(e => {
       if (/nätverksfel|timeout/.test(e.message)) {
+        markGmBridgeDead();
         vlog('Mistral: GM-bryggan svarade inte — försöker igen via fetch…');
         return fetchPost(url, headers, body);
       }
@@ -466,12 +491,24 @@
   // Läser en fil ur data-repot. 404 (filen finns inte än — helt normalt
   // första gången) ger tyst {records:[]}/sha:null istället för ett fel.
   function githubDataGet(path) {
+    const token = githubDataToken();
+    const ghUrl = 'https://api.github.com/repos/' + GITHUB_DATA_OWNER + '/' + GITHUB_DATA_REPO + '/contents/' + path;
+    // (2026-10-19) Död brygga → fetch-reserv direkt utan hanterar-retries.
+    if (gmBridgeIsDead()) {
+      vlog('Datasynk: fetch-reserv direkt (GM-bryggan markerad död nyligt).');
+      return fetch(ghUrl, { headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json' } })
+        .then(r => {
+          if (r.status === 404) return { json: { records: [] }, sha: null };
+          if (r.status === 401) throw new Error('401 – ogiltig GitHub-PAT');
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json().then(data => ({ json: JSON.parse(base64ToUtf8(data.content.replace(/\n/g, ''))), sha: data.sha }));
+        });
+    }
     return new Promise((resolve, reject) => {
-      const token = githubDataToken();
       if (!token) return reject(new Error('ingen GitHub-PAT satt (fliken Inställningar)'));
       GM_xmlhttpRequest({
         method: 'GET',
-        url: 'https://api.github.com/repos/' + GITHUB_DATA_OWNER + '/' + GITHUB_DATA_REPO + '/contents/' + path,
+        url: ghUrl,
         headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json' },
         onload: r => {
           if (r.status === 404) return resolve({ json: { records: [] }, sha: null });
@@ -488,6 +525,7 @@
       });
     }).catch(e => {
       if (/nätverksfel|timeout/.test(e.message)) {
+        markGmBridgeDead();
         const token = githubDataToken();
         vlog('Datasynk: GM-bryggan svarade inte — hämtar via fetch-reserv…');
         return fetch('https://api.github.com/repos/' + GITHUB_DATA_OWNER + '/' + GITHUB_DATA_REPO + '/contents/' + path,
@@ -612,6 +650,7 @@
       });
     }).catch(e => {
       if (/nätverksfel|timeout/.test(e.message)) {
+        markGmBridgeDead();
         vlog('Billetto: GM-bryggan svarade inte — försöker igen via fetch…');
         return fetch(url, {
           method: 'POST',
