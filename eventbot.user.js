@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.99.0
+// @version      7.99.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -7899,7 +7899,21 @@
     // "+" = AND inom en OR-grupp — kräver BÅDA (categoriesLower innehåller
     // numera även subcategory, se currentCategoryTitles()).
     ['Festivals+Film', null, null, 'At the Movies: Cinemas and Film Festivals Stockholm', 'Mysiga biografer och filmfestivaler i Stockholm'],
-    ['Guided tours & Lectures', 'Natur', null, "Enjoy Allemansrätten – Sweden's Right to Roam", 'Njut av allemansrätten i Stockholms natur'],
+    // (2026-10-16, på begäran) Allemansrätten-paret triggas numera av
+    // naturreservat / "nature reserve" / nationalpark — inte längre av
+    // det breda ordet "Natur" och utan kategorikrav.
+    [null, 'naturreservat, "nature reserve", nationalpark', null, "Enjoy Allemansrätten – Sweden's Right to Roam", 'Njut av allemansrätten i Stockholms natur'],
+    // (2026-10-16, på begäran) Vandring/hike taggar Hiking Trails-paret —
+    // MEN inte när ett skärgårdsord också finns: då taggas skärgårdsparet
+    // (nedan) ISTÄLLET ("istället", användarens ord). Uteslutningstermerna
+    // (-skärgård* osv.) vinner alltid enligt buildKeywordTest. * = prefix
+    // så att svenska böjningsformer träffar: skärgården/skärgårdar,
+    // vandringen/vandringar, hiking/hikes, utökrogen osv.
+    [null, 'vandring*, hike, hiking, hiker*, -skärgård*, -archipelago*, -utö*, -vaxholm*, -grinda*, -sandhamn*, -möja*, -gällnö*', null, 'Hiking Trails Near Stockholm', 'Vandring i och kring Stockholm'],
+    // Skärgårdsvandring: (vandring|hike) OCH något skärgårdsord — varje
+    // kombination skrivs ut som egen AND-grupp (inget nested-stöd i
+    // parseOrAndCell).
+    [null, 'skärgård*+vandring*, skärgård*+hike, skärgård*+hiking, skärgård*+hiker*, archipelago*+vandring*, archipelago*+hike, archipelago*+hiking, archipelago*+hiker*, utö*+vandring*, utö*+hike, utö*+hiking, utö*+hiker*, vaxholm*+vandring*, vaxholm*+hike, vaxholm*+hiking, vaxholm*+hiker*, grinda*+vandring*, grinda*+hike, grinda*+hiking, grinda*+hiker*, sandhamn*+vandring*, sandhamn*+hike, sandhamn*+hiking, sandhamn*+hiker*, möja*+vandring*, möja*+hike, möja*+hiking, möja*+hiker*, gällnö*+vandring*, gällnö*+hike, gällnö*+hiking, gällnö*+hiker*', null, 'Hiking in the Stockholm Archipelago', 'Vandring i Stockholms skärgård'],
     ['Music', 'dirigent, orkester, kvartett, kvintett, stråk, kammarkör, "chamber music", kammarmusik', null, 'An Evening With Classical Music in Stockholm', 'Njut av klassisk musik i Stockholm'],
     // Subcategory-baserad kompletteringsrad (2026-09-23, på begäran): taggar
     // samma guidepar direkt via subcategoryn, utan att kräva något nyckelord
