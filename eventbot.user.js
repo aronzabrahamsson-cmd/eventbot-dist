@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.99.9
+// @version      7.99.10
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1281,11 +1281,36 @@
   // domänerna (7.26–7.28) dubblerade i stället varenda rad i hela kalendern
   // och orsakade en flodvåg av falska dubblettlarm. Tillbaka till en domän.
   const SED_BASE = location.origin + '/api/v1/singulareventdates/';
+  // (2026-10-19) SBR-widgeten kör på stockholmbusinessregion.se — där finns
+  // INGET /api/v1/singulareventdates/ (roten till "Kunde inte läsa er
+  // kalender"-felet i SBR:s CRM-import). Visit-kalendern ligger på Visit
+  // Stockholms domän, och dit behöver vi GM-bryggan: den går runt CORS
+  // (same-origin-fetch från SBR-domänen blockeras) OCH skickar med
+  // webbläsarens visitstockholm.se-sessioncookies (privilegierad
+  // tilläggsförfrågan), vilket krävs för inloggad CMS-åtkomst. MAIN/NEW
+  // kör oförändrat via sameOriginGet på sin egen domän.
+  const SBR_MODE = location.hostname === 'www.stockholmbusinessregion.se';
+  const VISIT_SED_BASE = 'https://www.visitstockholm.se/api/v1/singulareventdates/';
+  async function sedGet(page) {
+    if (SBR_MODE) {
+      // GM-bryggan är ENDAST vägen hit: fetch-reserven (fetchGetJson) går
+      // inte — den skickar inga Visit-cookies och blockeras av CORS.
+      // (2026-10-19) Faller bryggan (sovande hanterare, se markGmBridgeDead)
+      // provar vi ändå EN fetch — API:t kan vara publikt — men med ett
+      // tydligt fel om det inte går.
+      try { return await gmGet(VISIT_SED_BASE + '?page=' + page); }
+      catch (e) {
+        throw new Error('Visit-kalendern kräver GM-bryggan från SBR-domänen (' + e.message +
+          '). Prova: starta om webbläsaren/tillägget, eller hämta kalendern i MAIN/NEW-vyn — cachen (CACHE_CAL) delas och gäller direkt här.');
+      }
+    }
+    return sameOriginGet(SED_BASE + '?page=' + page);
+  }
 
   async function buildDedupIndex(onProgress, onPage) {
     const rows = [];
     let first;
-    try { onProgress('Läser er kalender, sida 1…'); first = await sameOriginGet(SED_BASE + '?page=1'); }
+    try { onProgress('Läser er kalender, sida 1…'); first = await sedGet(1); }
     catch (e) { throw new Error('Kunde inte läsa er kalender: ' + e.message + ' — inloggad i CMS:et?'); }
     const totalPages = first.total_pages || 1;
     if (onPage) onPage(1, totalPages);
@@ -1293,7 +1318,7 @@
     for (let p = 2; p <= totalPages; p++) {
       onProgress(`Läser er kalender, sida ${p}/${totalPages}…`);
       if (onPage) onPage(p, totalPages);
-      const data = await sameOriginGet(SED_BASE + '?page=' + p);
+      const data = await sedGet(p);
       (data.results || []).forEach(r => rows.push(slimRow(r)));
       await new Promise(r => setTimeout(r, 80));
     }
