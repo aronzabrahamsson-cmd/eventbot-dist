@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.99.10
+// @version      7.99.11
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2817,6 +2817,71 @@
     return { total, occCount, type: match.type };
   }
 
+  // (2026-10-19, på begäran) SBR: "Antal besökare" (id_expected_attendees)
+  // fylls ALLTID i — källa: lokalens kapacitet ur FORECAST_VENUES (samma
+  // siffror som NEW/MAIN:s forecast) om venue matchar, annars agentens
+  // uppgift. En pop-up visar källan; vid lokal-match visas hela listan med
+  // lokaler och beräknad kapacitet så redaktören ser vad siffran bygger på.
+  function sbrVenueCapacityList() {
+    return FORECAST_VENUES.map(f => {
+      const name = f.names.find(n => n !== n.toLowerCase()) || f.names[0];
+      return '<tr><td style="padding:2px 10px 2px 0;">' + name.replace(/^\w/, c => c.toUpperCase()) + '</td>' +
+             '<td style="padding:2px 0; text-align:right;">' + f.attendees.toLocaleString('sv-SE') + '</td>' +
+             '<td style="padding:2px 0 2px 10px; color:#787e8a;">(' + f.type + ')</td></tr>';
+    }).join('');
+  }
+  async function sbrExpectedAttendees(ev, data) {
+    const el = document.getElementById('id_expected_attendees');
+    if (!el) { vlog('Antal besökare: hittade inte id_expected_attendees.', 'err'); return; }
+    const occCount = (ev.dates && ev.dates.length) ? ev.dates.length : 1;
+    // (1) Lokalkapacitet
+    const match = matchForecastVenue(ev.venue_name || data.venue_name_sv || data.venue_name_en || '', ev.address || data.address || '');
+    if (match) {
+      const total = match.attendees * occCount;
+      simulateInput(el, String(total));
+      const venueLabel = match.names.find(n => n.length > 3) || match.names[0];
+      vlog('Antal besökare: ' + total + ' (kapacitet för ' + venueLabel + (occCount > 1 ? ' × ' + occCount + ' tillfällen' : '') + ')', 'ok');
+      showSbrAttendeesPopup('Källa: <b>lokalens kapacitet</b> — ' + venueLabel + ' har ' + match.attendees.toLocaleString('sv-SE') +
+        (occCount > 1 ? ' per tillfälle × ' + occCount + ' tillfällen' : '') + ' = <b>' + total.toLocaleString('sv-SE') + '</b> besökare.',
+        sbrVenueCapacityList(), match);
+      return total;
+    }
+    // (2) Agentens uppgift — agenten kan ge expected_attendees eller
+    // participants/participants_count i CRM-importfallet.
+    const agentVal = parseInt(String(
+      data.expected_attendees || data.participants || data.participants_count || data.attendees || ''
+    ).replace(/[^\d]/g, ''), 10);
+    if (agentVal > 0) {
+      simulateInput(el, String(agentVal));
+      vlog('Antal besökare: ' + agentVal + ' (källa: arrangörens sida via agenten).', 'ok');
+      showSbrAttendeesPopup('Källa: <b>arrangörens sida</b> — agenten hittade uppgiften <b>' + agentVal.toLocaleString('sv-SE') + '</b> besökare. Ingen lokal-match, så kontrollera gärna siffran mot källan.', sbrVenueCapacityList(), null);
+      return agentVal;
+    }
+    // (3) Ingen källa — fältet lämnas tomt med tydlig varning
+    vlog('Antal besökare: varken lokal-match (venue: "' + (ev.venue_name || data.venue_name_sv || data.venue_name_en || '(tomt)') + '") eller agent-uppgift — fältet lämnas tomt, fyll i manuellt.', 'err');
+    showSbrAttendeesPopup('<span style="color:#c0392b;">Ingen källa hittades</span> — varken lokal-match i kapacitetslistan eller besökaruppgift från arrangörens sida. Fyll i <b>Antal besökare</b> manuellt.', sbrVenueCapacityList(), null);
+    return null;
+  }
+  function showSbrAttendeesPopup(sourceText, capacityTable, match) {
+    // Sticky-ruta vid Antal besökare-fältet (ingen alert som blockerar
+    // flödet) + full lokallista så siffran kan granskas direkt.
+    let box = document.getElementById('vseh-sbr-attendees-box');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'vseh-sbr-attendees-box';
+      box.style.cssText = 'margin:6px 0 12px; padding:10px 12px; background:#eef6ff; border:1px solid #b8d8ff; border-radius:8px; font-size:12.5px; line-height:1.6; max-width:520px;';
+      const field = document.getElementById('id_expected_attendees');
+      if (field && field.parentNode) field.parentNode.insertBefore(box, field.nextSibling);
+      else document.body.appendChild(box);
+    }
+    box.innerHTML = '<div style="font-weight:600; margin-bottom:4px;">👥 ' + sourceText + '</div>' +
+      (match
+        ? '<details style="margin-top:6px;"><summary style="cursor:pointer; font-size:11.5px; color:#1a3a5c;">Visa lokaler och beräknad kapacitet</summary>' +
+          '<table style="margin-top:6px; font-size:11.5px; border-collapse:collapse;">' + capacityTable + '</table></details>'
+        : '<div style="margin-top:6px; font-size:11px; color:#787e8a;">Ingen lokal-match — kapacitetslistan inte applicerbar.</div>');
+    vlog('Antal besökare: pop-up-ruta visas vid fältet (källa: ' +
+      (match ? 'lokalens kapacitet' : (String(sourceText).includes('arrangörens') ? 'arrangörens sida' : 'ingen — manuellt')) + ').', 'ok');
+  }
   // Hitta rätt <option> value för en synlig text (t.ex. "Event"/"Fair").
   function matchSelectOption(sel, label) {
     const opt = [...sel.options].find(o => (o.textContent || '').trim().toLowerCase() === label.toLowerCase());
@@ -4038,6 +4103,15 @@
       const fc = await fillForecastIfMatch(ev);
       if (fc) forecastNote = ' — OBS: granska forecast (' + fc.total + (fc.occCount > 1 ? ', ' + fc.occCount + ' tillfällen' : '') + ')';
     } catch (e) { vlog('Forecast-ifyllning fel: ' + e.message, 'err'); }
+    // (2026-10-19, på begäran) SBR-läget: besökssiffra ska ALLTID fyllas i.
+    // Prioritering: (1) lokalkapacitet från FORECAST_VENUES om venue matchar,
+    // (2) agentens uppgift om den gav en siffra, (3) tomt + varning. En
+    // pop-up-ruta anger ALLTID källan och visar lokallistan med kapaciteter
+    // vid venue-match.
+    if (location.hostname === 'www.stockholmbusinessregion.se') {
+      try { await sbrExpectedAttendees(ev, data); }
+      catch (e) { vlog('Antal besökare (SBR): ' + e.message, 'err'); }
+    }
 
     // Bildautomation direkt efter formuläret (automatiskt).
     try { await automateImage(data); }
