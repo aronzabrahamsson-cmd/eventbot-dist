@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.0
+// @version      7.100.1
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1909,10 +1909,16 @@
       dt.setData('text/plain', String(text));
       editable.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
     } catch {}
+    // (2026-10-19) execCommand-insertText-steget är BORTTAGET: när paste
+    // landat visuellt men verifieringen mot det dolda fältet misslyckats
+    // (split-brain, synken hann inte inom 1,5 s) lade steget texten Ovanpå
+    // igen — och utan full selectAll-täckning duplicerades innehållet i
+    // fältet. Det var roten till att description "klistrades in gång på
+    // gång" på edit-sidor. EN metod, EN gång — misslyckas verifieringen
+    // lämnas fältet orört (paste kan i värsta fall ha landat synligt,
+    // men aldrig dubblerat).
     if (await waitLanded()) return true;
-    document.execCommand('selectAll', false, null);
-    document.execCommand('insertText', false, String(text));
-    if (await waitLanded()) return true;
+    return false;
     // TIDLIGARE SISTA RESERV (borttagen 2026-10-09): att skriva Draft.js-JSON
     // direkt i det dolda input-fältet skapade en split-brain — React/Draftails
     // internal state uppdaterades aldrig, fältet blev oredigerbart vid nästa
@@ -1926,7 +1932,21 @@
       ' — fältet lämnas orört (ingen dold JSON-skrivning längre). Klistra in manuellt.', 'err');
     return false;
   }
-  async function updateDraftail(fieldId, text) {
+  // (2026-10-19) Tidsbaserad skrivspärr per fält: på edit-sidor skrivs
+  // description av pollern (emoji-rensning), guide-taggningens parallella
+  // flöden och ev. knapptryck — flera anrop inom samma sekunder kunde
+  // interfolieras (samma fält skrivet om och om, "klistrades in gång på
+  // gång"). Ett nytt anrop för samma fält inom 15 s avbryts direkt, OM det
+  // inte är en KLICKAD åtgärd (rewrite/translate skickar userAction=true
+  // och går alltid igenom).
+  const draftailWriteStamp = new Map();
+  async function updateDraftail(fieldId, text, userAction = false) {
+    const last = draftailWriteStamp.get(fieldId) || 0;
+    if (!userAction && Date.now() - last < 15000) {
+      vlog('Beskrivning: skrivning till ' + fieldId + ' spärrad (redan skriven för <15 s sedan) — hoppar över för att undvika duplicering.', 'err');
+      return;
+    }
+    draftailWriteStamp.set(fieldId, Date.now());
     // Bekräftat via fältkartläggning (2026-09-21) att SBR:s add-event-formulär
     // använder en VANLIG <textarea> för description_en/sv, inte Draftail —
     // mountDraftail() letar då förgäves efter en .DraftEditor-root som aldrig
