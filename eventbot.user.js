@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.4
+// @version      7.100.5
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1902,6 +1902,46 @@
         ' tecken) och en paste skulle duplicera innehållet. Klistra in manuellt.', 'err');
       return false;
     }
+    // (2026-10-20, v7.100.5) TÖM FÄLTET FÖRST — garanterad ersättning, aldrig
+    // tillägg: även när select-all VERIFIERAS täcka hela innehållet har paste
+    // ibland landat bredvid markören i stället för att ersätta den (bekräftat
+    // av användaren: originaltexten blev kvar både vid em-dash-rensning och
+    // vid Mistral-omskrivning). Tvåsteg nu: (1) ta bort hela markeringen via
+    // ett riktigt delete-händelsepar (keydown Delete + beforeinput +
+    // input) — Draftails egen tangentbords-hantering tömmer då EditorState
+    // korrekt; verifiera att fältet är tomt (upp till 2 s). (2) först när
+    // fältet är verifierat tomt körs paste — den kan då aldrig lägga till,
+    // bara fylla ett tomt fält. Om tömningen inte verifieras avbryts hela
+    // skrivningen (ingen paste alls) — ett tydligt misslyckande är bättre
+    // än duplicerad text.
+    const waitEmpty = async () => {
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 100));
+        const cur = (editable.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!cur) return true;
+      }
+      return false;
+    };
+    let emptied = false;
+    try {
+      editable.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true }));
+      editable.dispatchEvent(new InputEvent('beforeinput', { inputType: 'deleteContentBackward', bubbles: true, cancelable: true }));
+      editable.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
+      editable.dispatchEvent(new KeyboardEvent('keyup', { key: 'Delete', bubbles: true, cancelable: true }));
+      emptied = await waitEmpty();
+    } catch {}
+    if (!emptied) {
+      // Reserv: selection fortfarande satt — prova execCommand('delete').
+      try {
+        document.execCommand('delete');
+        emptied = await waitEmpty();
+      } catch {}
+    }
+    if (!emptied) {
+      vlog('Beskrivning: AVBRYTER skrivning till ' + fieldId +
+        ' — fältet kunde inte tömmas verifierat (innehåll kvar efter delete) och en paste skulle duplicera texten. Klistra in manuellt.', 'err');
+      return false;
+    }
     // Draft.js är en kontrollerad React-komponent: råa DOM-ändringar den inte
     // själv sanktionerat (t.ex. execCommand insertText) accepteras till synes,
     // men internal EditorState uppdateras inte — vid nästa tangenttryckning
@@ -1925,6 +1965,8 @@
     // 1,5 s till 5 s — synken Draftail→dolt fält hann ibland inte inom 1,5 s
     // på långsamma sidor, vilket gav falska negativ i verifieringen (och
     // tidigare, när fler metoder staplades, dubbelskrivningar).
+    // (2026-10-20, v7.100.5) Paste körs nu mot ett VERIFIERAT TOMT fält (se
+    // tömningen ovan) — ersättning är garanterad, aldrig tillägg.
     const waitLanded = async () => {
       for (let i = 0; i < 50; i++) {
         await new Promise(r => setTimeout(r, 100));
