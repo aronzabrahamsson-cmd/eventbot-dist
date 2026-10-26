@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.2
+// @version      7.100.4
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1864,19 +1864,44 @@
     const editable = root && (root.querySelector('.public-DraftEditor-content') || root);
     if (!editable || !editable.isContentEditable) return false;
     editable.focus();
-    // Rensa först: markera HELA befintliga innehållet så paste/insertText
+    // Rensa först: markera HELA befintliga innehållet så paste
     // ERSÄTTER den gamla texten i stället för att lägga den nya bredvid/
     // efter den (bekräftat 2026-10-09: utan markering kunde den ursprungliga
     // descriptionen bli kvar när paste landade vid markörens position).
     // Räkna aldrig med execCommand här — bygg markeringen med Selection-API:t
     // så den fungerar även om execCommand selectAll ignoreras.
+    // (2026-10-20, v7.100.4) VERIFIERAD SELECT-ALL: en obekräftad markering
+    // kunde misslyckas tyst (Draft.js återställer caret vid fokus/render) —
+    // paste satte då in texten VID MARKÖREN och duplicerade innehållet.
+    // Em-dash-rensningens 1,5s-poll läste samma em-dash igen (originalet var
+    // kvar) och körde var 15:e sekund → fältet växte 2^n tills fliken
+    // stängdes. Nu: efter markering kontrolleras att selection faktiskt
+    // täcker hela innehållet; om inte provas execCommand('selectAll') som
+    // reserv och kontrolleras igen. Täcker den fortfarande inte hela
+    // innehållet AVBRYTS skrivningen helt (ingen paste alls) — ett tydligt
+    // misslyckande i loggen är bättre än en duplicering som förstörs
+    // när användaren sparar.
+    const fullTextLen = (editable.textContent || '').replace(/\s+/g, ' ').trim().length;
+    let selectedLen = 0;
     try {
       const sel = window.getSelection();
       const range = document.createRange();
       range.selectNodeContents(editable);
       sel.removeAllRanges();
       sel.addRange(range);
+      selectedLen = (sel.toString() || '').replace(/\s+/g, ' ').trim().length;
+      if (selectedLen < fullTextLen) {
+        // Reserv: vissa Draft.js-versioner lyssnar bara på execCommand.
+        try { document.execCommand('selectAll'); } catch {}
+        selectedLen = (sel.toString() || '').replace(/\s+/g, ' ').trim().length;
+      }
     } catch {}
+    if (selectedLen < fullTextLen) {
+      vlog('Beskrivning: AVBRYTER skrivning till ' + fieldId +
+        ' — select-all täckte inte hela fältet (' + selectedLen + '/' + fullTextLen +
+        ' tecken) och en paste skulle duplicera innehållet. Klistra in manuellt.', 'err');
+      return false;
+    }
     // Draft.js är en kontrollerad React-komponent: råa DOM-ändringar den inte
     // själv sanktionerat (t.ex. execCommand insertText) accepteras till synes,
     // men internal EditorState uppdateras inte — vid nästa tangenttryckning
@@ -1895,10 +1920,13 @@
     // execCommand + direkt JSON-skrivning ovanpå. Dubbelskrivningarna skapade
     // en kapplöpning där React till slut återställde fältet till sitt eget
     // ( ursprungliga) state — därför kom originaltexten tillbaka i sv-fältet.
-    // Nu: polla det dolda fältet i upp till 1,5 s per metod och gå bara vidare
-    // till nästa metod om den verkligen inte landade.
+    // Nu: polla det dolda fältet per metod och gå bara vidare till nästa metod
+    // om den verkligen inte landade. (2026-10-20, v7.100.4) Väntan höjd från
+    // 1,5 s till 5 s — synken Draftail→dolt fält hann ibland inte inom 1,5 s
+    // på långsamma sidor, vilket gav falska negativ i verifieringen (och
+    // tidigare, när fler metoder staplades, dubbelskrivningar).
     const waitLanded = async () => {
-      for (let i = 0; i < 15; i++) {
+      for (let i = 0; i < 50; i++) {
         await new Promise(r => setTimeout(r, 100));
         if (draftailTextLanded(fieldId, text)) return true;
       }
@@ -1939,12 +1967,17 @@
   // gång"). Ett nytt anrop för samma fält inom 15 s avbryts direkt, OM det
   // inte är en KLICKAD åtgärd (rewrite/translate skickar userAction=true
   // och går alltid igenom).
+  // (2026-10-20, v7.100.4) Returnerar nu ÄRLIGT true/false — true bara när
+  // texten VERKLIGEN landade i det dolda fältet (facit). Tidigare returnerade
+  // funktionen aldrig något, så anropare (riktlinje-omskrivning, båda
+  // översättningsvägarna) loggade "Klar" även när skrivningen hade misslyckats
+  // tyst — användaren trodde texten var ersatt när den gamla låg kvar.
   const draftailWriteStamp = new Map();
   async function updateDraftail(fieldId, text, userAction = false) {
     const last = draftailWriteStamp.get(fieldId) || 0;
     if (!userAction && Date.now() - last < 15000) {
       vlog('Beskrivning: skrivning till ' + fieldId + ' spärrad (redan skriven för <15 s sedan) — hoppar över för att undvika duplicering.', 'err');
-      return;
+      return false;
     }
     draftailWriteStamp.set(fieldId, Date.now());
     // Bekräftat via fältkartläggning (2026-09-21) att SBR:s add-event-formulär
@@ -1956,23 +1989,23 @@
     if (plainEl && plainEl.tagName === 'TEXTAREA') {
       simulateInput(plainEl, text);
       vlog(`Beskrivning ifylld (textarea): ${fieldId} → ${String(text).slice(0, 60)}...`, 'ok');
-      return;
+      return true;
     }
     try {
       const root = await mountDraftail(fieldId);
       if (!root) {
         warnDraftailOnce(fieldId, `Beskrivning: hittade inget Draftail-fält för ${fieldId} (varken .DraftEditor-root eller en klickbar .Draftail-Editor) — fältet lämnas tomt.`);
-        return;
+        return false;
       }
       const props = getDraftProps(root);
       if (!props) {
         warnDraftailOnce(fieldId, `Beskrivning: hittade Draftail-fältet ${fieldId} men inte dess React-props — provar reservsökvägen (contentEditable).`);
         if (await updateDraftailViaClipboard(fieldId, text)) {
           vlog(`Beskrivning ifylld (contentEditable-reserv): ${fieldId} → ${String(text).slice(0, 60)}...`, 'ok');
-          return;
+          return true;
         }
         warnDraftailOnce(fieldId, `Beskrivning: kunde inte skriva till ${fieldId} — varken React-props eller contentEditable-reserv fungerade.`);
-        return;
+        return false;
       }
       const editorState = props.editorState;
       const EditorState = editorState.constructor;
@@ -1984,9 +2017,24 @@
         newState = EditorState.moveSelectionToEnd(newState);
       }
       props.onChange(newState);
-      vlog(`Beskrivning ifylld: ${fieldId} → ${String(text).slice(0, 60)}...`, 'ok');
+      // (2026-10-20, v7.100.4) Verifiera att synken till det dolda fältet
+      // faktiskt hann — props.onChange() är fire-and-forget och Draftails
+      // synk kan dröja. Polla upp till 5 s; misslyckas det returneras false
+      // så anroparen kan varna ärligt.
+      let landed = false;
+      for (let i = 0; i < 50 && !landed; i++) {
+        await new Promise(r => setTimeout(r, 100));
+        landed = draftailTextLanded(fieldId, text);
+      }
+      if (landed) {
+        vlog(`Beskrivning ifylld: ${fieldId} → ${String(text).slice(0, 60)}...`, 'ok');
+        return true;
+      }
+      vlog(`Beskrivning: React-vägen svarade men texten verifierades INTE i det dolda fältet inom 5 s (${fieldId}) — fältet kan visa ny text men spara gammal. Ladda om sidan för att se sanningen.`, 'err');
+      return false;
     } catch (err) {
       vlog(`Beskrivning: fel vid ifyllning av ${fieldId} (fortsätter): ${err && err.message ? err.message : err}`, 'err');
+      return false;
     }
   }
 
@@ -2727,12 +2775,18 @@
     }
 
     if (data.description_sv) {
-      try { await updateDraftail("id_description_sv", data.description_sv); }
-      catch (err) { vlog(`Beskrivning (sv): ovänta fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
+      try {
+        const okSv = await updateDraftail("id_description_sv", data.description_sv);
+        if (!okSv) vlog('Beskrivning (sv): kunde INTE skrivas automatiskt — klistra in texten manuellt.', 'err');
+      }
+      catch (err) { vlog(`Beskrivning (sv): oväntat fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
     } else { vlog('Beskrivning (sv): inget description_sv i svaret — fältet lämnas tomt.', 'err'); }
     if (data.description_en) {
-      try { await updateDraftail("id_description_en", data.description_en); }
-      catch (err) { vlog(`Beskrivning (en): ovänta fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
+      try {
+        const okEn = await updateDraftail("id_description_en", data.description_en);
+        if (!okEn) vlog('Beskrivning (en): kunde INTE skrivas automatiskt — klistra in texten manuellt.', 'err');
+      }
+      catch (err) { vlog(`Beskrivning (en): oväntat fel (fortsätter): ${err && err.message ? err.message : err}`, 'err'); }
     } else { vlog('Beskrivning (en): inget description_en i svaret — fältet lämnas tomt.', 'err'); }
 
     try { fillLanguageField(data); }
@@ -7794,8 +7848,16 @@
       // bort lokalt ur svaret som en garanti — samma mönster som stripEmDashes.
       const cleaned = stripEmDashes(rewritten.trim()).replace(EMOJI_RE, '').replace(/ {2,}/g, ' ').trim();
       vlog('Riktlinje-omskrivning: Ersätter text i ' + fieldId + ' — gammal text: "' + text + '"');
-      await updateDraftail(fieldId, cleaned, true);   // userAction — går alltid igenom spärren
-      vlog('Riktlinje-omskrivning: Klar (' + fieldId + ')' + (cleaned === text ? ' — OBS: Mistral svarade med identisk text.' : ', ' + (text.length - cleaned.length) + ' tecken kortare.'), 'ok');
+      // (2026-10-20, v7.100.4) updateDraftail returnerar nu ärligt true/false —
+      // logga MISSLYCKADES (inte "Klar") när texten inte landade, så användaren
+      // vet att den nya texten måste klistras in manuellt.
+      const writeOk = await updateDraftail(fieldId, cleaned, true);   // userAction — går alltid igenom spärren
+      if (writeOk) {
+        vlog('Riktlinje-omskrivning: Klar (' + fieldId + ')' + (cleaned === text ? ' — OBS: Mistral svarade med identisk text.' : ', ' + (text.length - cleaned.length) + ' tecken kortare.'), 'ok');
+      } else {
+        vlog('Riktlinje-omskrivning: MISSLYCKADES — den nya texten kunde inte skrivas till ' + fieldId +
+          ' automatiskt (gamla texten ligger kvar). Klistra in den nya texten manuellt. Ny text: "' + cleaned + '"', 'err');
+      }
     } catch (e) {
       vlog('Riktlinje-omskrivning: Fel — ' + e.message, 'err');
     }
@@ -7827,6 +7889,15 @@
   // men vi behåller noten separat via emdashReplaced-per-field tills
   // sidan laddas om, eftersom själva ersättningen bara sker EN gång).
   const emdashReplaced = new Set();
+  // (2026-10-20) Engångsspärr för em-dash-rensning av description-fälten.
+  // stripEmDashesFromFields() körs av 1,5s-pollern — när updateDraftail()
+  // misslyckas (React-props hittas inte, paste-verifieringen slår fel) ändras
+  // inte det dolda fältet, så nästa poll såg samma em-dash igen och försökte
+  // skriva om och om igen ("spärrad (redan skriven för <15 s sedan)" i
+  // loggen tills fliken stängdes). Samma mönster som emoji-rensningens
+  // descEmojiStripTried: max ETT skrivförsök per fält och session — misslyckas
+  // det syns felet i loggen och användaren rättar manuellt.
+  const emdashDescTried = new Set();
   function stripEmDashesFromFields() {
     // Titlar + länktext: vanliga input-fält
     ['id_title_en', 'id_title_sv', 'id_link_text'].forEach(id => {
@@ -7841,11 +7912,18 @@
     ['id_description_en', 'id_description_sv'].forEach(id => {
       const text = readDraftailText(id);
       if (!text || !text.includes('—')) return;
+      if (emdashDescTried.has(id)) return;
+      emdashDescTried.add(id);
       const fixed = text.replace(/\s*—\s*/g, ' – ').replace(/ {2,}/g, ' ').trim();
+      vlog('Em-dash: försöker ersätta — i ' + id + ' (spärrad tills sidan laddas om).');
+      // (2026-10-20, v7.100.4) updateDraftail verifierar själv mot det dolda
+      // fältet och returnerar ärligt — ingen egen poll behövs längre.
       updateDraftail(id, fixed).then(ok => {
         if (ok) {
           emdashReplaced.add(id);
           vlog('Em-dash: ersatte — i ' + id + ' (texten är antagligen AI-bearbetad).', 'ok');
+        } else {
+          vlog('Em-dash: kunde INTE ersätta — i ' + id + ' automatiskt — rättas manuellt (spärrad tills sidan laddas om).', 'err');
         }
       }).catch(() => {});
     });
@@ -8102,7 +8180,12 @@
       if (descEmojiStripTried.has(fieldId)) return;
       descEmojiStripTried.add(fieldId);
       vlog('Beskrivning: emojis hittade i ' + fieldId + ' — försöker rensa EN gång (spärrad tills sidan laddas om).');
-      await updateDraftail(fieldId, text.replace(EMOJI_RE, '').replace(/ {2,}/g, ' '));
+      // (2026-10-20, v7.100.4) Logga ärligt vid misslyckande — tidigare såg
+      // pollern tyst ut att ha lyckats fast den rensade texten aldrig landade.
+      const emojiOk = await updateDraftail(fieldId, text.replace(EMOJI_RE, '').replace(/ {2,}/g, ' '));
+      if (!emojiOk) {
+        vlog('Beskrivning: kunde INTE rensa emojis i ' + fieldId + ' automatiskt — ta bort dem manuellt (spärrad tills sidan laddas om).', 'err');
+      }
     });
   }
 
@@ -9158,7 +9241,12 @@
       if (targetLang === 'en' && !/^NOTE:\s*The event is in Swedish\./im.test(newDesc)) {
         newDesc = 'NOTE: The event is in Swedish.\n\n' + newDesc;
       }
-      await updateDraftail('id_description_' + targetLang, newDesc, true);   // userAction
+      // (2026-10-20, v7.100.4) Ärligt resultat — "Klar" bara när texten landade.
+      const descWriteOk = await updateDraftail('id_description_' + targetLang, newDesc, true);   // userAction
+      if (!descWriteOk) {
+        vlog('Översättning: MISSLYCKADES — beskrivningen kunde inte skrivas till id_description_' + targetLang +
+          ' automatiskt (gamla texten ligger kvar). Klistra in manuellt. Ny text: "' + newDesc + '"', 'err');
+      }
 
       if (sourceTitle) {
         const titlePayload = {
@@ -9179,7 +9267,11 @@
         if (titleEl) simulateInput(titleEl, translatedTitle);
         vlog('Översättning: Klar rubrik (' + targetName + '): "' + translatedTitle + '"', 'ok');
       }
-      vlog('Översättning: Klar (' + targetName + ').', 'ok');
+      if (descWriteOk) {
+        vlog('Översättning: Klar (' + targetName + ').', 'ok');
+      } else {
+        vlog('Översättning: rubriken är översatt men beskrivningen MISSLYCKADES (se fel ovan) — klistra in beskrivningen manuellt.', 'err');
+      }
     } catch (e) {
       vlog('Översättning: Fel — ' + e.message, 'err');
     }
@@ -9209,8 +9301,14 @@
       if (!translated) throw new Error('Tomt svar från Mistral');
       const oldTargetText = readDraftailText('id_description_' + targetLang);
       if (oldTargetText) vlog('Översättning: Ersätter text i id_description_' + targetLang + ' — gammal text: "' + oldTargetText + '"');
-      await updateDraftail('id_description_' + targetLang, stripEmDashes(translated.trim()), true);   // userAction
-      vlog('Översättning: Klar (' + targetName + ').', 'ok');
+      // (2026-10-20, v7.100.4) Ärligt resultat — "Klar" bara när texten landade.
+      const descWriteOk = await updateDraftail('id_description_' + targetLang, stripEmDashes(translated.trim()), true);   // userAction
+      if (descWriteOk) {
+        vlog('Översättning: Klar (' + targetName + ').', 'ok');
+      } else {
+        vlog('Översättning: MISSLYCKADES — beskrivningen kunde inte skrivas till id_description_' + targetName +
+          ' automatiskt (gamla texten ligger kvar). Klistra in manuellt. Ny text: "' + stripEmDashes(translated.trim()) + '"', 'err');
+      }
     } catch (e) {
       vlog('Översättning: Fel — ' + e.message, 'err');
     }
