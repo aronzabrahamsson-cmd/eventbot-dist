@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.7
+// @version      7.100.8
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1547,18 +1547,19 @@
   // Spärr så DEDUP-NÄRMISS-loggning inte upprepas varje gång listan ritas om.
   const loggedNearMisses = new Set();
 
-  function matchStatus(ev, { strict = false } = {}) {
-    if (!dedupIndex) return { key: 'unknown', detail: '', matches: [] };
+  function matchStatus(ev, { strict = false, index = null } = {}) {
+    const idx = index || dedupIndex;
+    if (!idx) return { key: 'unknown', detail: '', matches: [] };
     if (isManualIn(ev)) return { key: 'in', detail: 'manuellt hanterat', matches: [] };
     const simThreshold = strict ? DRAFT_SIM_THRESHOLD : SIM_THRESHOLD;
     const cand = new Set();
-    new Set(tokens(ev.title)).forEach(tok => { const s = dedupIndex.byToken.get(tok); if (s) s.forEach(i => cand.add(i)); });
+    new Set(tokens(ev.title)).forEach(tok => { const s = idx.byToken.get(tok); if (s) s.forEach(i => cand.add(i)); });
     // Om utkastet har en egen svensk titel (draftvyns extractRowData()) —
     // kalenderraden vi jämför mot kan exponera BARA sin svenska titel (t.ex.
     // om den engelska sidan inte är publicerad separat), så utan detta hittas
     // den varken som kandidat eller matchar på titel (bekräftat 2026-09-29).
     if (ev.title_sv) {
-      new Set(tokens(ev.title_sv)).forEach(tok => { const s = dedupIndex.byToken.get(tok); if (s) s.forEach(i => cand.add(i)); });
+      new Set(tokens(ev.title_sv)).forEach(tok => { const s = idx.byToken.get(tok); if (s) s.forEach(i => cand.add(i)); });
     }
 
     // Adressbaserade kandidater LÄGGS TILL separat — fångar fall där titlarna
@@ -1592,7 +1593,11 @@
     }
     const evHasPlace = !!(normText(ev.venue_name) || normAddr(ev.address));
     cand.forEach(i => {
-      const row = dedupIndex.rows[i];
+      const row = idx.rows[i];
+      // (2026-10-26) Självträff: när matchStatus körs mot samma lista som ev
+      // själv kommer från (SBR-DRAFT), måste raden själv exkluderas — annars
+      // matchar varje rad sig själv (tSim=1.0) och allt blir "Dubblett".
+      if (ev._key && row._key && ev._key === row._key) return;
       if (isDismissed(ev, row)) return;
       // Bästa av engelsk/svensk titeljämförelse — en kalenderrad kan exponera
       // bara ETT språks titel (se kommentaren vid kandidatinsamlingen ovan).
@@ -1679,7 +1684,7 @@
     // orelaterat event på samma adress. Utan något titelstöd alls är ett
     // brett spann för svagt som ensamt bevis — exakt dag mot dag krävs.
     addrOnlyCand.forEach(i => {
-      const row = dedupIndex.rows[i];
+      const row = idx.rows[i];
       if (isDismissed(ev, row)) return;
       const vSim = placeSim(ev.venue_name, ev.address, row.venue_name, row.address);
       if (vSim < 0.9) return;
@@ -6042,7 +6047,10 @@
     const start_date = parseSwedishDate((cells[3]?.textContent || '').trim()) || '';
     const modified_raw = (cells[4]?.textContent || '').trim();
     const status = (cells[5]?.textContent || '').trim();
-    return { title_en, title_sv, start_date, modified_raw, status };
+    // (2026-10-26) Spara även titelcellens href (edit-länken) så SBR-DRAFT-vyn
+    // kan länka direkt till eventets edit-sida i jämförelsevyn.
+    const href = (cells[1]?.querySelector('a')?.getAttribute('href') || '').trim();
+    return { title_en, title_sv, start_date, modified_raw, status, href };
   }
 
   function fetchVisibleSbrEvents() {
@@ -7100,6 +7108,245 @@
       dates: start_date ? [{ date: start_date }] : [],
       _source: 'draft'
     };
+  }
+
+
+  // ==== [SBR-DRAFT] initSbrDraftDedup — Dubblettkoll på SBR:s draft-lista ====
+  // Widget-namn: SBR-DRAFT. Körs på stockholmbusinessregion.se/wt/cms/snippets/
+  // api/event/?status=draft (samma sidmall som SBR:s eventlista, se
+  // extractSbrRowData: td.title på kolumnindex 1 + positionella syskon).
+  // (2026-10-26, på begäran) Samma utseende som Visit:s DRAFT-vy
+  // (initDraftvyDubblettkoll: sticky bar + badges på raderna + klickbar
+  // jämförelse-rad), men datakällan är SBR:s MANUELLA eventlista som sparas
+  // i fliken "Eventlista" (sbr_manual_calendar, GM-nyckel SBR_CAL_KEY) — inte
+  // ett API. Varje importerad rad matchas mot de ÖVRIGA importerade raderna:
+  // 2 liknande rader = förväntat språkpar (visas ej), 3+ = misstänkt dubblett.
+  // Raden själv i listan länkas till sin edit-sida via titelcellens <a href>
+  // (sparas i href-fältet vid import).
+  const SBR_DRAFT_EXTRA_CSS = `
+    #vseh-sbrdraft-bar { position:sticky; top:0; z-index:9999; display:flex; align-items:center;
+      flex-wrap:wrap; gap:10px; background:var(--vd-bg3); color:var(--vd-txt); padding:10px 14px;
+      margin:0 0 14px; border-radius:6px; box-shadow:0 2px 10px rgba(0,0,0,.3);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    #vseh-sbrdraft-bar strong { font-size:14px; margin-right:4px; }
+    #vseh-sbrdraft-bar button { padding:8px 14px; border:none; border-radius:5px; cursor:pointer;
+      font-size:13px; font-weight:600; }
+    #vseh-sbrdraft-bar button:disabled { opacity:.6; cursor:not-allowed; }
+    #vseh-sbrdraft-ts { font-size:12px; color:#c3c8d1; }
+    .vseh-sbrdraft-cmp-row td { background:var(--vd-bg2); padding:10px 14px; }
+  `;
+
+  let sbrDraftIndex = null;          // buildIndexFromRows över sbrManualCal
+  const sbrDraftExpanded = new Set();
+
+  function ensureSbrDraftStyle() {
+    if (document.getElementById('vseh-sbrdraft-css')) return;
+    const s = document.createElement('style');
+    s.id = 'vseh-sbrdraft-css';
+    s.textContent = PANEL_CSS + DRAFT_EXTRA_CSS + SBR_DRAFT_EXTRA_CSS;
+    document.head.appendChild(s);
+  }
+
+  // Importerad rad → samma "row"-shape som kalendraden i matchStatus()
+  function sbrCalRow(e) {
+    return {
+      title: e.title_en || e.title_sv || '',
+      title_sv: e.title_sv || '',
+      venue_name: '',
+      address: '',
+      start: e.start_date || '',
+      end: e.start_date || '',
+      isSpan: false,
+      href: e.href || '',
+      dates: e.start_date ? [{ date: e.start_date }] : [],
+      _source: 'sbr-list',
+      _key: sbrCalKey(e)
+    };
+  }
+
+  function buildSbrDraftIndex() {
+    loadSbrManualCal();
+    const rows = sbrManualCal.map(sbrCalRow);
+    return buildIndexFromRows(rows);
+  }
+
+  function initSbrDraftDedup() {
+    vlog('SBR-Draft-Dubblettkoll: Initierar på SBR:s draft-lista');
+    ensureSbrDraftStyle();
+    loadSbrManualCal();
+    if (!document.getElementById('vseh-sbrdraft-bar')) {
+      const bar = document.createElement('div');
+      bar.id = 'vseh-sbrdraft-bar';
+      bar.innerHTML = `
+        <strong>Eventbot – Dubblettkoll (SBR-eventlista)</strong>
+        <button type="button" id="vseh-sbrdraft-run">Sök dubbletter i importerad lista</button>
+        <button type="button" id="vseh-sbrdraft-import">Hämta synliga rader till Eventlista</button>
+        <span id="vseh-sbrdraft-ts"></span>
+        <button type="button" id="vseh-sbrdraft-logbtn" title="Visa logg">📋 Logg</button>
+      `;
+      insertBarAtTop(bar);
+      document.getElementById('vseh-sbrdraft-run').addEventListener('click', () => runSbrDraftCheck());
+      document.getElementById('vseh-sbrdraft-import').addEventListener('click', () => { fetchVisibleSbrEvents(); runSbrDraftCheck(); });
+      document.getElementById('vseh-sbrdraft-logbtn').addEventListener('click', () => {
+        let w = document.getElementById('vseh-logwrap');
+        if (!w) {
+          w = document.createElement('div');
+          w.id = 'vseh-logwrap';
+          w.style.display = 'none';
+          w.innerHTML = `<div class="vseh-loghdr">Diagnostiklogg <span style="display:flex;gap:5px;">
+            <button type="button" id="vseh-logcopy" title="Kopiera loggen">📋 Kopiera</button>
+            <button type="button" id="vseh-logclose" title="Stäng">✕</button></span></div>
+            <div id="vseh-log"></div>`;
+          document.body.appendChild(w);
+          document.getElementById('vseh-logclose').addEventListener('click', () => { w.style.display = 'none'; });
+          document.getElementById('vseh-logcopy').addEventListener('click', async () => {
+            const btn = document.getElementById('vseh-logcopy');
+            const ok = await copyToClipboard(VLOG.map(e => e.line).join('\n'));
+            btn.textContent = ok ? '✓ Kopierat' : 'Fel';
+            setTimeout(() => btn.textContent = '📋 Kopiera', 1200);
+          });
+        }
+        w.style.display = (w.style.display === 'none' || !w.style.display) ? 'flex' : 'none';
+        renderLog();
+      });
+    }
+    updateSbrDraftTs();
+    // Hydrera från sparad lista direkt — ingen tung hämtning behövs.
+    sbrDraftIndex = buildSbrDraftIndex();
+    if (sbrManualCal.length) runSbrDraftCheck();
+    else vlog('SBR-Draft: Eventlistan är tom — klicka "Hämta synliga rader" eller importera i panelen.', 'err');
+  }
+
+  function updateSbrDraftTs() {
+    const ts = document.getElementById('vseh-sbrdraft-ts');
+    if (ts) ts.textContent = sbrManualCal.length ? `Eventlista: ${sbrManualCal.length} importerade` : '';
+  }
+
+  function sbrDraftBadgeInfo(st) {
+    if (st.key === 'out') return { emoji: '✅', label: 'Ej dubblett', bg: '#1f7a4d', fg: '#fff', expandable: false };
+    if (st.key === 'in') return { emoji: '🎭', label: 'Dubblett', bg: '#c02626', fg: '#fff', expandable: true };
+    if (st.key === 'partial' || st.key === 'unsure') return { emoji: '🤔', label: 'Osäker', bg: '#c9881f', fg: '#fff', expandable: true };
+    return null;
+  }
+
+  function runSbrDraftCheck() {
+    sbrDraftIndex = buildSbrDraftIndex();
+    updateSbrDraftTs();
+    if (!sbrManualCal.length) { vlog('SBR-Draft: Eventlistan är tom — inget att kontrollera.', 'err'); return; }
+    vlog('SBR-Draft: Kör dubblettkontroll på ' + sbrManualCal.length + ' importerade rader (inom listan)');
+    const rows = document.querySelectorAll('td.title');
+    document.querySelectorAll('.vseh-sbrdraft-badge').forEach(b => b.remove());
+    document.querySelectorAll('.vseh-sbrdraft-cmp-row').forEach(r => r.remove());
+
+    let checked = 0;
+    const counts = { 'Ej dubblett': 0, Osäker: 0, Dubblett: 0 };
+    rows.forEach(td => {
+      const tr = td.closest('tr');
+      if (!tr) return;
+      const data = extractSbrRowData(tr);
+      if (!data || !(data.title_en || data.title_sv)) return;
+      checked++;
+      const ev = sbrCalRow(data);
+      ev.title = ev.title || ev.title_sv;
+      ev._key = sbrCalKey(data);
+      // matchStatus mot VÅR EGEN lista (index-param), strict som i DRAFT-vyn.
+      const st = matchStatus(ev, { strict: true, index: sbrDraftIndex });
+      const info = sbrDraftBadgeInfo(st);
+      if (!info) return;
+      counts[info.label] = (counts[info.label] || 0) + 1;
+
+      const titleWrap = td.querySelector('.title-wrapper') || td;
+      titleWrap.style.display = 'inline-flex';
+      titleWrap.style.alignItems = 'center';
+      titleWrap.style.gap = '6px';
+
+      const badge = document.createElement('span');
+      badge.className = 'vseh-badge vseh-sbrdraft-badge' + (info.expandable ? ' expandable' : '');
+      badge.style.background = info.bg;
+      badge.style.color = info.fg;
+      badge.textContent = info.emoji + ' ' + info.label;
+      titleWrap.insertBefore(badge, titleWrap.firstChild);
+
+      if (info.expandable) {
+        const pk = tr.dataset.objectPk || ('row-' + checked);
+        badge.addEventListener('click', () => {
+          if (sbrDraftExpanded.has(pk)) {
+            sbrDraftExpanded.delete(pk);
+            const next = tr.nextElementSibling;
+            if (next && next.classList.contains('vseh-sbrdraft-cmp-row')) next.remove();
+          } else {
+            sbrDraftExpanded.add(pk);
+            insertSbrDraftCompareRow(tr, ev, st, pk);
+          }
+        });
+      }
+    });
+    vlog(`SBR-Draft: Kontrollerade ${checked} synliga rader — ${counts.Dubblett} dubblett(er), ${counts.Osäker} osäkra, ${counts['Ej dubblett']} ej dubbletter (matchade mot importerad eventlista på ${sbrManualCal.length} rader)`,
+      (counts.Dubblett || counts.Osäker) ? 'err' : 'ok');
+  }
+
+  function insertSbrDraftCompareRow(tr, ev, st, pk) {
+    const old = tr.nextElementSibling;
+    if (old && old.classList.contains('vseh-sbrdraft-cmp-row')) old.remove();
+    const row = document.createElement('tr');
+    row.className = 'vseh-sbrdraft-cmp-row';
+    const td = document.createElement('td');
+    td.colSpan = tr.children.length;
+    td.innerHTML = sbrDraftCompareHTML(ev, st, pk);
+    row.appendChild(td);
+    tr.insertAdjacentElement('afterend', row);
+    row.querySelectorAll('.dp-multi').forEach(el => el.addEventListener('click', () => {
+      const box = document.getElementById('dp-' + el.dataset.dp);
+      if (!box) return;
+      const open = box.style.display !== 'none';
+      box.style.display = open ? 'none' : 'block';
+      const arrow = el.querySelector('.dp-arrow');
+      if (arrow) arrow.textContent = open ? '▸' : '▾';
+    }));
+    row.querySelectorAll('.vseh-sbrdraft-notdup').forEach(btn => btn.addEventListener('click', () => {
+      const mi = parseInt(btn.dataset.mi, 10);
+      const match = st.matches[mi];
+      if (!match) return;
+      dismissPair(ev, match);
+      vlog('SBR-Draft: Avmarkerade felmatchning: "' + ev.title + '" ≠ "' + match.title + '"', 'ok');
+      runSbrDraftCheck();
+    }));
+  }
+
+  // Jämförelsevy — samma visuella mönster som draftCompareHTML, men båda
+  // kolumner kommer från den importerade SBR-listan (vänster = raden i
+  // listvyn, höger = matchande importerade rad(er)). "Granska"-länken går
+  // till eventets edit-sida via href sparad vid import (titelcellens <a>).
+  function sbrDraftCompareHTML(ev, st, pk) {
+    const ourDates = (ev.dates || []).map(d => d.date);
+    const selfSide = `
+      <div class="vseh-cmp-col">
+        <h5>Denna rad i listan</h5>
+        <div class="vseh-item">
+          <div class="vseh-item-btns">
+            ${ev.href ? `<a class="vseh-edit" href="${esc(ev.href)}" target="_blank" rel="noopener">🔍 Granska</a>` : ''}
+          </div>
+          <div class="vseh-item-title">${esc(ev.title)}${ev.title_sv ? ' / ' + esc(ev.title_sv) : ''}</div>
+          <div class="vseh-item-row"><span class="lab">Datum</span> ${datePresent('sbrdraft', ourDates, false, ourDates[0], ourDates[ourDates.length - 1], 'sbrdraft-' + pk)}</div>
+        </div>
+      </div>`;
+
+    let otherSide;
+    if (!st.matches.length) {
+      otherSide = `<div class="vseh-cmp-col"><h5>Eventlistan (importerad)</h5><div class="vseh-nomatch">Ingen matchande post.</div></div>`;
+    } else {
+      otherSide = `<div class="vseh-cmp-col"><h5>Eventlistan (${st.matches.length} träff${st.matches.length > 1 ? 'ar' : ''})</h5>` +
+        st.matches.map((m, mi) => `
+          <div class="vseh-item">
+            <div class="vseh-item-btns">
+              <button class="vseh-dismiss vseh-sbrdraft-notdup" data-mi="${mi}" type="button" title="Detta är inte samma event">✅ Ej dubblett</button>
+              ${m.href ? `<a class="vseh-edit" href="${esc(m.href)}" target="_blank" rel="noopener">🔍 Granska</a>` : ''}
+            </div>
+            <div class="vseh-item-title">${esc(m.title)}${m.title_sv ? ' / ' + esc(m.title_sv) : ''}</div>
+            <div class="vseh-item-row"><span class="lab">Datum</span> ${datePresent('sbrcal', m.isSpan ? null : [m.start], m.isSpan, m.start, m.end, 'sbrcal-' + pk + '-' + mi)}</div>
+          </div>`).join('') + `</div>`;
+    }
+    return `<div class="vseh-compare"><div class="vseh-cmp-grid">${selfSide}${otherSide}</div></div>`;
   }
 
   // ---- EventChecker (sticky bar, edit-sida) --------------------------------
@@ -9658,6 +9905,9 @@
     if (mode === 'small') mode = 'max';            // legacy-läge → maximera
     if (!['min', 'max'].includes(mode)) mode = 'min';
     buildSbrPanel();
+    // (2026-10-26) På ?status=draft körs även dubblettkollen (SBR-DRAFT) —
+    // panelen OCH dubblettvyn samtidigt, badges på listans rader.
+    if (/[?&]status=draft(?:&|$)/.test(location.search)) initSbrDraftDedup();
   } else if (KNOWN_DRAFT_URL.test(location.href)) {
     initDraftvyDubblettkoll();
   } else if (KNOWN_EDIT_URL.test(location.href)) {
