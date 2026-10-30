@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.6
+// @version      7.100.7
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -8323,13 +8323,19 @@
     // "författar*" → författarsamtal). Vänster-gränsen behålls alltid
     // (samma ASCII-lookaround som wordBoundaryPattern) så termen inte
     // matcher mitt i ett annat ord. Utan * gäller ordgräns på båda sidor.
+    // (2026-10-26, v7.100.7) Apostrof-normalisering: termer skrivna med vanlig
+    // apostrof (') ska även träffa typografisk (’ U+2019) och prime (ʼ U+02BC) —
+    // text kopierad från Word/webbsidor innehåller nästan alltid ’, och tidigare
+    // missade t.ex. "new year's" därför "New Year’s Concert" helt. Ersätt varje
+    // ' i den escapade termen med en teckenklass som täcker alla tre varianter.
     const termRe = term => {
+      const escApos = esc => esc.replace(/'/g, "['’ʼ]");
       if (term.endsWith('*')) {
         const stem = term.slice(0, -1);
-        const esc = stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const esc = escApos(stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
         return new RegExp('(?<![' + WORD_CHAR_CLASS + '])' + esc, 'i');
       }
-      return new RegExp(wordBoundaryPattern(term), 'i');
+      return new RegExp(escApos(wordBoundaryPattern(term)), 'i');
     };
     const excludeRe = exclude.map(termRe);
     const orGroupsRe = orGroups.map(group => group.map(termRe));
@@ -8509,7 +8515,12 @@
     ['Classical & Art Music', null, null, 'An Evening With Classical Music in Stockholm', 'Njut av klassisk musik i Stockholm'],
     ['Sports & Wellbeing', 'Spa', null, 'Enjoy a Spa Weekend in Stockholm City', 'Njut av spa i Stockholm'],
     [null, 'Semla', null, 'Fat Tuesday – the day of the Semla 2026', 'Njut av Stockholms bästa semlor 2027'],
-    ["Christmas & New Year's", 'Nyår, nyårsafton, nyårshelgen, "fira nyår", "new year\'s", "the new year"', null, "New Year's Eve in Stockholm 2026", 'Nyår i Stockholm 2026'],
+    // (2026-10-26, v7.100.7) Utökade nyckelord efter miss på Confidencen-
+    // konserten: "nyår" träffade inte sammansättningen "nyårskonsert"
+    // (ordgräns efter r) → "nyår*" prefix. "new year" utan 's matchar början
+    // av "new year's"/"new year’s" (nästa tecken är icke-ordtecken), och med
+    // apostrof-normaliseringen i buildKeywordTest täcks både ' och ’.
+    ["Christmas & New Year's", 'Nyår*, nyårsafton, nyårshelgen, "fira nyår", "new year", "new year\'s", "the new year"', null, "New Year's Eve in Stockholm 2026", 'Nyår i Stockholm 2026'],
     [null, 'påsk, easter', null, 'Easter in Stockholm', 'Påsk i Stockholm 2026'],
     [null, 'Quiz, frågesport', null, 'Quiz night in Stockholm', 'Quizkväll i Stockholm'],
     [null, 'ridtur, häst', null, 'Saddle up: Horseback Riding in Stockholm', 'Sadla upp: Se Stockholm från hästryggen'],
