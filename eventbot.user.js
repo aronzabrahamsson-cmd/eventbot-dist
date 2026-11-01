@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.10
+// @version      7.100.11
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3490,7 +3490,10 @@
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = '🖼️ Senaste skärmdump';
-    btn.style.cssText = 'margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;';
+    btn.style.cssText = 'font-size:12px; padding:4px 10px; cursor:pointer;';
+    // (v7.100.11) Knapparna ligger i en DELAD flex-rad (bredvid varandra, inte
+    // ovanfå/nedanför) så man inte råkar klicka fel — se ensureImageButtonRow().
+    ensureImageButtonRow(fileInput).appendChild(btn);
     btn.addEventListener('click', async () => {
       const origText = btn.textContent;
       btn.disabled = true; btn.textContent = 'Läser urklipp…';
@@ -3519,13 +3522,60 @@
         setTimeout(() => { btn.disabled = false; btn.textContent = origText; }, 1800);
       }
     });
-    fileInput.parentNode.insertBefore(btn, fileInput.nextSibling);
   }
   // Sätter in knappen bredvid filfältet första gången den hittas i DOM:en
   // (choosermodalen finns bara medan den är öppen) — dataset-flaggan på
   // fältet SJÄLVT (inte en modul-variabel) gör detta säkert att köra om
   // och om igen från pollern, även om modalen stängs/öppnas flera gånger
   // under samma sidladdning (ett nytt filfält = ingen dataset-flagga än).
+  // (v7.100.11) Delad rad under filf\u00e4ltet d\u00e4r b\u00e5de sk\u00e4rmdumpsknappen och
+  // Mistral-knappen ligger bredvid varandra (flex, gap) — tidigare l\u00e5g de
+  // under varandra (display:block) och det blev l\u00e4tt att klicka fel.
+  function ensureImageButtonRow(fileInput) {
+    if (!fileInput) return null;
+    let row = fileInput.parentNode && fileInput.parentNode.querySelector(':scope > .vseh-img-btn-row');
+    if (row) return row;
+    row = document.createElement('div');
+    row.className = 'vseh-img-btn-row';
+    row.style.cssText = 'display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;';
+    fileInput.parentNode.insertBefore(row, fileInput.nextSibling);
+    return row;
+  }
+
+  // (v7.100.11) Bildvyer (MAIN chooser-modal, SBR-IMG, VS-IMG): titel och
+  // fotocred dupliceras ALLTID automatiskt \u00e5t andra h\u00e5llet n\u00e4r exakt ett av
+  // spr\u00e5kf\u00e4lten \u00e4r ifyllt (EN ifylld -> kopiera till SV; SV ifylld -> till EN;
+  // b\u00e5da ifyllda eller b\u00e5da tomma -> inget). Skriver bara n\u00e4r m\u00e5l-f\u00e4ltet \u00e4r
+  // tomt (aldrig \u00f6ver befintlig text), max en g\u00e5ng per riktning och session.
+  const imgLangDupDone = new Set();
+  function syncImageLangPair(idA, idB, keyPrefix) {
+    const a = document.getElementById(idA);
+    const b = document.getElementById(idB);
+    if (!a || !b) return;
+    const va = (a.value || '').trim();
+    const vb = (b.value || '').trim();
+    const kind = idA.includes('title') ? 'Titel' : 'Cred';
+    if (va && !vb && !imgLangDupDone.has(keyPrefix + '|a2b')) {
+      imgLangDupDone.add(keyPrefix + '|a2b');
+      setNativeValue(b, va);
+      vlog('Bildvy: duplicerade ' + kind.toLowerCase() + ' ' + idA + ' \u2192 ' + idB + ' ("' + va.slice(0, 60) + '").', 'ok');
+      showAutoChangeNote(b, kind + ' duplicerad fr\u00e5n det andra spr\u00e5ket');
+    } else if (!va && vb && !imgLangDupDone.has(keyPrefix + '|b2a')) {
+      imgLangDupDone.add(keyPrefix + '|b2a');
+      setNativeValue(a, vb);
+      vlog('Bildvy: duplicerade ' + kind.toLowerCase() + ' ' + idB + ' \u2192 ' + idA + ' ("' + vb.slice(0, 60) + '").', 'ok');
+      showAutoChangeNote(a, kind + ' duplicerad fr\u00e5n det andra spr\u00e5ket');
+    }
+  }
+  function syncImageTitleAndCredit(fields) {
+    syncImageLangPair(fields.title, fields.title_sv, fields.file + ':title');
+    syncImageLangPair(fields.credit, fields.credit_sv, fields.file + ':credit');
+  }
+  function startImageLangSync(fields, pollMs) {
+    syncImageTitleAndCredit(fields);
+    setInterval(() => syncImageTitleAndCredit(fields), pollMs || 1500);
+  }
+
   function ensureManualImageUploadButton() {
     const fileInput = document.getElementById(IMG_FIELDS.file);
     ensureClipboardImageButton(fileInput, autoFillManualImageUpload);   // 🖼️ Senaste skärmdump → auto-Mistral (2026-10-16)
@@ -3534,7 +3584,8 @@
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = '🤖 Fyll i automatiskt (Mistral)';
-    btn.style.cssText = 'margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;';
+    btn.style.cssText = 'font-size:12px; padding:4px 10px; cursor:pointer;';
+    ensureImageButtonRow(fileInput).appendChild(btn);
     btn.addEventListener('click', async () => {
       const file = fileInput.files && fileInput.files[0];
       let source = file ? { file } : null;
@@ -3556,7 +3607,6 @@
         setTimeout(() => { btn.disabled = false; btn.textContent = origText; }, 1500);
       }
     });
-    fileInput.parentNode.insertBefore(btn, fileInput.nextSibling);
   }
   let manualImageUploadWired = false;
   function wireManualImageUploadAutomation() {
@@ -3564,6 +3614,7 @@
     manualImageUploadWired = true;
     ensureManualImageUploadButton();
     setInterval(ensureManualImageUploadButton, 1000);
+    startImageLangSync(IMG_FIELDS, 1000);   // (v7.100.11) auto-duplicera titel+cred
     vlog('Manuell bilduppladdning: knapp för automatisk ifyllning aktiverad.');
   }
 
@@ -3627,7 +3678,8 @@
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = '🤖 Fyll i automatiskt (Mistral)';
-    btn.style.cssText = 'margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;';
+    btn.style.cssText = 'font-size:12px; padding:4px 10px; cursor:pointer;';
+    ensureImageButtonRow(fileInput).appendChild(btn);
     btn.addEventListener('click', async () => {
       const file = fileInput.files && fileInput.files[0];
       let source = file ? { file } : null;
@@ -3649,12 +3701,12 @@
         setTimeout(() => { btn.disabled = false; btn.textContent = origText; }, 1500);
       }
     });
-    fileInput.parentNode.insertBefore(btn, fileInput.nextSibling);
   }
   function initSbrImagePage() {
     vlog('SBR bildsida: knapp för automatisk ifyllning aktiverad.');
     ensureSbrImagePageButton();
     setInterval(() => { ensureSbrImagePageButton(); checkBrokenImageOnPage(); }, 1000);
+    startImageLangSync(SBR_IMG_FIELDS, 1000);   // (v7.100.11) auto-duplicera titel+cred
     ensureSettingsCogButton();
   }
 
@@ -3730,7 +3782,8 @@
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = '🤖 Fyll i automatiskt (Mistral)';
-    btn.style.cssText = 'margin-top:6px; display:block; font-size:12px; padding:4px 10px; cursor:pointer;';
+    btn.style.cssText = 'font-size:12px; padding:4px 10px; cursor:pointer;';
+    ensureImageButtonRow(fileInput).appendChild(btn);
     btn.addEventListener('click', async () => {
       const file = fileInput.files && fileInput.files[0];
       let source = file ? { file } : null;
@@ -3752,12 +3805,12 @@
         setTimeout(() => { btn.disabled = false; btn.textContent = origText; }, 1500);
       }
     });
-    fileInput.parentNode.insertBefore(btn, fileInput.nextSibling);
   }
   function initVsImagePage() {
     vlog('Bildsida: knapp för automatisk ifyllning aktiverad.');
     ensureVsImagePageButton();
     setInterval(() => { ensureVsImagePageButton(); checkBrokenImageOnPage(); }, 1000);
+    startImageLangSync(VS_IMG_FIELDS, 1000);   // (v7.100.11) auto-duplicera titel+cred
     ensureSettingsCogButton();
   }
 
@@ -7526,8 +7579,21 @@
   // mejladressen vid KLICK-tillfället (inte vid inmatning) så en ändring i
   // fältet alltid respekteras.
   function installMailArrangorButton() {
-    const field = document.getElementById('id_submitted_by_email');
-    if (!field || document.getElementById('vseh-mail-arrangor')) return;
+    // (v7.100.11) SBR kan ha annat mejlfälts-id — prova flera id:n och
+    // label-text; finns inget mejlfält alls blir det en tyst no-op.
+    let field = document.getElementById('id_submitted_by_email') ||
+                document.getElementById('id_contact_email') ||
+                document.getElementById('id_email');
+    if (!field) {
+      const label = [...document.querySelectorAll('label')].find(l => /mejl|e-?post|email/i.test((l.textContent || '').trim()));
+      if (label) {
+        const forId = label.getAttribute('for');
+        if (forId) field = document.getElementById(forId);
+        if (!field && label.parentElement) field = label.parentElement.querySelector('input[type="email"], input[name*="email" i]');
+      }
+    }
+    if (!field) return;   // (v7.100.11) inget mejlfält på sidan — no-op
+    if (document.getElementById('vseh-mail-arrangor')) return;
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.id = 'vseh-mail-arrangor';
@@ -7559,6 +7625,18 @@
     btn.addEventListener('click', () => {
       const titleEl = document.getElementById('id_title_sv') || document.getElementById('id_title_en');
       const title = (titleEl && titleEl.value || 'ert event').trim();
+      // (v7.100.11) SBR: näringslivskalender, egen signatur utan Visit-länk.
+      if (SBR_MODE) {
+        // Avslagsmall: [eventtitel] ersätts automatiskt; XXX är en kvarstående
+        // platshållare som redigeras manuellt i mejlprogrammet per fall.
+        mailto('Er evenemangsannons: ' + title,
+          'Hej!%0D%0A%0D%0A' +
+          'Tack för att ni skickar in ' + encodeURIComponent(title) +
+          ' till Stockholms näringslivskalender. Tyvärr kan vi inte publicera just detta event eftersom det är mer XXX ett event.%0D%0A%0D%0A' +
+          'Hör av er om ni har några frågor!%0D%0A%0D%0A' +
+          'Allt gott,%0D%0AStockholm Business Region');
+        return;
+      }
       // Avslagsmall: [eventtitel] ersätts automatiskt; XXX är en kvarstående
       // platshållare som redigeras manuellt i mejlprogrammet per fall.
       mailto('Er evenemangsannons: ' + title,
@@ -7597,6 +7675,15 @@
             lines.map(l => encodeURIComponent(l)).join('%0D%0A');
         }
       } catch {}
+      // (v7.100.11) SBR-variant utan guide-lista (SBR har inga related_guides).
+      if (SBR_MODE) {
+        mailto(title + ' publicerad på stockholmbusinessregion.se',
+          'Hej!%0D%0A%0D%0A' +
+          'Tack för att ni skickar in ' + encodeURIComponent(title) + ' till Stockholms näringslivskalender.%0D%0A%0D%0A' +
+          'Nu är eventet publicerat.%0D%0A%0D%0AAllt gott,%0D%0A' +
+          'Redaktionen,%0D%0AStockholm Business Region');
+        return;
+      }
       // Godkännandemall (på begäran 2026-10-06).
       mailto(title + ' publicerad på Visit Stockholm',
         'Hej!%0D%0A%0D%0A' +
@@ -7614,6 +7701,9 @@
     vlog('EventChecker: Initierar på edit-sida');
     ensureEditBarStyle();
     installMailArrangorButton();
+    // (v7.100.11) SBR renderar formuläret asynkront — mejlfältet kan dyka upp
+    // efter init, så polla (idempotent tack vare vseh-mail-arrangor-checken).
+    setInterval(installMailArrangorButton, 1500);
     if (!dedupIndex) loadCache();
     wireManualImageUploadAutomation();
     wireDateFixBox();
@@ -7728,6 +7818,13 @@
   // upplevelse"/"missa inte chansen" tillagda på begäran).
   const HYPE_WORDS = ['fantastisk', 'magisk', 'underbar', 'vänner och familj',
     'kompisgänget', 'unik upplevelse', 'missa inte chansen'];
+  // (v7.100.11) SBR:s agentprompt: "UNDVIK säljande/upplevelseinriktat språk
+  // ('en oförglömlig kväll', 'missa inte')" — näringsliv, inte turism.
+  // Ordgränsade (wordListRe) så inte "missa" ensamt triggar fel.
+  const SBR_HYPE_WORDS_SV = ['oförglömlig', 'oförglömligt', 'missa inte', 'unikt tillfälle',
+    'boka nu', 'sista chansen', 'enastående', 'magisk kväll', 'upplevelse du inte får missa'];
+  const SBR_HYPE_WORDS_EN = ['unforgettable', 'don’t miss', "don't miss", 'once in a lifetime',
+    'book now', 'last chance', 'exclusive experience', 'one-of-a-kind', 'must-see'];
   // Nyckelord för "Vi publicerar inte"-kategorier ur riktlinjerna — bara de
   // som bedömdes tillräckligt träffsäkra att flagga med enkla nyckelord
   // (privata boka-själv-upplägg och "utanför Stockholmsregionen" är för
@@ -7883,6 +7980,36 @@
     if (!hidden || !hidden.value) return '';
     try { return (JSON.parse(hidden.value).blocks || []).map(b => b.text || '').join('\n'); }
     catch { return ''; }
+  }
+
+  // (2026-10-27, v7.100.11) Generell läsning av ett textfält oavsett widget:
+  // SBR:s formulär använder en VANLIG <textarea> för description_en/sv (inte
+  // Draftail) — då läser vi el.value direkt; på Visit är fältet ett dolt
+  // input med Draft.js-JSON som readDraftailText() parsar.
+  function readFieldText(fieldId) {
+    const el = document.getElementById(fieldId);
+    if (el && el.tagName === 'TEXTAREA') return el.value || '';
+    return readDraftailText(fieldId);
+  }
+
+  // (2026-10-27, v7.100.11) Info-popup OVANFÖR fältet när scriptet gjort en
+  // automatisk ändring (emojis/em-dash borttagna, länktext ifylld m.m.) — en
+  // kort grön rad som beskriver VAD som gjordes. Sparas i autoChangeNotes så
+  // renderAutoChangeNotes() (i poll-loopen) kan återställa noten om Wagtail
+  // råkar rita om formuläret.
+  const autoChangeNotes = new Map();   // key -> { fieldId, msg }
+  function showAutoChangeNote(el, msg) {
+    if (!el || !el.id) return;
+    autoChangeNotes.set(el.id + '|' + msg, { fieldId: el.id, msg });
+    setFieldNote(el, 'autochange',
+      '<div style="color:#1f7a4d;font-weight:600;">\u2705 ' + esc(msg) + ' <span style="font-weight:400;font-style:italic;">(automatisk \u00e4ndring)</span></div>');
+  }
+  function renderAutoChangeNotes() {
+    autoChangeNotes.forEach(({ fieldId, msg }) => {
+      const el = document.getElementById(fieldId);
+      if (el) setFieldNote(el, 'autochange',
+        '<div style="color:#1f7a4d;font-weight:600;">\u2705 ' + esc(msg) + ' <span style="font-weight:400;font-style:italic;">(automatisk \u00e4ndring)</span></div>');
+    });
   }
 
   // Understryknings-overlay på Draftail-fältet (2026-10-14, på begäran):
@@ -8042,7 +8169,7 @@
     ['en', 'sv'].forEach(lang => {
       const fieldId = 'id_description_' + lang;
       const el = document.getElementById(fieldId);
-      const text = readDraftailText(fieldId);
+      const text = readFieldText(fieldId);   // (v7.100.11) textarea på SBR också (inte bara Draftail)
       if (!text) { setFieldNote(el, 'guideline', ''); clearGuidelineUnderlines(fieldId); return; }
       const lower = text.toLowerCase();
       const fieldIssues = [];
@@ -8095,6 +8222,16 @@
         }
         if (/\bmässa\b/i.test(text) && !categoriesLower.includes('fairs')) {
           fieldIssues.push({ label: 'Möjlig otillåten eventtyp', msg: '"mässa" utan kategorin Fairs kan syfta på en religiös gudstjänst, vilket vi inte publicerar.' });
+        }
+      }
+      // (v7.100.11) SBR-hype: agentprompten säger uttryckligen "UNDVIK
+      // säljande/upplevelseinriktat språk (en oförglömlig kväll, missa inte)".
+      // Samma "Säljspråk"-etikett så samma Mistral-fix gäller.
+      if (SBR_MODE) {
+        const sbrHype = (lang === 'sv' ? SBR_HYPE_WORDS_SV : SBR_HYPE_WORDS_EN)
+          .find(w => wordListRe([w]).test(text));
+        if (sbrHype) {
+          fieldIssues.push({ label: 'Säljspråk', msg: 'Säljande/upplevelseinriktad formulering ("' + sbrHype + '") — näringslivskommunikation ska vara saklig och professionell, inte turistmarknadsföring.' });
         }
       }
 
@@ -8236,7 +8373,7 @@
   // ändra EXAKT det som flaggats och inget annat.
   async function rewriteGuidelineIssues(lang, fixLabels) {
     const fieldId = 'id_description_' + lang;
-    const text = readDraftailText(fieldId);
+    const text = readFieldText(fieldId);   // (v7.100.11) textarea på SBR
     if (!text) return;
     // Faller tillbaka på SBR-nyckeln om Visit-nyckeln saknas — chat/completions
     // fungerar med vilken Mistral-konto-nyckel som helst, och fältet kan ha
@@ -8324,9 +8461,9 @@
       emdashReplaced.add(id);
       vlog('Em-dash: ersatte — i ' + id + ' (texten är antagligen AI-bearbetad).', 'ok');
     });
-    // Beskrivningar: Draftail (contenteditable)
+    // Beskrivningar: Draftail (Visit) ELLER vanlig textarea (SBR) — readFieldText/updateDraftail hanterar båda (v7.100.11).
     ['id_description_en', 'id_description_sv'].forEach(id => {
-      const text = readDraftailText(id);
+      const text = readFieldText(id);
       if (!text || !text.includes('—')) return;
       if (emdashDescTried.has(id)) return;
       emdashDescTried.add(id);
@@ -8337,6 +8474,7 @@
       updateDraftail(id, fixed).then(ok => {
         if (ok) {
           emdashReplaced.add(id);
+          showAutoChangeNote(document.getElementById(id), 'Em-dash (—) ersatt med tankstreck (–) i ' + id.replace('id_description_', 'beskrivning '));
           vlog('Em-dash: ersatte — i ' + id + ' (texten är antagligen AI-bearbetad).', 'ok');
         } else {
           vlog('Em-dash: kunde INTE ersätta — i ' + id + ' automatiskt — rättas manuellt (spärrad tills sidan laddas om).', 'err');
@@ -8359,7 +8497,10 @@
       const el = document.getElementById(id);
       if (!el || !el.value || !EMOJI_RE.test(el.value)) return;
       const stripped = el.value.replace(EMOJI_RE, '').replace(/ {2,}/g, ' ').trim();
-      if (stripped !== el.value) simulateInput(el, stripped);
+      if (stripped !== el.value) {
+        simulateInput(el, stripped);
+        showAutoChangeNote(el, 'Emojis borttagna ur ' + id.replace('id_title_', 'rubrik '));
+      }
     });
   }
 
@@ -8369,8 +8510,15 @@
   // 2026-09-19). Kräver >3 bokstäver totalt (bortser från siffror/
   // skiljetecken/apostrofer) för att inte flagga korta initialförkortningar.
   function isAllCapsTitle(title) {
-    const letters = (title || '').replace(/[^a-zA-ZåäöÅÄÖ]/g, '');
-    return letters.length > 3 && title === title.toUpperCase() && title !== title.toLowerCase();
+    const t = title || '';
+    const letters = t.replace(/[^a-zA-ZåäöÅÄÖ]/g, '');
+    if (!(letters.length > 3 && t === t.toUpperCase() && t !== t.toLowerCase())) return false;
+    // (v7.100.11) SBR-prompten: förkortningar med punkt mellan versaler/siffror
+    // (t.ex. "B2B.IO", "U.S.A") behåller sin VERSAL-form. En punkt INUTI ett
+    // ord (bokstav/siffra på båda sidor) räcker som förkortning; enbart
+    // punkt i slutet (meningsslut) gör det inte.
+    if (/[A-Z0-9]\.[A-Z0-9]/.test(t)) return false;
+    return true;
   }
 
   // Skickar bara SJÄLVA TITELN (inte hela beskrivningen) till Mistral, med en
@@ -8591,7 +8739,7 @@
   const descEmojiStripTried = new Set();
   function stripDescriptionEmoji() {
     ['id_description_en', 'id_description_sv'].forEach(async fieldId => {
-      const text = readDraftailText(fieldId);
+      const text = readFieldText(fieldId);   // (v7.100.11) textarea på SBR också
       if (!text || !EMOJI_RE.test(text)) return;
       if (descEmojiStripTried.has(fieldId)) return;
       descEmojiStripTried.add(fieldId);
@@ -8599,7 +8747,9 @@
       // (2026-10-20, v7.100.4) Logga ärligt vid misslyckande — tidigare såg
       // pollern tyst ut att ha lyckats fast den rensade texten aldrig landade.
       const emojiOk = await updateDraftail(fieldId, text.replace(EMOJI_RE, '').replace(/ {2,}/g, ' '));
-      if (!emojiOk) {
+      if (emojiOk) {
+        showAutoChangeNote(document.getElementById(fieldId), 'Emojis borttagna ur ' + fieldId.replace('id_description_', 'beskrivning '));
+      } else {
         vlog('Beskrivning: kunde INTE rensa emojis i ' + fieldId + ' automatiskt — ta bort dem manuellt (spärrad tills sidan laddas om).', 'err');
       }
     });
@@ -8645,7 +8795,7 @@
       (document.getElementById('id_venue_name_sv')?.value || '')).toLowerCase();
     const text = ((document.getElementById('id_title_en')?.value || '') + ' ' +
       (document.getElementById('id_title_sv')?.value || '') + ' ' +
-      readDraftailText('id_description_en') + ' ' + readDraftailText('id_description_sv') + ' ' + venue).toLowerCase();
+      readFieldText('id_description_en') + ' ' + readFieldText('id_description_sv') + ' ' + venue).toLowerCase();
     const dates = currentEventDates();
     return { categories, categoriesLower, venue, text, dates };
   }
@@ -9587,8 +9737,8 @@
   // svenska och översätter den till engelska (och tvärtom), eftersom
   // scriptet inte kan veta vilket av de två identiska fälten som "är fel".
   function checkIdenticalDescriptions() {
-    const enText = readDraftailText('id_description_en').trim();
-    const svText = readDraftailText('id_description_sv').trim();
+    const enText = readFieldText('id_description_en').trim();   // (v7.100.11) textarea på SBR
+    const svText = readFieldText('id_description_sv').trim();
     const identical = !!enText && !!svText && enText.toLowerCase() === svText.toLowerCase();
     ['en', 'sv'].forEach(lang => {
       const el = document.getElementById('id_description_' + lang);
@@ -9618,8 +9768,8 @@
   function checkIdenticalTitlesAndDescriptions() {
     const titleEn = (document.getElementById('id_title_en')?.value || '').trim();
     const titleSv = (document.getElementById('id_title_sv')?.value || '').trim();
-    const descEn = readDraftailText('id_description_en').trim();
-    const descSv = readDraftailText('id_description_sv').trim();
+    const descEn = readFieldText('id_description_en').trim();   // (v7.100.11) textarea på SBR
+    const descSv = readFieldText('id_description_sv').trim();
     const identical = !!titleEn && !!titleSv &&
       titleEn.toLowerCase() === titleSv.toLowerCase() &&
       !!descEn && !!descSv && descEn.toLowerCase() === descSv.toLowerCase();
@@ -9655,7 +9805,7 @@
   // rubriken och "NOTE: The event is in Swedish." först i description.
   async function translateTitleAndDescription(targetLang) {
     const sourceLang = targetLang === 'en' ? 'sv' : 'en';
-    const sourceText = readDraftailText('id_description_' + sourceLang);
+    const sourceText = readFieldText('id_description_' + sourceLang)   // (v7.100.11) textarea på SBR;
     const sourceTitle = (document.getElementById('id_title_' + sourceLang)?.value || '').trim();
     const mistralKey = GM_getValue('mistral_key', '');
     if (!mistralKey) { vlog('Översättning: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
@@ -9672,7 +9822,7 @@
       const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
       const translated = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
       if (!translated) throw new Error('Tomt svar från Mistral');
-      const oldTargetText = readDraftailText('id_description_' + targetLang);
+      const oldTargetText = readFieldText('id_description_' + targetLang)   // (v7.100.11);
       if (oldTargetText) vlog('Översättning: Ersätter text i id_description_' + targetLang + ' — gammal text: "' + oldTargetText + '"');
       let newDesc = stripEmDashes(translated.trim());
       if (targetLang === 'en' && !/^NOTE:\s*The event is in Swedish\./im.test(newDesc)) {
@@ -9720,7 +9870,7 @@
   // (agenten är byggd för att skriva om/skapa event, inte för ren översättning,
   // så vi går förbi den och kör en enkel, fristående modell direkt).
   async function translateDescription(targetLang) {
-    const sourceText = readDraftailText('id_description_' + (targetLang === 'en' ? 'sv' : 'en'));
+    const sourceText = readFieldText('id_description_' + (targetLang === 'en' ? 'sv' : 'en'))   // (v7.100.11) textarea på SBR;
     const mistralKey = GM_getValue('mistral_key', '');
     if (!mistralKey) { vlog('Översättning: Mistral API-nyckel saknas (fliken Inställningar).', 'err'); return; }
     const targetName = mistralLangName(targetLang);
@@ -9736,7 +9886,7 @@
       const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
       const translated = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
       if (!translated) throw new Error('Tomt svar från Mistral');
-      const oldTargetText = readDraftailText('id_description_' + targetLang);
+      const oldTargetText = readFieldText('id_description_' + targetLang);   // (v7.100.11)
       if (oldTargetText) vlog('Översättning: Ersätter text i id_description_' + targetLang + ' — gammal text: "' + oldTargetText + '"');
       // (2026-10-20, v7.100.4) Ärligt resultat — "Klar" bara när texten landade.
       const descWriteOk = await updateDraftail('id_description_' + targetLang, stripEmDashes(translated.trim()), true);   // userAction
@@ -9809,12 +9959,330 @@
     const textEl = document.getElementById('id_external_website_url_text');
     if (!urlEl || !textEl || textEl.value.trim() || !urlEl.value.trim()) return;
     const url = urlEl.value.toLowerCase();
-    const isTicketVendor = TICKET_VENDOR_DOMAINS.some(d => url.includes(d));
-    const isStageFilm = currentCategoryTitles().map(c => c.toLowerCase()).includes('stage & film');
     linkTextAutofilled = true;
-    const text = (isTicketVendor || isStageFilm) ? 'Biljetter / Tickets' : 'Mer information / More information';
+    // (v7.100.11) SBR-prompten: länktext = "Mer info / More information" eller
+    // arrangörens namn — näringslivsevent har inga biljettleverantörer, så
+    // "Biljetter / Tickets"-regeln gäller INTE på SBR.
+    let text;
+    if (SBR_MODE) {
+      text = 'Mer information / More information';
+    } else {
+      const isTicketVendor = TICKET_VENDOR_DOMAINS.some(d => url.includes(d));
+      const isStageFilm = currentCategoryTitles().map(c => c.toLowerCase()).includes('stage & film');
+      text = (isTicketVendor || isStageFilm) ? 'Biljetter / Tickets' : 'Mer information / More information';
+    }
     simulateInput(textEl, text);
+    showAutoChangeNote(textEl, 'Länktext ifylld: "' + text + '"');
     vlog('EventEdit: Fyllde i länktext "' + text + '".', 'ok');
+  }
+
+  // (v7.100.11) SBR: organizer_href_text fylls automatiskt med
+  // "Om [arrangörsnamn] / About the Organizer" när organizer_href finns men
+  // textfältet är tomt — samma regel som agentprompten (och samma som koden
+  // redan sätter vid URL-import, se rad ~4359). Fält-id:n antas enligt Wagtail-
+  // konventionen id_organizer_href/id_organizer_href_text; om något saknas
+  // loggas det en gång så vi kan justera.
+  let sbrOrganizerTextFilled = false;
+  function autofillSbrOrganizerHrefText() {
+    if (sbrOrganizerTextFilled || !SBR_MODE) return;
+    const hrefEl = document.getElementById('id_organizer_href');
+    const textEl = document.getElementById('id_organizer_href_text');
+    if (!hrefEl || !textEl) return;
+    if (!hrefEl.value.trim() || textEl.value.trim()) return;
+    const orgEl = document.getElementById('id_organizer') || document.getElementById('id_organizer_name');
+    const orgName = (orgEl && (orgEl.value || orgEl.textContent) || '').trim();
+    sbrOrganizerTextFilled = true;
+    const text = orgName ? ('Om ' + orgName + ' / About the Organizer') : 'Om arrangören / About the Organizer';
+    simulateInput(textEl, text);
+    showAutoChangeNote(textEl, 'Arrangörslänktext ifylld: "' + text + '"');
+    vlog('EventEdit: Fyllde i arrangörslänktext "' + text + '".', 'ok');
+    if (!orgEl) vlog('SBR: arrangörsfält hittades inte (id_organizer/id_organizer_name) — föreslog generisk text.', 'err');
+  }
+
+  // ==== [SBR-EDIT] SBR:s create/edit-sida — automatiska kontroller (v7.100.11) ====
+  // Samma widget som Visit EDIT (sticky bar + logg via initEventChecker(), samma
+  // consent-bar vid "Senast ändrad"), men med SBR:s innehållsregler från
+  // URL-agentens prompt: näringslivston (ej säljande), rena textareor (inga
+  // HTML/markdown), 3–6 meningar, checkbox-fält bara vid explicita signaler,
+  // stadsomfattande event = "Flera platser i Stockholm"/"Various locations".
+  // Körs på BÅDE /wt/cms/snippets/api/event/create/* och /edit/* (dispatchern).
+  // Fält-id:n antas enligt Wagtail-konventionen (id_<fältnamn>) — hittas något
+  // inte loggas det tydligt så vi kan justera efter första körningen.
+
+  // Hjälp: hitta ett fält via id först, annars via label-text (Wagtail renderar
+  // ibland labeln nära fältet). Returnerar elementet eller null. Loggar EN gång
+  // per nyckel när inget hittas (så vi ser i loggen vad som saknas).
+  const sbrFieldMissingLogged = new Set();
+  function sbrFindField(ids, labelRe) {
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (el) return el;
+    }
+    if (labelRe) {
+      const label = [...document.querySelectorAll('label')].find(l => labelRe.test((l.textContent || '').trim()));
+      if (label) {
+        const forId = label.getAttribute('for');
+        if (forId && document.getElementById(forId)) return document.getElementById(forId);
+        const ctrl = label.parentElement && label.parentElement.querySelector('input, select, textarea');
+        if (ctrl) return ctrl;
+      }
+    }
+    return null;
+  }
+  function sbrLogMissing(key, ids) {
+    if (sbrFieldMissingLogged.has(key)) return;
+    sbrFieldMissingLogged.add(key);
+    vlog('SBR-EDIT: fält hittades inte — testade id:n ' + ids.join(', ') + ' (kontrollen hoppas över tills vidare).', 'err');
+  }
+  function sbrCheckbox(id, labelRe) {
+    const el = sbrFindField([id], labelRe);
+    if (!el) { sbrLogMissing(id, [id]); return null; }
+    if (el.type !== 'checkbox') return null;
+    return el;
+  }
+
+  // textsökning i titel+beskrivningar (båda språken)
+  function sbrAllText() {
+    return ((document.getElementById('id_title_en')?.value || '') + ' ' +
+      (document.getElementById('id_title_sv')?.value || '') + ' ' +
+      readFieldText('id_description_en') + ' ' + readFieldText('id_description_sv'));
+  }
+
+  // is_free: true ENDAST vid explicit gratis-signal; annars ska rutan vara OCheckad.
+  const SBR_FREE_SIGNALS = wordListRe(['gratis', 'kostnadsfritt', 'fritt inträde', 'free entry', 'free admission', 'no fee', 'free of charge']);
+  function checkSbrIsFree() {
+    const el = sbrCheckbox('id_is_free', /gratis|free/i);
+    if (!el) return;
+    const hasSignal = SBR_FREE_SIGNALS.test(sbrAllText());
+    if (el.checked && !hasSignal) {
+      setFieldNote(el, 'sbrfree', '<div style="color:#c02626;font-weight:600;">⚠️ "Gratis" är ikryssat men texten säger inte uttryckligen att eventet är gratis (gratis/kostnadsfritt/free entry/no fee) — enligt regeln ska is_free bara sättas vid explicit signal.</div>');
+    } else if (!el.checked && hasSignal) {
+      setFieldNote(el, 'sbrfree', '<div style="color:#e0a052;font-weight:600;">ℹ️ Texten säger att eventet är gratis men "Gratis" är INTE ikryssat — kryssa i om det stämmer.</div>');
+    } else {
+      setFieldNote(el, 'sbrfree', '');
+    }
+  }
+
+  // is_digital: true ENDAST helt digitalt/online — hybridevent (fysisk plats OCH
+  // digitalt) räknas INTE.
+  const SBR_DIGITAL_SIGNALS = wordListRe(['online', 'digitalt', 'webinar', 'webbinarium', 'livestream', 'live stream', 'via zoom', 'via teams', 'digital event', 'virtuellt', 'virtual event', 'på distans']);
+  const SBR_PHYSICAL_SIGNALS = wordListRe(['på plats', 'fysiskt', 'irl', 'in person', 'på lokal', 'onsite', 'face-to-face', 'i lokalen']);
+  function checkSbrIsDigital() {
+    const el = sbrCheckbox('id_is_digital', /digital/i);
+    if (!el) return;
+    const text = sbrAllText();
+    const hasDigital = SBR_DIGITAL_SIGNALS.test(text);
+    const hasPhysical = SBR_PHYSICAL_SIGNALS.test(text);
+    const venue = ((document.getElementById('id_venue_name_en')?.value || '') + ' ' +
+      (document.getElementById('id_venue_name_sv')?.value || '')).trim();
+    const address = (document.getElementById('id_address')?.value || '').trim();
+    const hasPlace = !!(venue && !/flera platser|various locations/i.test(venue)) || !!address;
+    if (el.checked && hasPlace && !hasDigital) {
+      setFieldNote(el, 'sbrdigital', '<div style="color:#c02626;font-weight:600;">⚠️ "Digitalt" är ikryssat men eventet har en fysisk plats (venue/adress ifylld) — ett hybridevent räknas INTE som is_digital.</div>');
+    } else if (el.checked && hasPhysical && hasDigital) {
+      setFieldNote(el, 'sbrdigital', '<div style="color:#e0a052;font-weight:600;">ℹ️ Texten nämner både digitalt och fysiskt deltagande (hybrid) — is_digital ska bara vara true för HELT digitala event.</div>');
+    } else if (!el.checked && hasDigital && !hasPlace && !hasPhysical) {
+      setFieldNote(el, 'sbrdigital', '<div style="color:#e0a052;font-weight:600;">ℹ️ Texten tyder på ett helt digitalt event men "Digitalt" är INTE ikryssat.</div>');
+    } else {
+      setFieldNote(el, 'sbrdigital', '');
+    }
+  }
+
+  // is_impact_days: true ENDAST vid explicit "Stockholm Impact Days"-koppling.
+  function checkSbrImpactDays() {
+    const el = sbrCheckbox('id_is_impact_days', /impact days/i);
+    if (!el) return;
+    const mentions = /stockholm\s+impact\s+days/i.test(sbrAllText());
+    if (el.checked && !mentions) {
+      setFieldNote(el, 'sbrimpact', '<div style="color:#c02626;font-weight:600;">⚠️ "Impact Days" är ikryssat men "Stockholm Impact Days" nämns ingenstans i titel/beskrivning — sätt bara vid explicit koppling.</div>');
+    } else if (!el.checked && mentions) {
+      setFieldNote(el, 'sbrimpact', '<div style="color:#e0a052;font-weight:600;">ℹ️ Texten nämner "Stockholm Impact Days" men rutan är INTE ikryssad.</div>');
+    } else {
+      setFieldNote(el, 'sbrimpact', '');
+    }
+  }
+
+  // language: aldrig tomt; signal-baserat förslag. SBR-prompten: exakt ett av
+  // "Engelska"/"Svenska"/"Other" efter vilket språk eventet FAKTISKT hålls på.
+  function checkSbrLanguage() {
+    const el = sbrFindField(['id_language'], /språk|language/i);
+    if (!el || el.tagName !== 'SELECT') { if (el === null) sbrLogMissing('id_language', ['id_language']); return; }
+    const val = (el.value || '').trim();
+    const text = sbrAllText();
+    const enSignal = wordListRe(['in english', 'held in english', 'english only', 'språket är engelska']).test(text);
+    const svSignal = wordListRe(['på svenska', 'svenskt språk', 'held in swedish']).test(text);
+    if (!val) {
+      let suggestion = '';
+      if (enSignal && !svSignal) suggestion = 'Engelska';
+      else if (svSignal && !enSignal) suggestion = 'Svenska';
+      setFieldNote(el, 'sbrlang', '<div style="color:#c02626;font-weight:600;">⚠️ Språkfältet är tomt — det är obligatoriskt (Engelska/Svenska/Other efter vilket språk eventet hålls på).' + (suggestion ? ' Texten tyder på <b>' + suggestion + '</b>.' : '') + '</div>');
+    } else {
+      setFieldNote(el, 'sbrlang', '');
+    }
+  }
+
+  // main_subject / event_type: obligatoriska, exakta strängar — här bara
+  // "är något valt överhuvudtaget" (innehållsvalet är redaktionellt).
+  function checkSbrSubjectAndType() {
+    const ms = sbrFindField(['id_main_subject'], /huvudämne|main subject/i);
+    const hiddenMs = document.querySelector('input[name="main_subject"]');
+    if ((!ms || !(ms.value || '').trim()) && (!hiddenMs || !hiddenMs.value.trim())) {
+      if (ms) setFieldNote(ms, 'sbrsubject', '<div style="color:#c02626;font-weight:600;">⚠️ Huvudämne (main_subject) är inte valt — obligatoriskt fält.</div>');
+      else sbrLogMissing('id_main_subject', ['id_main_subject', 'input[name=main_subject]']);
+    } else if (ms) {
+      setFieldNote(ms, 'sbrsubject', '');
+    }
+    const et = sbrFindField(['id_event_type'], /eventtyp|event type/i);
+    const hiddenEt = document.querySelector('input[name="event_type"]');
+    if ((!et || !(et.value || '').trim()) && (!hiddenEt || !hiddenEt.value.trim())) {
+      if (et) setFieldNote(et, 'sbreventtype', '<div style="color:#c02626;font-weight:600;">⚠️ Eventtyp (event_type) är inte vald — obligatoriskt fält.</div>');
+      else sbrLogMissing('id_event_type', ['id_event_type', 'input[name=event_type]']);
+    } else if (et) {
+      setFieldNote(et, 'sbreventtype', '');
+    }
+  }
+
+  // Stadsomfattande event utan fast plats: venue ska vara "Flera platser i
+  // Stockholm"/"Various locations in Stockholm" och adress tom.
+  const SBR_CITYWIDE_SIGNALS = wordListRe(['hela stockholm', 'city-wide', 'citywide', 'i hela staden', 'sprids över hela', 'flera platser', 'various locations', 'throughout stockholm', 'across stockholm', 'stadens', 'staden']);
+  const SBR_CITYWIDE_VENUE = /flera platser i stockholm|various locations in stockholm/i;
+  function checkSbrCitywide() {
+    const venueEn = document.getElementById('id_venue_name_en');
+    const venueSv = document.getElementById('id_venue_name_sv');
+    const addr = document.getElementById('id_address');
+    const text = sbrAllText();
+    const citywideSignal = SBR_CITYWIDE_SIGNALS.test(text);
+    const venueVal = ((venueEn?.value || '') + ' ' + (venueSv?.value || '')).trim();
+    const isCitywideVenue = SBR_CITYWIDE_VENUE.test(venueVal);
+    const addrVal = (addr?.value || '').trim();
+    if (citywideSignal && venueVal && !isCitywideVenue && !addrVal) {
+      (venueSv || venueEn) && setFieldNote(venueSv || venueEn, 'sbrcity', '<div style="color:#e0a052;font-weight:600;">ℹ️ Texten beskriver ett stadsomfattande event — venue bör vara "Flera platser i Stockholm"/"Various locations in Stockholm" (och adress tom).</div>');
+    } else if (isCitywideVenue && addrVal) {
+      setFieldNote(addr, 'sbrcity', '<div style="color:#c02626;font-weight:600;">⚠️ Venue är "Flera platser i Stockholm"/"Various locations" men adressfältet är ifyllt — vid stadsomfattande event ska adress lämnas TOM.</div>');
+    } else {
+      [venueEn, venueSv, addr].forEach(el => { if (el) setFieldNote(el, 'sbrcity', ''); });
+    }
+  }
+
+  // organizer_href_text ska vara tom när organizer_href är tom.
+  function checkSbrOrganizerHrefText() {
+    const hrefEl = document.getElementById('id_organizer_href');
+    const textEl = document.getElementById('id_organizer_href_text');
+    if (!hrefEl || !textEl) return;
+    if (!hrefEl.value.trim() && textEl.value.trim()) {
+      setFieldNote(textEl, 'sbrorghref', '<div style="color:#c02626;font-weight:600;">⚠️ Arrangörslänken (organizer_href) är tom men länktexten är ifylld — lämna texten tom när länken är tom.</div>');
+    } else {
+      setFieldNote(textEl, 'sbrorghref', '');
+    }
+  }
+
+  // Beskrivning: ren löptext (ingen HTML/markdown — fältet är en vanlig textruta
+  // på SBR) och 3–6 meningar enligt agentprompten. Flaggas bara, Mistral-knapp.
+  const SBR_MARKUP_RE = /<\/?[a-z][^>]*>|\*\*[^*]+\*\*|__[^_]+__|\[[^\]]+\]\([^)]+\)|^#{1,6}\s|\|[^|\n]+\|/m;
+  function countSentences(text) {
+    return (text.match(/[^.!?\u2026]+[.!?\u2026]+["'\u201d)]*/g) || (text.trim() ? [text.trim()] : [])).length;
+  }
+  function checkSbrDescriptionShape() {
+    ['en', 'sv'].forEach(lang => {
+      const fieldId = 'id_description_' + lang;
+      const el = document.getElementById(fieldId);
+      const text = readFieldText(fieldId).trim();
+      if (!text) { setFieldNote(el, 'sbrshape', ''); return; }
+      const issues = [];
+      if (SBR_MARKUP_RE.test(text)) {
+        issues.push({ label: 'Formatering i fält', msg: 'Texten innehåller HTML/markdown-liknande formatering — beskrivningsfältet på SBR är en REN textruta, formatering syns som rå kod.' });
+      }
+      const n = countSentences(text);
+      if (n < 3 || n > 6) {
+        issues.push({ label: 'Längd', msg: 'Beskrivningen har ' + n + ' mening' + (n === 1 ? '' : 'ar') + ' — riktlinjen är 3–6 meningar.' });
+      }
+      if (!issues.length) { setFieldNote(el, 'sbrshape', ''); return; }
+      setFieldNote(el, 'sbrshape',
+        '<div style="color:#c02626;font-weight:600;">⚠️ ' + issues.map(i => i.label + ': ' + i.msg).join(' ') + '</div>' +
+        '<div style="margin-top:6px;"><button type="button" class="vseh-sbrshape-fix-btn" data-lang="' + lang + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (ren löptext, 3–6 meningar)</button></div>');
+    });
+    document.querySelectorAll('.vseh-sbrshape-fix-btn').forEach(btn => {
+      if (btn.dataset.wired) return;
+      btn.dataset.wired = '1';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Anropar Mistral…';
+        await rewriteSbrDescriptionShape(btn.dataset.lang);
+        btn.disabled = false;
+        btn.textContent = orig;
+      });
+    });
+  }
+  // Mistral-omskrivning av SBR-beskrivning: ren löptext, 3–6 meningar, saklig
+  // näringslivston (ingen säljtext), behåll all sakinfo.
+  async function rewriteSbrDescriptionShape(lang) {
+    const fieldId = 'id_description_' + lang;
+    const text = readFieldText(fieldId);
+    if (!text.trim()) return;
+    const mistralKey = GM_getValue('sbr_mistral_key', '');
+    if (!mistralKey) { vlog('SBR-beskrivning: Mistral API-nyckel saknas (SBR-fliken Inställningar).', 'err'); return; }
+    try {
+      vlog('SBR-beskrivning: Skickar text till Mistral (' + fieldId + ')…');
+      const payload = {
+        model: 'mistral-small-latest',
+        messages: [
+          { role: 'system', content: 'Du är redaktör för Stockholm Business Region näringslivsevent. Skriv om texten användaren ger till REN LÖPTEXT (ingen HTML, ingen markdown — fältet är en vanlig textruta) på 3–6 meningar. Saklig, professionell, informativ näringslivston — vad eventet handlar om, för vem, vad deltagare kan förvänta sig. UNDVIK säljande/upplevelseinriktat språk. Ta INTE med teknisk/logistisk info som redan finns i andra fält (adress, datum, pris). Texten är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + '. Svara ENDAST med den omskrivna texten, ingen kommentar, inga citattecken, ingen formatering.' + NO_EMDASH_RULE },
+          { role: 'user', content: text }
+        ]
+      };
+      const resp = await gmPost(MISTRAL_CHAT, { 'Authorization': 'Bearer ' + mistralKey, 'Content-Type': 'application/json' }, payload);
+      const rewritten = resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;
+      if (!rewritten) throw new Error('Tomt svar från Mistral');
+      const cleaned = stripEmDashes(rewritten.trim()).replace(EMOJI_RE, '').replace(/ {2,}/g, ' ');
+      vlog('SBR-beskrivning: Ersätter text i ' + fieldId + ' — gammal text: "' + text.slice(0, 120) + '…"');
+      const ok = await updateDraftail(fieldId, cleaned, true);
+      if (ok) {
+        showAutoChangeNote(document.getElementById(fieldId), 'Beskrivning ' + lang + ' omskriven av Mistral (ren löptext)');
+        vlog('SBR-beskrivning: Klar (' + fieldId + ').', 'ok');
+      } else {
+        vlog('SBR-beskrivning: MISSLYCKADES — klistra in manuellt. Ny text: "' + cleaned + '"', 'err');
+      }
+    } catch (e) {
+      vlog('SBR-beskrivning: Fel — ' + e.message, 'err');
+    }
+  }
+
+  // Samlad poll för SBR create/edit. Kör bara de SBR-specifika kontrollerna här;
+  // de delade (titel/guideline/identical/linktext m.m.) körs via samma
+  // runEditPageChecks()-anrop som Visit (se initSbrEditAutomation nedan).
+  function runSbrEditPageChecks() {
+    if (!SBR_MODE) return;
+    checkSbrIsFree();
+    checkSbrIsDigital();
+    checkSbrImpactDays();
+    checkSbrLanguage();
+    checkSbrSubjectAndType();
+    checkSbrCitywide();
+    checkSbrOrganizerHrefText();
+    checkSbrDescriptionShape();
+    autofillSbrOrganizerHrefText();
+    renderAutoChangeNotes();
+  }
+
+  // (v7.100.11) Init för SBR:s create/edit: samma EventChecker-bar + logg som
+  // Visit EDIT (initEventChecker), mejlknappar om fältet finns, consent-bar vid
+  // redan hanterat event, och samma 1.5 s-poll som dessutom kör SBR-kontrollerna.
+  function initSbrEditAutomation() {
+    vlog('SBR-EDIT: Initierar automatiska kontroller på SBR create/edit-sida');
+    const startAutomation = () => {
+      initEventChecker();
+      installResaleSubmitGuard();
+      loadManuallyRemovedGuides();
+      runEditPageChecks();
+      runSbrEditPageChecks();
+      setInterval(() => { runEditPageChecks(); runSbrEditPageChecks(); }, 1500);
+    };
+    if (findAlreadyHandledIndicator()) {
+      showAutomationConsentBar(startAutomation);
+    } else {
+      startAutomation();
+    }
   }
 
   function runEditPageChecks() {
@@ -10033,10 +10501,13 @@
     if (mode === 'small') mode = 'max';            // legacy-läge → maximera
     if (!['min', 'max'].includes(mode)) mode = 'min';
     buildSbrPanel();
-    // (2026-10-26, v7.100.10) På SBR create/edit: kontrollera ev. bruten bild
-    // (filnamn sparat men filen saknas på servern).
+    // (2026-10-27, v7.100.11) På SBR create/edit: samma EDIT-automationswidget
+    // som Visit (sticky bar + logg + alla textkontroller) PLUS SBR-specifika
+    // innehållsregler (is_free/is_digital/impact_days/language/subject/
+    // event_type/stadsomfattande venue/organizer-länktext/ren löptext).
     if (/\/wt\/cms\/snippets\/api\/event\/(create|edit)\//.test(location.pathname)) {
-      setInterval(checkBrokenImageOnPage, 2000);
+      initSbrEditAutomation();
+      setInterval(checkBrokenImageOnPage, 2000);   // (v7.100.10) bruten bild
     }
     // (2026-10-26, v7.100.9) Dubblettkollen (SBR-DRAFT) körs på ALLA SBR:s
     // eventlist-URL:er (inte bara ?status=draft) — panelen OCH dubblettvyn
