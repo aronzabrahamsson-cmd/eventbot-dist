@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.8
+// @version      7.100.9
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1594,10 +1594,14 @@
     const evHasPlace = !!(normText(ev.venue_name) || normAddr(ev.address));
     cand.forEach(i => {
       const row = idx.rows[i];
-      // (2026-10-26) Självträff: när matchStatus körs mot samma lista som ev
-      // själv kommer från (SBR-DRAFT), måste raden själv exkluderas — annars
-      // matchar varje rad sig själv (tSim=1.0) och allt blir "Dubblett".
-      if (ev._key && row._key && ev._key === row._key) return;
+      // (2026-10-26, v7.100.9) Självträff: när matchStatus körs mot samma lista
+      // som ev själv kommer från (SBR-DRAFT) måste raden själv exkluderas.
+      // Jämför på href (edit-länken) i första hand — två RIKTIGA dubbletter i
+      // listan har OLIKA href men kan ha samma titel+datum, så en _key-
+      // jämförelse skulle felaktigt exkludera dem också. Saknas href faller
+      // vi tillbaka på _key.
+      if (ev._selfHref && row._selfHref) { if (ev._selfHref === row._selfHref) return; }
+      else if (ev._key && row._key && ev._key === row._key) return;
       if (isDismissed(ev, row)) return;
       // Bästa av engelsk/svensk titeljämförelse — en kalenderrad kan exponera
       // bara ETT språks titel (se kommentaren vid kandidatinsamlingen ovan).
@@ -4710,7 +4714,10 @@
     .dp-multi { color:var(--vd-accent); font-weight:600; cursor:pointer; user-select:none; }
     .dp-arrow { font-size:9px; }
     .dp-dates { margin-top:4px; color:var(--vd-txt2); font-size:11px; line-height:1.6; }
-    #vseh-logwrap { position:fixed; bottom:18px; left:18px; width:440px; max-height:50vh; z-index:1000001;
+    #vseh-logwrap { position:fixed; bottom:18px; left:18px; width:440px; max-height:50vh; z-index:2147483000;
+    /* (2026-10-26, v7.100.9) 2147483000 = nära max för z-index — Wagtails
+       dialogfönster/modaler ligger runt z-index 1050+, så loggfönstret måste
+       upp dit för att synas även när en dialog är öppen. */
       background:var(--vd-bg); border:1px solid var(--vd-accent); border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,.6);
       display:flex; flex-direction:column; overflow:hidden; }
     .vseh-loghdr { font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--vd-txt2); padding:8px 11px;
@@ -6003,6 +6010,19 @@
 
   function loadSbrManualCal() {
     try { sbrManualCal = JSON.parse(GM_getValue(SBR_CAL_KEY, '[]')) || []; } catch { sbrManualCal = []; }
+    // (2026-10-26, v7.100.9) Sanera bort badge-föroreningar från äldre körningar:
+    // före v7.100.9 lästes titelcellens hela textContent, så när SBR-DRAFT satte
+    // in badges (🎭/🤔/✅) i cellen blev sparade titlar "🎭 Dubblett\n…Titel".
+    // Rensa prefixet så gamla poster får tillbaka rena titlar och samma
+    // sbrCalKey som nya importer.
+    let dirty = false;
+    const badgeRe = /^\s*(?:\uD83C\uDFAD|\uD83E\uDD14|\u2705)[^\n]*\n+(?:\s*\n)*/u;
+    sbrManualCal.forEach(e => {
+      const en = (e.title_en || '').replace(badgeRe, '').trim();
+      const sv = (e.title_sv || '').replace(badgeRe, '').trim();
+      if (en !== e.title_en || sv !== e.title_sv) { e.title_en = en; e.title_sv = sv; dirty = true; }
+    });
+    if (dirty) { saveSbrManualCal(); vlog('Eventlista: sanerade bort badge-text från ' + 'sparade titlar (äldre import).', 'ok'); }
   }
   function saveSbrManualCal() { GM_setValue(SBR_CAL_KEY, JSON.stringify(sbrManualCal)); }
 
@@ -6041,7 +6061,13 @@
   function extractSbrRowData(row) {
     const cells = row.children;
     if (!cells || cells.length < 6) return null;
-    const title_en = (cells[1]?.textContent || '').trim();
+    // (2026-10-26, v7.100.9) Läs EN-titeln från länken (<a>) i titelcellen,
+    // INTE från cellens hela textContent — SBR-DRAFT-vyn stoppar in badges
+    // (🎭/🤔/✅) i samma cell, och då blev textContent "🎭 Dubblett\n...Titel"
+    // vid nästa import → varje rad fick en NY sbrCalKey → importen växte
+    // 15 rader per körning (302→317→332) och alla synliga rader blev till
+    // slut "Dubblett" mot sina egna badge-förorenade kopior.
+    const title_en = (cells[1]?.querySelector('a')?.textContent || cells[1]?.textContent || '').trim();
     const title_sv = (cells[2]?.textContent || '').trim();
     if (!title_en && !title_sv) return null;
     const start_date = parseSwedishDate((cells[3]?.textContent || '').trim()) || '';
@@ -6054,6 +6080,9 @@
   }
 
   function fetchVisibleSbrEvents() {
+    // (2026-10-26, v7.100.9) Ta bort dubblett-badges först — annars kan
+    // badge-texten smyga in i titelcellens textContent vid import.
+    document.querySelectorAll('.vseh-sbrdraft-badge, .vseh-draft-badge').forEach(b => b.remove());
     const titleCells = [...document.querySelectorAll('td.title')];
     if (!titleCells.length) { vlog('Eventlista: hittade inga rader (ingen td.title) på sidan — är du på SBR:s eventlista?', 'err'); return; }
     const parsed = titleCells.map(td => extractSbrRowData(td.closest('tr'))).filter(Boolean);
@@ -7160,7 +7189,8 @@
       href: e.href || '',
       dates: e.start_date ? [{ date: e.start_date }] : [],
       _source: 'sbr-list',
-      _key: sbrCalKey(e)
+      _key: sbrCalKey(e),
+      _selfHref: e.href || ''
     };
   }
 
@@ -7235,6 +7265,7 @@
     if (!sbrManualCal.length) { vlog('SBR-Draft: Eventlistan är tom — inget att kontrollera.', 'err'); return; }
     vlog('SBR-Draft: Kör dubblettkontroll på ' + sbrManualCal.length + ' importerade rader (inom listan)');
     const rows = document.querySelectorAll('td.title');
+    if (!rows.length) { vlog('SBR-Draft: Inga listrader (td.title) på denna sida — är du på SBR:s eventlista?', 'err'); return; }
     document.querySelectorAll('.vseh-sbrdraft-badge').forEach(b => b.remove());
     document.querySelectorAll('.vseh-sbrdraft-cmp-row').forEach(r => r.remove());
 
@@ -7249,6 +7280,7 @@
       const ev = sbrCalRow(data);
       ev.title = ev.title || ev.title_sv;
       ev._key = sbrCalKey(data);
+      ev._selfHref = data.href || '';
       // matchStatus mot VÅR EGEN lista (index-param), strict som i DRAFT-vyn.
       const st = matchStatus(ev, { strict: true, index: sbrDraftIndex });
       const info = sbrDraftBadgeInfo(st);
@@ -9905,9 +9937,11 @@
     if (mode === 'small') mode = 'max';            // legacy-läge → maximera
     if (!['min', 'max'].includes(mode)) mode = 'min';
     buildSbrPanel();
-    // (2026-10-26) På ?status=draft körs även dubblettkollen (SBR-DRAFT) —
-    // panelen OCH dubblettvyn samtidigt, badges på listans rader.
-    if (/[?&]status=draft(?:&|$)/.test(location.search)) initSbrDraftDedup();
+    // (2026-10-26, v7.100.9) Dubblettkollen (SBR-DRAFT) körs på ALLA SBR:s
+    // eventlist-URL:er (inte bara ?status=draft) — panelen OCH dubblettvyn
+    // samtidigt, badges på listans rader. På create/edit-sidor finns inga
+    // td.title-rader så körningen blir en no-op där.
+    if (/\/wt\/cms\/snippets\/api\/event\/(\?|$)/.test(location.pathname + location.search)) initSbrDraftDedup();
   } else if (KNOWN_DRAFT_URL.test(location.href)) {
     initDraftvyDubblettkoll();
   } else if (KNOWN_EDIT_URL.test(location.href)) {
