@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.11
+// @version      7.100.12
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -12,6 +12,9 @@
 // @match        https://www.visitstockholm.com/cms/api/event/edit/*
 // @match        https://www.visitstockholm.se/cms/api/event/edit/*
 // @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/event/edit/*
+// @match        https://www.stockholmbusinessregion.se/wt/cms/snippets/api/venue/add/*
+// @match        https://www.visitstockholm.com/cms/snippets/api/venue/add/*
+// @match        https://www.visitstockholm.se/cms/snippets/api/venue/add/*
 // @match        https://www.visitstockholm.com/cms/pages/*
 // @match        https://www.visitstockholm.se/cms/pages/*
 // @match        https://www.visitstockholm.com/cms/images/*
@@ -8108,7 +8111,10 @@
       // checkGuidelineIssues håller noten så länge något är flaggat och
       // städarnas emdash/caps-noter ligger i separata note-element.
       note.style.cssText = 'font-size:13px;margin:4px 0;';
-      wrap.insertBefore(note, wrap.firstChild);
+      // (v7.100.12) Auto-ändrings-popupen ("vad scriptet gjorde") ska ligga
+      // NEDANFÖR fältet, inte ovanför — övriga nottyper ligger kvar överst.
+      if (key === 'autochange') wrap.appendChild(note);
+      else wrap.insertBefore(note, wrap.firstChild);
     }
     // Hovringsspärr (2026-10-09): checkboxarna i Åtgärder-rutan syns bara när
     // musen är över rutan, men pollingen (var 1.5s) skriver om hela innerHTML —
@@ -9999,6 +10005,103 @@
     if (!orgEl) vlog('SBR: arrangörsfält hittades inte (id_organizer/id_organizer_name) — föreslog generisk text.', 'err');
   }
 
+  // ==== [VENUE-ADD] "Lägg till plats i listan" (v7.100.12) ==================
+  // På event-EDIT (Visit + SBR) ligger en knapp bredvid venue-rullgardenen.
+  // Klick: 1) kopiera all platsinfo från eventformuläret till GM-nyckeln
+  // `venue_handoff`, 2) öppna sajtens venue/add-sida i NY FLIK (en riktig
+  // <a target="_blank"> så popup-blockerare inte stoppar; ctrl-klick funkar
+  // också), 3) scriptet kör även på venue/add-sidan och fyller i den sparade
+  // infon där (samma domän => samma GM-lager).
+  const VENUE_HANDOFF_KEY = 'venue_handoff';
+  // Fält som kopieras från eventformuläret till venue/add-formuläret — samma
+  // id:n på båda sajternas venue/add (bekräftat via fältkartläggning
+  // 2026-10-27). id_location är ett dolt pk-fält (referens till befintlig
+  // plats) och kopieras INTE; id_location_latlng är kartans koordinater.
+  const VENUE_HANDOFF_FIELDS = ['id_venue_name_sv', 'id_venue_name_en', 'id_address',
+    'id_zip_code', 'id_city', 'id_closest_station', 'id_location_latlng'];
+  function venueAddUrl() {
+    return SBR_MODE
+      ? 'https://www.stockholmbusinessregion.se/wt/cms/snippets/api/venue/add/'
+      : 'https://www.visitstockholm.com/cms/snippets/api/venue/add/';
+  }
+  function collectVenueHandoff() {
+    const data = {};
+    VENUE_HANDOFF_FIELDS.forEach(id => {
+      const el = document.getElementById(id);
+      data[id] = el ? (el.value || '').trim() : '';
+    });
+    return data;
+  }
+  function installVenueAddButton() {
+    if (document.getElementById('vseh-venue-add-btn')) return;
+    // Hitta venue-rullgardenen: id_venue först, annars select vars scope
+    // innehåller "Venue"/"Plats".
+    const sel = document.getElementById('id_venue') ||
+      [...document.querySelectorAll('select')].find(s => {
+        const scope = s.closest('li, fieldset, div');
+        return scope && /\bvenue\b|\bplats\b/i.test(scope.textContent || '');
+      });
+    if (!sel) return;
+    const wrap = document.createElement('span');
+    wrap.style.cssText = 'display:inline-flex; align-items:center; gap:6px; margin-left:8px;';
+    const a = document.createElement('a');
+    a.id = 'vseh-venue-add-btn';
+    a.href = venueAddUrl();
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.textContent = '\u2795 L\u00e4gg till plats i listan';
+    a.style.cssText = 'font-size:12px; padding:3px 9px; border:1px solid var(--vd-line,#3a3f4b); ' +
+      'border-radius:6px; text-decoration:none; cursor:pointer; white-space:nowrap; ' +
+      'background:var(--vd-bg2,#2a2f3a); color:var(--vd-txt,#e8e8e8);';
+    a.addEventListener('click', () => {
+      const data = collectVenueHandoff();
+      // Spara INNAN fliken öppnas — GM_setValue är synkront nog för detta
+      // ändamål i Tampermonkey; ts gör att venue-sidan bara tar emot NYA
+      // handoffs (max 5 min gamla).
+      GM_setValue(VENUE_HANDOFF_KEY, { data, ts: Date.now(), src: location.href });
+      const filled = Object.values(data).filter(v => v).length;
+      vlog('L\u00e4gg till plats: kopierade ' + filled + ' ifyllda f\u00e4lt (' +
+        VENUE_HANDOFF_FIELDS.filter(id => data[id]).join(', ') + ') och \u00f6ppnar venue/add i ny flik.', 'ok');
+    });
+    wrap.appendChild(a);
+    sel.insertAdjacentElement('afterend', wrap);
+    vlog('L\u00e4gg till plats i listan-knapp placerad vid venue-f\u00e4ltet.', 'ok');
+  }
+
+  // Körs på venue/add-sidorna (see dispatcher): om det finns en f\u00e4rsk
+  // handoff sparad fyller scriptet i f\u00e4lten direkt.
+  function initVenueAddPage() {
+    vlog('Venue-add: kollar efter sparad platsinfo fr\u00e5n eventformul\u00e4ret\u2026');
+    let h = null;
+    try { h = GM_getValue(VENUE_HANDOFF_KEY, null); } catch {}
+    if (!h || !h.data || !h.ts || Date.now() - h.ts > 5 * 60 * 1000) {
+      vlog('Venue-add: ingen f\u00e4rsk handoff (eller f\u00f6r gammal) \u2014 fyller i inget.', 'ok');
+      return;
+    }
+    // Ta bort direkt så samma handoff inte fylls i igen vid omladdning.
+    GM_setValue(VENUE_HANDOFF_KEY, null);
+    let filled = 0;
+    VENUE_HANDOFF_FIELDS.forEach(id => {
+      const val = (h.data[id] || '').trim();
+      const el = document.getElementById(id);
+      if (!val || !el) return;
+      setNativeValue(el, val);
+      filled++;
+    });
+    vlog('Venue-add: fyllde i ' + filled + ' f\u00e4lt fr\u00e5n eventet (' + (h.src || '') + '). Spara formul\u00e4ret.', 'ok');
+    // Visa en tydlig banner högst upp så användaren ser att något hänt.
+    const anchor = document.querySelector('.page-header, .header, header, h1') || document.querySelector('form');
+    if (anchor) {
+      const bar = document.createElement('div');
+      bar.id = 'vseh-venue-handoff-bar';
+      bar.style.cssText = 'position:sticky;top:0;z-index:9999;background:#1f7a4d;color:#fff;' +
+        'padding:10px 14px;border-radius:6px;margin:0 0 14px;font-weight:600;' +
+        'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;';
+      bar.textContent = '\u2705 Fyllde i ' + filled + ' f\u00e4lt fr\u00e5n eventformul\u00e4ret \u2014 kontrollera och spara platsen.';
+      anchor.parentNode.insertBefore(bar, anchor.nextSibling);
+    }
+  }
+
   // ==== [SBR-EDIT] SBR:s create/edit-sida — automatiska kontroller (v7.100.11) ====
   // Samma widget som Visit EDIT (sticky bar + logg via initEventChecker(), samma
   // consent-bar vid "Senast ändrad"), men med SBR:s innehållsregler från
@@ -10276,7 +10379,8 @@
       loadManuallyRemovedGuides();
       runEditPageChecks();
       runSbrEditPageChecks();
-      setInterval(() => { runEditPageChecks(); runSbrEditPageChecks(); }, 1500);
+      installVenueAddButton();
+      setInterval(() => { runEditPageChecks(); runSbrEditPageChecks(); installVenueAddButton(); }, 1500);
     };
     if (findAlreadyHandledIndicator()) {
       showAutomationConsentBar(startAutomation);
@@ -10412,11 +10516,12 @@
       installResaleSubmitGuard();
       loadManuallyRemovedGuides();
       runEditPageChecks();
+      installVenueAddButton();
       // Formuläret uppdaterar sina dolda fält utan DOM-mutationer vi enkelt
       // kan observera (Draftails onChange, autocompletens val-klick) — en
       // enkel poll täcker alla kontrollerna ovan billigt nog för ett
       // formulär av den här storleken.
-      setInterval(runEditPageChecks, 1500);
+      setInterval(() => { runEditPageChecks(); installVenueAddButton(); }, 1500);
     };
     if (findAlreadyHandledIndicator()) {
       showAutomationConsentBar(startAutomation);
@@ -10516,6 +10621,9 @@
     if (/\/wt\/cms\/snippets\/api\/event\/(\?|$)/.test(location.pathname + location.search)) initSbrDraftDedup();
   } else if (KNOWN_DRAFT_URL.test(location.href)) {
     initDraftvyDubblettkoll();
+  } else if (/\/wt\/cms\/snippets\/api\/venue\/add\//.test(location.href) ||
+             /\/cms\/snippets\/api\/venue\/add\//.test(location.href)) {
+    initVenueAddPage();
   } else if (KNOWN_EDIT_URL.test(location.href)) {
     initEventEditAutomation();
   } else if (KNOWN_GUIDE_LIST_URL.test(location.href)) {
