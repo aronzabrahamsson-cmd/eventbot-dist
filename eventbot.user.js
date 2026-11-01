@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.12
+// @version      7.100.13
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -7935,8 +7935,11 @@
         return findAllRanges(text, PHONE_IN_TEXT_RE).concat(findAllRanges(text, EMAIL_IN_TEXT_RE));
       case 'Vi/oss-språk': return findAllRanges(text, wordListRe(WE_US_WORDS_SV.concat(WE_US_WORDS_EN)));
       case 'Säljspråk': {
-        const hit = HYPE_WORDS.find(w => text.toLowerCase().includes(w.toLowerCase()));
-        return hit ? findAllRanges(text, new RegExp(hit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')) : [];
+        // (v7.100.13) På SBR även SBR-hype-listorna (oförglömlig, missa inte,
+        // don't miss m.fl.) — ordgränsade så samma ord inte understryks två ggr.
+        const words = SBR_MODE ? HYPE_WORDS.concat(SBR_HYPE_WORDS_SV, SBR_HYPE_WORDS_EN) : HYPE_WORDS;
+        const hit = words.find(w => new RegExp(wordBoundaryPattern(w), 'i').test(text));
+        return hit ? findAllRanges(text, new RegExp(wordBoundaryPattern(hit), 'i')) : [];
       }
       case 'Möjlig otillåten eventtyp': {
         const hit = INELIGIBLE_EVENT_WORDS.find(w => wordListRe([w]).test(text)) || (/\bmässa\b/i.test(text) ? 'mässa' : null);
@@ -8023,13 +8026,93 @@
   function clearGuidelineUnderlines(fieldId) {
     const hidden = document.getElementById(fieldId);
     const wrap = hidden && (hidden.closest('.w-field, .w-panel, [data-field]') || hidden.parentElement);
-    const old = wrap && wrap.querySelector('.vseh-gl-overlay');
-    if (old) old.remove();
+    if (!wrap) return;
+    wrap.querySelectorAll('.vseh-gl-overlay, .vseh-gl-mirror').forEach(el => el.remove());
+  }
+
+  // (v7.100.13) Understrykningar i en vanlig <textarea> (SBR): en textarea kan
+  // inte innehålla rik text, så vi bygger en OSYNLIG "mirror"-div med samma
+  // typografi/bredd som textarean, stoppar in texten med varje flaggad term i
+  // en <span>, mäter span-rectarna och ritar linjer i en overlay ovanpå
+  // textarean. Vid scroll ritas linjerna om (lyssnare). Allt read-only —
+  // textareans innehåll rörs aldrig.
+  const textareaGlState = new Map();   // fieldId -> { text, issues, venueNames, addressRaw, wired }
+  function drawTextareaUnderlines(ta, text, fieldIssues, venueNames, addressRaw) {
+    const wrap = ta.closest('.w-field, .w-panel, [data-field]') || ta.parentElement;
+    if (!wrap) return;
+    wrap.querySelectorAll('.vseh-gl-overlay, .vseh-gl-mirror').forEach(el => el.remove());
+    if (!fieldIssues.length) { textareaGlState.delete(ta.id); return; }
+    const marks = [];
+    fieldIssues.forEach(issue => {
+      const color = GUIDELINE_ISSUE_COLOR[issue.label] || '#ff3b3b';
+      guidelineIssueRanges(text, issue.label, venueNames, addressRaw)
+        .forEach(([s, e]) => marks.push({ s, e, color }));
+    });
+    if (!marks.length) return;
+    marks.sort((a, b) => a.s - b.s || a.e - b.e);
+    // Mirror: samma box som textarean, samma font — mäter var varje tecken ligger.
+    const cs = getComputedStyle(ta);
+    const mirror = document.createElement('div');
+    mirror.className = 'vseh-gl-mirror';
+    mirror.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;' +
+      'white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word;' +
+      'left:' + ta.offsetLeft + 'px;top:' + ta.offsetTop + 'px;' +
+      'width:' + ta.clientWidth + 'px;' +
+      'padding:' + cs.padding + ';border:' + cs.border + ';' +
+      'font:' + cs.font + ';line-height:' + cs.lineHeight + ';letter-spacing:' + cs.letterSpacing + ';';
+    // Bygg HTML med spans runt markeringarna (samma algoritm som highlightedTextPreview).
+    let html = '', pos = 0;
+    marks.forEach(({ s: ms, e: me }) => {
+      if (ms < pos) return;
+      html += esc(text.slice(pos, ms));
+      html += '<span class="vseh-gl-mark" style="text-decoration:underline;text-decoration-color:inherit;">' + esc(text.slice(ms, me)) + '</span>';
+      pos = me;
+    });
+    html += esc(text.slice(pos));
+    mirror.innerHTML = html;
+    wrap.appendChild(mirror);
+    // Overlay ovanpå textarean.
+    if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+    const overlay = document.createElement('div');
+    overlay.className = 'vseh-gl-overlay';
+    overlay.style.cssText = 'position:absolute;left:' + ta.offsetLeft + 'px;top:' + ta.offsetTop + 'px;' +
+      'width:' + ta.clientWidth + 'px;height:' + ta.clientHeight + 'px;pointer-events:none;overflow:hidden;z-index:2;';
+    wrap.appendChild(overlay);
+    const wrapRect = wrap.getBoundingClientRect();
+    const draw = () => {
+      overlay.querySelectorAll('.vseh-gl-line').forEach(l => l.remove());
+      const mRect = mirror.getBoundingClientRect();
+      mirror.querySelectorAll('.vseh-gl-mark').forEach((span, i) => {
+        const r = span.getBoundingClientRect();
+        const line = document.createElement('div');
+        line.className = 'vseh-gl-line';
+        line.style.cssText = 'position:absolute;left:' + (r.left - wrapRect.left - ta.offsetLeft) + 'px;' +
+          'top:' + (r.bottom - wrapRect.top - ta.offsetTop + ta.scrollTop - 1) + 'px;' +
+          'width:' + r.width + 'px;height:2px;background:' + (marks[i] ? marks[i].color : '#ff3b3b') + ';border-radius:1px;';
+        overlay.appendChild(line);
+      });
+    };
+    draw();
+    // Rita om vid scroll/resize (pollern ritar också om var 1.5s).
+    const st = textareaGlState.get(ta.id) || {};
+    if (!st.wired) {
+      st.wired = true;
+      ta.addEventListener('scroll', draw);
+      window.addEventListener('resize', draw);
+    }
+    textareaGlState.set(ta.id, st);
   }
   function drawGuidelineUnderlines(fieldId, text, fieldIssues, venueNames, addressRaw) {
     clearGuidelineUnderlines(fieldId);
     if (!fieldIssues.length) return;
-    const hidden = document.getElementById(fieldId);
+    const fieldEl = document.getElementById(fieldId);
+    // (v7.100.13) SBR:s beskrivningsfält är en vanlig <textarea> (ingen
+    // Draftail-editor) — rita understrykningarna via en mirror-div istället.
+    if (fieldEl && fieldEl.tagName === 'TEXTAREA') {
+      drawTextareaUnderlines(fieldEl, text, fieldIssues, venueNames, addressRaw);
+      return;
+    }
+    const hidden = fieldEl;
     const wrap = hidden && (hidden.closest('.w-field, .w-panel, [data-field]') || hidden.parentElement);
     const editor = wrap && (wrap.querySelector('.Draftail-Editor') || wrap.querySelector('.DraftEditor-root'));
     if (!wrap || !editor) return;
