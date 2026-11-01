@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.9
+// @version      7.100.10
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -3196,6 +3196,67 @@
     }), 35000, 'bildnedladdning');
   }
 
+  // (2026-10-26, v7.100.10) Detektera BRUTNA bilder: Wagtail kan ha sparat ett
+  // filnamn utan att filen finns på disk (race vid syntetisk filinjektion —
+  // "Filen för originalbilden kunde inte hittas"). Vi hittar bildens URL i
+  // formuläret/bildsidan och gör en HEAD mot den; 404/!ok → tydlig varning.
+  // Varje URL kollas bara EN gång per sidvisning (lastBrokenCheckSrc).
+  let lastBrokenCheckSrc = '';
+  let lastBrokenCheckAt = 0;
+  async function checkBrokenImageOnPage() {
+    // Hitta första relevanta bild: eventformulärets chooser-förhandsvisning
+    // eller bildsidans huvudbild.
+    const img = document.querySelector(
+      'img[src*="/media/images/"], img[src*="/media/original_images/"], .image-chooser img, [class*="image-chooser"] img, .chooser__image img'
+    );
+    if (!img || !img.src) return;
+    const src = img.src;
+    if (src === lastBrokenCheckSrc) return;
+    if (Date.now() - lastBrokenCheckAt < 3000) return;   // max 1 koll/3 s
+    lastBrokenCheckSrc = src;
+    lastBrokenCheckAt = Date.now();
+    try {
+      const resp = await fetch(src, { method: 'HEAD', cache: 'no-store' });
+      if (!resp.ok) {
+        vlog('⚠️ BRUTEN BILD: "' + src.split('/').pop() + '" svarar HTTP ' + resp.status +
+          ' — filnamnet finns sparat men filen saknas på servern. Ladda upp en ny bild innan du sparar, annars visas "Filen för originalbilden kunde inte hittas".', 'err');
+      }
+      // 200 → allt ok, tyst.
+    } catch (e) {
+      // HEAD kan vägras (405) — prova GET med Range utan att ladda hela bilden
+      try {
+        const resp = await fetch(src, { method: 'GET', cache: 'no-store', headers: { Range: 'bytes=0-0' } });
+        if (resp.status !== 200 && resp.status !== 206) {
+          vlog('⚠️ BRUTEN BILD: "' + src.split('/').pop() + '" svarar HTTP ' + resp.status +
+            ' — ladda upp en ny bild innan du sparar.', 'err');
+        }
+      } catch (e2) {
+        vlog('⚠️ Kunde inte kontrollera bilden "' + src.split('/').pop() + '" (' + e2.message + ').', 'err');
+      }
+    }
+  }
+
+  // (2026-10-26, v7.100.10) Vänta tills Wagtail faktiskt registrerat den
+  // injicerade filen innan vi låter något klicka "Ladda upp". Tecken på att
+  // filen är registrerad: fileInput.value är satt, ELLER en förhandsvisning/
+  // thumbnail dyker upp i upload-fliken. Tidigare sattes bara files +
+  // syntetiskt change och sedan klickades submit efter fast 500 ms — ett
+  // race: om Wagtail inte hunnit läsa filen skickades multipart utan giltig
+  // fil och Wagtail skapade en Image-post vars fil saknades på disk
+  // ("Filen för originalbilden kunde inte hittas" i gamla event).
+  async function waitForFileRegistered(fileInput, timeoutMs = 8000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      const valOk = !!(fileInput.value || '').trim();
+      const preview = document.querySelector(
+        '#tab-upload img, [id^="tab-upload"] img, .chooser__preview img, .upload-fallback img, img[src^="blob:"]'
+      );
+      if (valOk || preview) return true;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    return false;
+  }
+
   async function tryInjectImageFile(imageUrl) {
     const fileInput = document.getElementById(IMG_FIELDS.file);
     if (!fileInput) { vlog('Filfält hittades ej.', 'err'); return false; }
@@ -3205,8 +3266,16 @@
       const dt = new DataTransfer();
       dt.items.add(file);
       fileInput.files = dt.files;
+      // change + input — Wagtail lyssnar på båda i olika versioner.
+      fileInput.dispatchEvent(new Event('input', { bubbles: true }));
       fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-      vlog('Bildfil injicerad (' + file.name + ', ' + Math.round(file.size/1024) + ' kB).', 'ok');
+      const registered = await waitForFileRegistered(fileInput);
+      if (!registered) {
+        vlog('VARNING: Wagtail hann inte registrera filen inom 8 s efter injektion (' +
+          file.name + ') — väntar INTE på submit, filen riskerar att sparas utan innehåll. Välj filen manuellt.', 'err');
+        return false;
+      }
+      vlog('Bildfil injicerad och registrerad av Wagtail (' + file.name + ', ' + Math.round(file.size/1024) + ' kB).', 'ok');
       return true;
     } catch (e) {
       vlog('Auto-uppladdning misslyckades: ' + e.message + '. Välj fil manuellt.', 'err');
@@ -3402,8 +3471,15 @@
       const dt = new DataTransfer();
       dt.items.add(file);
       fileInput.files = dt.files;
+      fileInput.dispatchEvent(new Event('input', { bubbles: true }));
       fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-      vlog('Skärmdump från urklippet inlagd i filfältet (' + file.name + ', ' + Math.round(file.size/1024) + ' kB).', 'ok');
+      // (2026-10-26, v7.100.10) Vänta på att Wagtail registrerat filen innan
+      // vi går vidare — annars kan sparningen gå igenom utan giltig fil.
+      const reg = await waitForFileRegistered(fileInput);
+      if (!reg) {
+        vlog('VARNING: skärmdumpen (' + file.name + ') hann inte registreras av Wagtail inom 8 s — välj filen manuellt om sparningen misslyckas.', 'err');
+      }
+      vlog('Skärmdump från urklippet inlagd i filfältet (' + file.name + ', ' + Math.round(file.size/1024) + ' kB)' + (reg ? ' — registrerad av Wagtail.' : '.'), 'ok');
       return true;
     }
     throw new Error('Ingen bild i urklippet — ta en skärmdump först (Win+Shift+S)');
@@ -3578,7 +3654,7 @@
   function initSbrImagePage() {
     vlog('SBR bildsida: knapp för automatisk ifyllning aktiverad.');
     ensureSbrImagePageButton();
-    setInterval(ensureSbrImagePageButton, 1000);
+    setInterval(() => { ensureSbrImagePageButton(); checkBrokenImageOnPage(); }, 1000);
     ensureSettingsCogButton();
   }
 
@@ -3681,7 +3757,7 @@
   function initVsImagePage() {
     vlog('Bildsida: knapp för automatisk ifyllning aktiverad.');
     ensureVsImagePageButton();
-    setInterval(ensureVsImagePageButton, 1000);
+    setInterval(() => { ensureVsImagePageButton(); checkBrokenImageOnPage(); }, 1000);
     ensureSettingsCogButton();
   }
 
@@ -3756,15 +3832,34 @@
     const ok = await tryInjectImageFile(imageUrl);
     if (!ok) { vlog('Välj bildfilen manuellt (auto-injektion nekades).'); return; }
 
-    // Bekräfta uppladdningen: klicka modalens "Ladda upp"-submit-knapp.
-    await new Promise(r => setTimeout(r, 500));
-    const uploadSubmit = [...document.querySelectorAll('button[type="submit"]')]
-      .find(b => /^ladda upp$/i.test((b.textContent || '').trim()));
+    // (2026-10-26, v7.100.10) Bekräfta uppladdningen: vänta tills submit-knappen
+    // är aktiv (Wagtail disablar den tills en fil är registrerad) — INTE bara
+    // en fast 500 ms-väntan, det var racet som gav brutna bildposter.
+    const fileInputNow = document.getElementById(IMG_FIELDS.file);
+    if (fileInputNow) await waitForFileRegistered(fileInputNow, 8000);
+    let uploadSubmit = null;
+    for (let i = 0; i < 30 && !uploadSubmit; i++) {
+      uploadSubmit = [...document.querySelectorAll('button[type="submit"]')]
+        .find(b => /^ladda upp$/i.test((b.textContent || '').trim()) && !b.disabled);
+      if (!uploadSubmit) await new Promise(r => setTimeout(r, 200));
+    }
     if (uploadSubmit) {
       uploadSubmit.click();
       vlog('Klickade "Ladda upp" för att bekräfta bilden.', 'ok');
+      // Verifiera att uppladdningen faktiskt gick igenom: modalen ska stängas
+      // och bilden synas i eventformuläret. Polla upp till 10 s.
+      let landed = false;
+      for (let i = 0; i < 100 && !landed; i++) {
+        await new Promise(r => setTimeout(r, 100));
+        const modalGone = !document.querySelector('#tab-label-upload') ||
+          !document.querySelector('#tab-label-upload')?.offsetParent;
+        const imgInForm = !!document.querySelector('img[src*="/media/"], .image-chooser img, [class*="image"] img');
+        if (modalGone && imgInForm) landed = true;
+      }
+      if (landed) vlog('Bilduppladdning verifierad: modalen stängd och bilden syns i formuläret.', 'ok');
+      else vlog('VARNING: kunde inte verifiera att bilden landade i formuläret inom 10 s efter "Ladda upp" — kontrollera manuellt innan du sparar (risk för bruten bildpost).', 'err');
     } else {
-      vlog('Hittade ej "Ladda upp"-knappen — klicka den manuellt för att slutföra.', 'err');
+      vlog('Hittade ej aktiv "Ladda upp"-knapp — klicka den manuellt för att slutföra.', 'err');
     }
   }
 
@@ -9738,6 +9833,7 @@
     autofillLinkText();
     detectManuallyRemovedGuides();
     runGuideTagRules().catch(() => {});
+    checkBrokenImageOnPage();   // (2026-10-26, v7.100.10) varning vid bruten bildfil
   }
 
   // ---- Samma automatik även på MAIN:s create-sida (på uttrycklig begäran,
@@ -9937,6 +10033,11 @@
     if (mode === 'small') mode = 'max';            // legacy-läge → maximera
     if (!['min', 'max'].includes(mode)) mode = 'min';
     buildSbrPanel();
+    // (2026-10-26, v7.100.10) På SBR create/edit: kontrollera ev. bruten bild
+    // (filnamn sparat men filen saknas på servern).
+    if (/\/wt\/cms\/snippets\/api\/event\/(create|edit)\//.test(location.pathname)) {
+      setInterval(checkBrokenImageOnPage, 2000);
+    }
     // (2026-10-26, v7.100.9) Dubblettkollen (SBR-DRAFT) körs på ALLA SBR:s
     // eventlist-URL:er (inte bara ?status=draft) — panelen OCH dubblettvyn
     // samtidigt, badges på listans rader. På create/edit-sidor finns inga
