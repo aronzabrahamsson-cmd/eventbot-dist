@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.13
+// @version      7.100.14
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -8050,50 +8050,68 @@
     });
     if (!marks.length) return;
     marks.sort((a, b) => a.s - b.s || a.e - b.e);
-    // Mirror: samma box som textarean, samma font — mäter var varje tecken ligger.
-    const cs = getComputedStyle(ta);
-    const mirror = document.createElement('div');
-    mirror.className = 'vseh-gl-mirror';
-    mirror.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;' +
-      'white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word;' +
-      'left:' + ta.offsetLeft + 'px;top:' + ta.offsetTop + 'px;' +
-      'width:' + ta.clientWidth + 'px;' +
-      'padding:' + cs.padding + ';border:' + cs.border + ';' +
-      'font:' + cs.font + ';line-height:' + cs.lineHeight + ';letter-spacing:' + cs.letterSpacing + ';';
-    // Bygg HTML med spans runt markeringarna (samma algoritm som highlightedTextPreview).
+    // Bygg mirror-HTML med spans runt de PLACERADE markeringarna (samma
+    // algoritm som highlightedTextPreview; överlappande hoppas över).
+    // placedMarks[i] hör ihop med span nr i i mirrorn.
+    const placedMarks = [];
     let html = '', pos = 0;
-    marks.forEach(({ s: ms, e: me }) => {
+    marks.forEach(({ s: ms, e: me, color }) => {
       if (ms < pos) return;
       html += esc(text.slice(pos, ms));
-      html += '<span class="vseh-gl-mark" style="text-decoration:underline;text-decoration-color:inherit;">' + esc(text.slice(ms, me)) + '</span>';
+      html += '<span class="vseh-gl-mark">' + esc(text.slice(ms, me)) + '</span>';
+      placedMarks.push(color);
       pos = me;
     });
     html += esc(text.slice(pos));
+    // Mirror: samma box/typografi som textarean — mäter var tecknen ligger.
+    const cs = getComputedStyle(ta);
+    const mirror = document.createElement('div');
+    mirror.className = 'vseh-gl-mirror';
+    mirror.setAttribute('aria-hidden', 'true');
+    mirror.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;' +
+      'white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word;z-index:0;' +
+      'padding:' + cs.padding + ';border:' + cs.border + ';' +
+      'font:' + cs.font + ';line-height:' + cs.lineHeight + ';letter-spacing:' + cs.letterSpacing + ';';
     mirror.innerHTML = html;
     wrap.appendChild(mirror);
-    // Overlay ovanpå textarean.
     if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
     const overlay = document.createElement('div');
     overlay.className = 'vseh-gl-overlay';
-    overlay.style.cssText = 'position:absolute;left:' + ta.offsetLeft + 'px;top:' + ta.offsetTop + 'px;' +
-      'width:' + ta.clientWidth + 'px;height:' + ta.clientHeight + 'px;pointer-events:none;overflow:hidden;z-index:2;';
+    overlay.style.cssText = 'position:absolute;pointer-events:none;overflow:hidden;z-index:2;';
     wrap.appendChild(overlay);
-    const wrapRect = wrap.getBoundingClientRect();
+    // (v7.100.14) ALL geometri beräknas i draw() med FÄRSKA rects — riktlinje-
+    // noten (setFieldNote) läggs in ovanför fältet och flyttar ner textarean,
+    // så offsetLeft/offsetTop fångade vid skapande blir föråldrade och linjerna
+    // hamnade i notrutan istället för i textfältet.
     const draw = () => {
+      const taRect = ta.getBoundingClientRect();
+      const wrapRect = wrap.getBoundingClientRect();
+      const left = taRect.left - wrapRect.left + wrap.scrollLeft;
+      const top = taRect.top - wrapRect.top + wrap.scrollTop;
+      mirror.style.left = left + 'px';
+      mirror.style.top = top + 'px';
+      mirror.style.width = ta.clientWidth + 'px';
+      overlay.style.left = left + 'px';
+      overlay.style.top = top + 'px';
+      overlay.style.width = ta.clientWidth + 'px';
+      overlay.style.height = ta.clientHeight + 'px';
+      const mirrorRect = mirror.getBoundingClientRect();
       overlay.querySelectorAll('.vseh-gl-line').forEach(l => l.remove());
-      const mRect = mirror.getBoundingClientRect();
       mirror.querySelectorAll('.vseh-gl-mark').forEach((span, i) => {
         const r = span.getBoundingClientRect();
         const line = document.createElement('div');
         line.className = 'vseh-gl-line';
-        line.style.cssText = 'position:absolute;left:' + (r.left - wrapRect.left - ta.offsetLeft) + 'px;' +
-          'top:' + (r.bottom - wrapRect.top - ta.offsetTop + ta.scrollTop - 1) + 'px;' +
-          'width:' + r.width + 'px;height:2px;background:' + (marks[i] ? marks[i].color : '#ff3b3b') + ';border-radius:1px;';
+        // r är oskrollad mirror-position; textarean skrollad med ta.scrollTop
+        // gör att samma tecken syns högre upp — linjen följer med.
+        line.style.cssText = 'position:absolute;' +
+          'left:' + (r.left - mirrorRect.left) + 'px;' +
+          'top:' + (r.bottom - mirrorRect.top - ta.scrollTop - 1) + 'px;' +
+          'width:' + r.width + 'px;height:2px;' +
+          'background:' + (placedMarks[i] || '#ff3b3b') + ';border-radius:1px;';
         overlay.appendChild(line);
       });
     };
     draw();
-    // Rita om vid scroll/resize (pollern ritar också om var 1.5s).
     const st = textareaGlState.get(ta.id) || {};
     if (!st.wired) {
       st.wired = true;
@@ -8102,72 +8120,7 @@
     }
     textareaGlState.set(ta.id, st);
   }
-  function drawGuidelineUnderlines(fieldId, text, fieldIssues, venueNames, addressRaw) {
-    clearGuidelineUnderlines(fieldId);
-    if (!fieldIssues.length) return;
-    const fieldEl = document.getElementById(fieldId);
-    // (v7.100.13) SBR:s beskrivningsfält är en vanlig <textarea> (ingen
-    // Draftail-editor) — rita understrykningarna via en mirror-div istället.
-    if (fieldEl && fieldEl.tagName === 'TEXTAREA') {
-      drawTextareaUnderlines(fieldEl, text, fieldIssues, venueNames, addressRaw);
-      return;
-    }
-    const hidden = fieldEl;
-    const wrap = hidden && (hidden.closest('.w-field, .w-panel, [data-field]') || hidden.parentElement);
-    const editor = wrap && (wrap.querySelector('.Draftail-Editor') || wrap.querySelector('.DraftEditor-root'));
-    if (!wrap || !editor) return;
-    // Samla alla (start, end, color)-markeringar från issues — positioner i
-    // DEN SAMMANSLAGNA texten readDraftailText() returnerar (block join \n).
-    const marks = [];
-    fieldIssues.forEach(issue => {
-      const color = GUIDELINE_ISSUE_COLOR[issue.label] || '#ff3b3b';
-      guidelineIssueRanges(text, issue.label, venueNames, addressRaw)
-        .forEach(([s, e]) => marks.push({ s, e, color }));
-    });
-    if (!marks.length) return;
-    // Overlay:n: en div ovanpå editorn (pointer-events:none) med absolut-
-    // positionerade smala linjer på Range-rect-positioner.
-    const overlay = document.createElement('div');
-    overlay.className = 'vseh-gl-overlay';
-    overlay.style.cssText = 'position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none;overflow:hidden;';
-    const eRect = editor.getBoundingClientRect();
-    // Hitta DOM-textnoder + offset i editorn för varje markering. Draftail
-    // renderar varje block som ett <p>/div med en textnod — vi kartlägger
-    // texten nod för nod mot readDraftailText()-strängen (samma ordning).
-    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
-    let node, off = 0; const nodes = [];
-    while ((node = walker.nextNode())) { nodes.push({ node, start: off, end: off + node.textContent.length }); off += node.textContent.length; }
-    const totalLen = off;
-    let placed = 0;
-    marks.forEach(({ s, e, color }) => {
-      if (e > totalLen) return;
-      // Markeringen kan spänna flera noder — en Range per nod-segment.
-      nodes.forEach(({ node: n, start: ns }) => {
-        const ne = ns + n.textContent.length;
-        const segS = Math.max(s, ns), segE = Math.min(e, ne);
-        if (segS >= segE) return;
-        try {
-          const range = document.createRange();
-          range.setStart(n, segS - ns); range.setEnd(n, segE - ns);
-          const rects = range.getClientRects();
-          for (const r of rects) {
-            const line = document.createElement('div');
-            line.style.cssText = 'position:absolute;left:' + (r.left - eRect.left + editor.scrollLeft) + 'px;' +
-              'top:' + (r.bottom - eRect.top - 1) + 'px;width:' + r.width + 'px;height:2px;' +
-              'background:' + color + ';border-radius:1px;';
-            overlay.appendChild(line);
-            placed++;
-          }
-        } catch {}
-      });
-    });
-    if (placed) {
-      if (getComputedStyle(editor).position === 'static') editor.style.position = 'relative';
-      editor.appendChild(overlay);
-    } else {
-      overlay.remove();
-    }
-  }
+
   function setFieldNote(el, key, html) {
     const wrap = fieldWrapper(el);
     if (!wrap) return;
