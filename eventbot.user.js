@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.14
+// @version      7.100.15
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -8121,6 +8121,78 @@
     textareaGlState.set(ta.id, st);
   }
 
+  // (v7.100.15, återställd från v7.100.13) v7.100.14:s geometri-omskrivning av
+  // drawTextareaUnderlines raderade hela denna funktion av misstag, men anropet
+  // i checkGuidelineIssues() blev kvar -> ReferenceError vid varje
+  // riktlinjefynd, vilket dessutom dödade resten av runEditPageChecks() samma
+  // poll-tick (guide-taggning + språkparssync slocknade på Visit EDIT).
+  function drawGuidelineUnderlines(fieldId, text, fieldIssues, venueNames, addressRaw) {
+    clearGuidelineUnderlines(fieldId);
+    if (!fieldIssues.length) return;
+    const fieldEl = document.getElementById(fieldId);
+    // SBR:s beskrivningsfält är en vanlig <textarea> (ingen Draftail-editor)
+    // — rita understrykningarna via en mirror-div istället.
+    if (fieldEl && fieldEl.tagName === 'TEXTAREA') {
+      drawTextareaUnderlines(fieldEl, text, fieldIssues, venueNames, addressRaw);
+      return;
+    }
+    const hidden = fieldEl;
+    const wrap = hidden && (hidden.closest('.w-field, .w-panel, [data-field]') || hidden.parentElement);
+    const editor = wrap && (wrap.querySelector('.Draftail-Editor') || wrap.querySelector('.DraftEditor-root'));
+    if (!wrap || !editor) return;
+    // Samla alla (start, end, color)-markeringar från issues — positioner i
+    // DEN SAMMANSLAGNA texten readDraftailText() returnerar (block join \n).
+    const marks = [];
+    fieldIssues.forEach(issue => {
+      const color = GUIDELINE_ISSUE_COLOR[issue.label] || '#ff3b3b';
+      guidelineIssueRanges(text, issue.label, venueNames, addressRaw)
+        .forEach(([s, e]) => marks.push({ s, e, color }));
+    });
+    if (!marks.length) return;
+    // Overlay:n: en div ovanpå editorn (pointer-events:none) med absolut-
+    // positionerade smala linjer på Range-rect-positioner.
+    const overlay = document.createElement('div');
+    overlay.className = 'vseh-gl-overlay';
+    overlay.style.cssText = 'position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none;overflow:hidden;';
+    const eRect = editor.getBoundingClientRect();
+    // Hitta DOM-textnoder + offset i editorn för varje markering. Draftail
+    // renderar varje block som ett <p>/div med en textnod — vi kartlägger
+    // texten nod för nod mot readDraftailText()-strängen (samma ordning).
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+    let node, off = 0; const nodes = [];
+    while ((node = walker.nextNode())) { nodes.push({ node, start: off, end: off + node.textContent.length }); off += node.textContent.length; }
+    const totalLen = off;
+    let placed = 0;
+    marks.forEach(({ s, e, color }) => {
+      if (e > totalLen) return;
+      // Markeringen kan spänna flera noder — en Range per nod-segment.
+      nodes.forEach(({ node: n, start: ns }) => {
+        const ne = ns + n.textContent.length;
+        const segS = Math.max(s, ns), segE = Math.min(e, ne);
+        if (segS >= segE) return;
+        try {
+          const range = document.createRange();
+          range.setStart(n, segS - ns); range.setEnd(n, segE - ns);
+          const rects = range.getClientRects();
+          for (const r of rects) {
+            const line = document.createElement('div');
+            line.style.cssText = 'position:absolute;left:' + (r.left - eRect.left + editor.scrollLeft) + 'px;' +
+              'top:' + (r.bottom - eRect.top - 1) + 'px;width:' + r.width + 'px;height:2px;' +
+              'background:' + color + ';border-radius:1px;';
+            overlay.appendChild(line);
+            placed++;
+          }
+        } catch {}
+      });
+    });
+    if (placed) {
+      if (getComputedStyle(editor).position === 'static') editor.style.position = 'relative';
+      editor.appendChild(overlay);
+    } else {
+      overlay.remove();
+    }
+  }
+
   function setFieldNote(el, key, html) {
     const wrap = fieldWrapper(el);
     if (!wrap) return;
@@ -10426,22 +10498,30 @@
   }
 
   function runEditPageChecks() {
-    activateAddressGeotag();
-    autoPublishStatus();
-    stripEmojisFromTitles();
-    stripEmDashesFromFields();
-    checkTitleCasing();
-    checkDateTimeInTitle();
-    checkTitleTooLong();
-    stripDescriptionEmoji();
-    checkGuidelineIssues();
-    checkIdenticalDescriptions();
-    checkIdenticalTitlesAndDescriptions();
-    checkResaleUrl();
-    autofillLinkText();
-    detectManuallyRemovedGuides();
-    runGuideTagRules().catch(() => {});
-    checkBrokenImageOnPage();   // (2026-10-26, v7.100.10) varning vid bruten bildfil
+    // (v7.100.15) Varje kontroll i egen try/catch: ett kast i EN kontroll
+    // (t.ex. en borttagen hjälpfunktion) får ALDRIG döda hela poll-ticken —
+    // tidigare dog runGuideTagRules()/språkparssyncen tyst efter
+    // checkGuidelineIssues() när drawGuidelineUnderlines saknades.
+    const safe = (name, fn) => {
+      try { fn(); }
+      catch (e) { vlog('EDIT-kontroll "' + name + '" kastade: ' + (e && e.message ? e.message : e) + ' — övriga kontroller fortsätter.', 'err'); }
+    };
+    safe('activateAddressGeotag', activateAddressGeotag);
+    safe('autoPublishStatus', autoPublishStatus);
+    safe('stripEmojisFromTitles', stripEmojisFromTitles);
+    safe('stripEmDashesFromFields', stripEmDashesFromFields);
+    safe('checkTitleCasing', checkTitleCasing);
+    safe('checkDateTimeInTitle', checkDateTimeInTitle);
+    safe('checkTitleTooLong', checkTitleTooLong);
+    safe('stripDescriptionEmoji', stripDescriptionEmoji);
+    safe('checkGuidelineIssues', checkGuidelineIssues);
+    safe('checkIdenticalDescriptions', checkIdenticalDescriptions);
+    safe('checkIdenticalTitlesAndDescriptions', checkIdenticalTitlesAndDescriptions);
+    safe('checkResaleUrl', checkResaleUrl);
+    safe('autofillLinkText', autofillLinkText);
+    safe('detectManuallyRemovedGuides', detectManuallyRemovedGuides);
+    safe('runGuideTagRules', () => runGuideTagRules().catch(() => {}));
+    safe('checkBrokenImageOnPage', checkBrokenImageOnPage);   // (2026-10-26, v7.100.10) varning vid bruten bildfil
   }
 
   // ---- Samma automatik även på MAIN:s create-sida (på uttrycklig begäran,
