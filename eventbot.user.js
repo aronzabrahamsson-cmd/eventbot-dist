@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.15
+// @version      7.100.16
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -10497,6 +10497,77 @@
     }
   }
 
+  // (v7.100.16, på begäran) Visit EDIT/NEW: rosa/grön pop-up vid
+  // besökssiffrorna (id_expected_attendees) som visar om eventet finns i den
+  // importerade CMS-exporten (GM-nyckeln sbr_manual_calendar — samma data som
+  // SBR-vyns "Eventlista"-flik läser). Grön = finns i CMS-export/
+  // prognoskalender (lägg INTE in besökarantal), rosa = finns EJ där (fyll i
+  // besökssiffror om stort event). Matchning: bästa titellikhet en/sv >= 0.75
+  // (eller exakt normaliserad titel) och, när båda sidor har datum, samma datum
+  // någonstans (annat datum = annat tillfälle av ev. återkommande event).
+  // SBR hoppas över — där är exporten själv källa.
+  let lastCmsExportNote = null;
+  function checkCmsExportStatus() {
+    if (location.hostname === 'www.stockholmbusinessregion.se') return;
+    const el = document.getElementById('id_expected_attendees');
+    if (!el) return;
+    const titleEn = (document.getElementById('id_title_en')?.value || '').trim();
+    const titleSv = (document.getElementById('id_title_sv')?.value || '').trim();
+    let cal = [];
+    try { cal = JSON.parse(GM_getValue(SBR_CAL_KEY, '[]')) || []; } catch { cal = []; }
+    if ((!titleEn && !titleSv) || !cal.length) {
+      setFieldNote(el, 'cmsexport', '');
+      lastCmsExportNote = null;
+      return;
+    }
+    const visitDates = new Set(currentDateBlocksWithTimes().map(b => b.date).filter(Boolean));
+    let best = null, bestSim = 0;
+    for (const e of cal) {
+      const cands = [e.title_en || '', e.title_sv || ''];
+      let s = 0;
+      for (const ct of cands) {
+        if (!ct) continue;
+        s = Math.max(s, titleEn ? titleSim(titleEn, ct) : 0, titleSv ? titleSim(titleSv, ct) : 0);
+      }
+      // exakt normaliserad titel räknas som full träff även under tröskeln
+      if (s < 1) {
+        const ne = normText(titleEn), ns = normText(titleSv);
+        if ((ne && (ne === normText(e.title_en || '') || ne === normText(e.title_sv || ''))) ||
+            (ns && (ns === normText(e.title_en || '') || ns === normText(e.title_sv || '')))) s = 1;
+      }
+      if (s < 0.75 || s <= bestSim) continue;
+      const calDate = (e.start_date || '').trim();
+      // när båda sidor har datum måste något datum överensstämma — annars är det
+      // ett annat tillfälle av samma återkommande event
+      if (calDate && visitDates.size && !visitDates.has(calDate)) continue;
+      best = e; bestSim = s;
+    }
+    const key = best
+      ? 'in:' + (best.title_en || best.title_sv || '') + '@' + (best.start_date || '')
+      : 'out:' + (titleEn || titleSv);
+    const wrap = fieldWrapper(el);
+    const noteExists = !!(wrap && wrap.querySelector('.vseh-field-note-cmsexport'));
+    if (key === lastCmsExportNote && noteExists) return;   // samma status, noten finns kvar — slipp loggspam
+    lastCmsExportNote = key;
+    if (best) {
+      const mTitle = best.title_sv || best.title_en || '';
+      setFieldNote(el, 'cmsexport',
+        '<div style="border:1px solid #1f7a4d;background:rgba(31,122,77,.12);color:#1f7a4d;border-radius:7px;padding:6px 10px;font-weight:600;">' +
+        '✅ Inlagd i CMS-export/prognoskalender' + (best.start_date ? ' (' + esc(best.start_date) + ')' : '') +
+        ' – lägg inte in besökarantal.' +
+        (mTitle ? ' <span style="font-weight:400;">(matchar ”' + esc(mTitle) + '”)</span>' : '') + '</div>');
+      vlog('CMS-export: "' + (titleEn || titleSv) + '" FINNS i importerad lista (”' + mTitle + '”' +
+        (best.start_date ? ', ' + best.start_date : '') + ') — grön popup vid besökssiffror.', 'ok');
+    } else {
+      setFieldNote(el, 'cmsexport',
+        '<div style="border:1px solid #d6336c;background:rgba(214,51,108,.10);color:#d6336c;border-radius:7px;padding:6px 10px;font-weight:600;">' +
+        '⚠️ Ej inlagd i CMS-export – fyll i besökssiffror om stort event. ' +
+        '<span style="font-weight:400;">(' + cal.length + ' event i SBR-vyns Eventlista)</span></div>');
+      vlog('CMS-export: "' + (titleEn || titleSv) + '" finns EJ i importerad lista (' + cal.length +
+        ' rader) — rosa popup vid besökssiffror.', 'err');
+    }
+  }
+
   function runEditPageChecks() {
     // (v7.100.15) Varje kontroll i egen try/catch: ett kast i EN kontroll
     // (t.ex. en borttagen hjälpfunktion) får ALDRIG döda hela poll-ticken —
@@ -10522,6 +10593,7 @@
     safe('detectManuallyRemovedGuides', detectManuallyRemovedGuides);
     safe('runGuideTagRules', () => runGuideTagRules().catch(() => {}));
     safe('checkBrokenImageOnPage', checkBrokenImageOnPage);   // (2026-10-26, v7.100.10) varning vid bruten bildfil
+    safe('checkCmsExportStatus', checkCmsExportStatus);   // (v7.100.16) CMS-export-popup vid besökssiffror
   }
 
   // ---- Samma automatik även på MAIN:s create-sida (på uttrycklig begäran,
@@ -10563,6 +10635,7 @@
     runGuideTagRules().catch(() => {});
     checkTitleCasing();
     checkDateTimeInTitle();
+    try { checkCmsExportStatus(); } catch (e) { vlog('CMS-export-check kastade: ' + (e && e.message ? e.message : e), 'err'); }   // (v7.100.16)
   }
   let mainAlwaysOnChecksStarted = false;
   function startMainAlwaysOnChecks() {
