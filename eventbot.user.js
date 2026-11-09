@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.17
+// @version      7.100.18
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1829,7 +1829,7 @@
     );
     let node = instKey ? root[instKey] : null;
     let hops = 0;
-    while (node && hops < 30) {
+    while (node && hops < 60) {   // (v7.100.18) fler hopp upp i fiber-trädet
       const mp = node.memoizedProps;
       if (mp && mp.onChange && mp.editorState) return mp;
       node = node.return || node._debugOwner || null;
@@ -1843,6 +1843,19 @@
       if (!k.startsWith("__reactProps$")) continue;
       const mp = root[k];
       if (mp && mp.onChange && mp.editorState) return mp;
+    }
+    // (v7.100.18) sista reserv: skanna hela fältets wrapper efter
+    // __reactProps$ på vilken nod som helst — vissa React/Wagtail-builds
+    // lägger props inte på root-noden utan på en inre komponentnod
+    // (vilket gjorde att updateDraftail föll tillbaka till contentEditable-
+    // reserven där skärmen inte alltid uppdaterades).
+    const wrapEl = root.closest('.w-field, .w-panel, [data-field]') || root.parentElement || root;
+    for (const el of wrapEl.querySelectorAll('*')) {
+      for (const k of Object.keys(el)) {
+        if (!k.startsWith('__reactProps$')) continue;
+        const mp = el[k];
+        if (mp && mp.onChange && mp.editorState) return mp;
+      }
     }
     return null;
   }
@@ -2026,7 +2039,30 @@
     // gång" på edit-sidor. EN metod, EN gång — misslyckas verifieringen
     // lämnas fältet orört (paste kan i värsta fall ha landat synligt,
     // men aldrig dubblerat).
-    if (await waitLanded()) return true;
+    if (await waitLanded()) {
+      // (v7.100.18) även SKÄRMEN måste visa texten — annars ser fältet tomt ut
+      // tills sparning även när dolda fältet är rätt. Vänta kort; vid mismatch
+      // tvinga re-render via riktig focus() (DraftEditor bygger om DOM från
+      // state) + forceSelection via props om de går att hitta.
+      const wantS = String(text).replace(/\s+/g, ' ').trim();
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 100));
+        const shown = (editable.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!wantS || shown === wantS) break;
+        if (i === 19) {
+          try { editable.focus(); } catch {}
+          try {
+            const props2 = getDraftProps(root);
+            if (props2) {
+              const ES2 = props2.editorState.constructor;
+              props2.onChange(ES2.forceSelection(props2.editorState, props2.editorState.getSelection().set('hasFocus', true)));
+            }
+          } catch {}
+          vlog('Beskrivning: ' + fieldId + ' rätt i dolda fältet men skärmen visade inte texten — tvingade re-render (fokus).', 'err');
+        }
+      }
+      return true;
+    }
     // (v7.100.17) Paste landade INTE — fältet är verifierat TOMT i React-state just
     // nu, så en sparning skulle radera hela beskrivningen. Återställ
     // originaltexten direkt (React-props först, andra paste som reserv).
@@ -5437,7 +5473,7 @@
       ta.value = '';
     });
 
-    loadSbrManualCal();
+    loadSbrManualCal(); pullSbrCalFromGh().catch(() => {});   // (v7.100.18)
     renderSbrManualCal();
     $('sbr-cal-fetch').addEventListener('click', fetchVisibleSbrEvents);
 
@@ -5790,6 +5826,7 @@
 
   // ---- SBR-läge: manuell eventlista (dedup-ersättning så länge inget API finns)
   const SBR_CAL_KEY = 'sbr_manual_calendar';
+  const SBR_CAL_GH_PATH = 'data/sbr_manual_calendar.json';   // (v7.100.18) central kopia i eventbot-data — GM-lagret är per domän i SBR-bot
   let sbrManualCal = [];   // [{ title_en, title_sv, start_date, modified, status }]
   const SV_MONTHS = { januari:1, februari:2, mars:3, april:4, maj:5, juni:6, juli:7,
     augusti:8, september:9, oktober:10, november:11, december:12 };
@@ -6218,7 +6255,54 @@
     });
     if (dirty) { saveSbrManualCal(); vlog('Eventlista: sanerade bort badge-text från ' + 'sparade titlar (äldre import).', 'ok'); }
   }
-  function saveSbrManualCal() { GM_setValue(SBR_CAL_KEY, JSON.stringify(sbrManualCal)); }
+  function saveSbrManualCal() {
+    GM_setValue(SBR_CAL_KEY, JSON.stringify(sbrManualCal));
+    // (v7.100.18) GM-lagret är per domän i SBR-bot-hanteraren — pusha även
+    // central kopia till eventbot-data så Visit EDIT/NEW kan läsa listan.
+    pushSbrCalToGh().catch(() => {});
+  }
+  // Central kopia i eventbot-data (samma mönster som datasynken för
+  // hanterat-flaggor): union på sbrCalKey, lokala poster vinner, 409 → läs
+  // om och försök igen.
+  async function pushSbrCalToGh() {
+    if (!githubDataToken()) return;   // ingen PAT — lokal import räcker i SBR-vyn
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let current;
+      try { current = await githubDataGet(SBR_CAL_GH_PATH); }
+      catch (e) { vlog('Eventlista: kunde inte läsa central kopia — ' + (e && e.message ? e.message : e), 'err'); return; }
+      const remote = Array.isArray(current.json && current.json.records) ? current.json.records : [];
+      const byKey = new Map(remote.map(e => [sbrCalKey(e), e]));
+      sbrManualCal.forEach(e => byKey.set(sbrCalKey(e), e));
+      const merged = [...byKey.values()];
+      try {
+        await githubDataPut(SBR_CAL_GH_PATH, { records: merged }, current.sha,
+          'Eventlista: ' + merged.length + ' poster (' + sbrManualCal.length + ' lokala)');
+        vlog('Eventlista: synkad till eventbot-data (' + merged.length + ' poster).', 'ok');
+        return;
+      } catch (e) {
+        if (e && e.conflict && attempt < 2) continue;
+        vlog('Eventlista: kunde inte skriva central kopia — ' + (e && e.message ? e.message : e), 'err');
+        return;
+      }
+    }
+  }
+  // Hämtar central kopia och mergar in saknade poster lokalt (SBR-vyn).
+  async function pullSbrCalFromGh() {
+    if (!githubDataToken()) return;
+    try {
+      const res = await githubDataGet(SBR_CAL_GH_PATH);
+      const remote = Array.isArray(res.json && res.json.records) ? res.json.records : [];
+      if (!remote.length) return;
+      const byKey = new Map(sbrManualCal.map(e => [sbrCalKey(e), e]));
+      let added = 0;
+      remote.forEach(e => { if (e && !byKey.has(sbrCalKey(e))) { sbrManualCal.push(e); added++; } });
+      if (added) {
+        GM_setValue(SBR_CAL_KEY, JSON.stringify(sbrManualCal));   // utan push (undvik cirkel)
+        renderSbrManualCal();
+        vlog('Eventlista: hämtade ' + added + ' nya poster från central kopia.', 'ok');
+      }
+    } catch (e) { vlog('Eventlista: kunde inte hämta central kopia — ' + (e && e.message ? e.message : e), 'err'); }
+  }
 
   function sbrCalKey(ev) { return normText(ev.title_en) + '@' + normText(ev.title_sv) + '@' + ev.start_date; }
 
@@ -7389,7 +7473,7 @@
   }
 
   function buildSbrDraftIndex() {
-    loadSbrManualCal();
+    loadSbrManualCal(); pullSbrCalFromGh().catch(() => {});   // (v7.100.18)
     const rows = sbrManualCal.map(sbrCalRow);
     return buildIndexFromRows(rows);
   }
@@ -7397,7 +7481,7 @@
   function initSbrDraftDedup() {
     vlog('SBR-Draft-Dubblettkoll: Initierar på SBR:s draft-lista');
     ensureSbrDraftStyle();
-    loadSbrManualCal();
+    loadSbrManualCal(); pullSbrCalFromGh().catch(() => {});   // (v7.100.18)
     if (!document.getElementById('vseh-sbrdraft-bar')) {
       const bar = document.createElement('div');
       bar.id = 'vseh-sbrdraft-bar';
@@ -10563,7 +10647,31 @@
   // och, när båda sidor har datum, samma datum någonstans.
   let lastCmsExportNote = null;
   let lastCmsExportDebug = '';
-  function checkCmsExportStatus() {
+  // (v7.100.18) GM-lagret är per domän i SBR-bot-hanteraren, så den lokala
+  // sbr_manual_calendar-nyckeln är tom på visitstockholm även efter import i
+  // SBR-vyn. Hämta då central kopia från eventbot-data (max 1 gång/60 s,
+  // bara om GitHub-PAT är satt).
+  let cmsExportRemoteCal = null, cmsExportRemoteTs = 0, cmsExportRemoteFetching = false;
+  async function loadCmsExportCal() {
+    let cal = [];
+    try { cal = JSON.parse(GM_getValue(SBR_CAL_KEY, '[]')) || []; } catch { cal = []; }
+    if (cal.length) return cal;
+    if (!githubDataToken()) return cal;
+    if (cmsExportRemoteFetching) return cmsExportRemoteCal || [];
+    if (cmsExportRemoteCal && Date.now() - cmsExportRemoteTs < 60000) return cmsExportRemoteCal;
+    cmsExportRemoteFetching = true;
+    try {
+      const res = await githubDataGet(SBR_CAL_GH_PATH);
+      const recs = Array.isArray(res.json && res.json.records) ? res.json.records : [];
+      cmsExportRemoteCal = recs; cmsExportRemoteTs = Date.now();
+      if (recs.length) vlog('CMS-export: hämtade ' + recs.length + ' importerade event från eventbot-data (central kopia).', 'ok');
+      return recs;
+    } catch (e) {
+      vlog('CMS-export: kunde inte hämta central lista — ' + (e && e.message ? e.message : e), 'err');
+      return cmsExportRemoteCal || [];
+    } finally { cmsExportRemoteFetching = false; }
+  }
+  async function checkCmsExportStatus() {
     if (location.hostname === 'www.stockholmbusinessregion.se') return;
     const debug = (msg) => { if (msg !== lastCmsExportDebug) { lastCmsExportDebug = msg; vlog('CMS-export: ' + msg, 'err'); } };
     const attendeesEl = sbrFindField(['id_expected_attendees'], /besök|besok|attendee|visitor/i);
@@ -10576,12 +10684,13 @@
     const anchor = candidates.find(e => e.getClientRects().length) || attendeesEl;
     const titleEn = (document.getElementById('id_title_en')?.value || '').trim();
     const titleSv = (document.getElementById('id_title_sv')?.value || '').trim();
-    let cal = [];
-    try { cal = JSON.parse(GM_getValue(SBR_CAL_KEY, '[]')) || []; } catch { cal = []; }
+    const cal = await loadCmsExportCal();
     if ((!titleEn && !titleSv) || !cal.length) {
       candidates.forEach(c => setFieldNote(c, 'cmsexport', ''));
       lastCmsExportNote = null;
-      debug(!cal.length ? 'ingen importerad lista än (sbr_manual_calendar tom — importera i SBR-vyn först)' : 'ingen titel ifylld än');
+      debug(!cal.length
+        ? (githubDataToken() ? 'ingen importerad lista än (importera i SBR-vyn — synkas till eventbot-data)' : 'ingen importerad lista än och ingen GitHub-PAT i Inställningar — importera i SBR-vyn och ange PAT')
+        : 'ingen titel ifylld än');
       return;
     }
     lastCmsExportDebug = '';
@@ -10637,7 +10746,10 @@
     // tidigare dog runGuideTagRules()/språkparssyncen tyst efter
     // checkGuidelineIssues() när drawGuidelineUnderlines saknades.
     const safe = (name, fn) => {
-      try { fn(); }
+      try {
+        const r = fn();
+        if (r && typeof r.catch === 'function') r.catch(e => vlog('EDIT-kontroll "' + name + '" (async) kastade: ' + (e && e.message ? e.message : e) + ' — övriga kontroller fortsätter.', 'err'));
+      }
       catch (e) { vlog('EDIT-kontroll "' + name + '" kastade: ' + (e && e.message ? e.message : e) + ' — övriga kontroller fortsätter.', 'err'); }
     };
     safe('activateAddressGeotag', activateAddressGeotag);
@@ -10698,7 +10810,7 @@
     runGuideTagRules().catch(() => {});
     checkTitleCasing();
     checkDateTimeInTitle();
-    try { checkCmsExportStatus(); } catch (e) { vlog('CMS-export-check kastade: ' + (e && e.message ? e.message : e), 'err'); }   // (v7.100.16)
+    checkCmsExportStatus().catch(e => vlog('CMS-export-check kastade: ' + (e && e.message ? e.message : e), 'err'));   // (v7.100.16, async från v7.100.18)
   }
   let mainAlwaysOnChecksStarted = false;
   function startMainAlwaysOnChecks() {
