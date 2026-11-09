@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.19
+// @version      7.100.20
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5535,7 +5535,7 @@
         vlog('SBR: Visit-kalenderhämtning misslyckades — ' + e.message + ' (byggDedupIndex läser location.origin, som på SBR-domänen saknar API:t — hämta i MAIN/DRAFT om felet kvarstår).', 'err');
       } finally { btn.disabled = false; }
     });
-    loadSbrCrmEvents();
+    loadSbrCrmEvents(); pullSbrCrmFromGh().catch(() => {});   // (v7.100.20)
     loadCrmHandled();
     pullAndMergeCrmHandled().then(renderCrmEvents).catch(() => {});
     renderCrmEvents();
@@ -5868,6 +5868,7 @@
     augusti:8, september:9, oktober:10, november:11, december:12 };
       // ---- SBR-läge: CRM-import (Excel-inklistring) ----------------------------
   const SBR_CRM_KEY = 'sbr_crm_events';
+  const SBR_CRM_GH_PATH = 'data/sbr_crm_events.json';   // (v7.100.20) central kopia i eventbot-data — GM-lagret är per domän
   let sbrCrmEvents = [];
   let crmFilter = 'all';
   let crmMonthFilter = 'all';   // 'all' | 'month' | '6m'
@@ -5883,7 +5884,50 @@
   function loadSbrCrmEvents() {
     try { sbrCrmEvents = JSON.parse(GM_getValue(SBR_CRM_KEY, '[]')) || []; } catch { sbrCrmEvents = []; }
   }
-  function saveSbrCrmEvents() { GM_setValue(SBR_CRM_KEY, JSON.stringify(sbrCrmEvents)); }
+  function saveSbrCrmEvents() {
+    GM_setValue(SBR_CRM_KEY, JSON.stringify(sbrCrmEvents));
+    // (v7.100.20) pusha även central kopia till eventbot-data så Visit
+    // EDIT/NEW kan se CRM-importen (samma mönster som eventlistan).
+    pushSbrCrmToGh().catch(() => {});
+  }
+  async function pushSbrCrmToGh() {
+    if (!githubDataToken()) return;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let current;
+      try { current = await githubDataGet(SBR_CRM_GH_PATH); }
+      catch (e) { vlog('CRM: kunde inte läsa central kopia — ' + (e && e.message ? e.message : e), 'err'); return; }
+      const remote = Array.isArray(current.json && current.json.records) ? current.json.records : [];
+      const byKey = new Map(remote.map(e => [crmKey(e), e]));
+      sbrCrmEvents.forEach(e => byKey.set(crmKey(e), e));
+      const merged = [...byKey.values()];
+      try {
+        await githubDataPut(SBR_CRM_GH_PATH, { records: merged }, current.sha,
+          'CRM-import: ' + merged.length + ' rader (' + sbrCrmEvents.length + ' lokala)');
+        vlog('CRM: synkad till eventbot-data (' + merged.length + ' rader).', 'ok');
+        return;
+      } catch (e) {
+        if (e && e.conflict && attempt < 2) continue;
+        vlog('CRM: kunde inte skriva central kopia — ' + (e && e.message ? e.message : e), 'err');
+        return;
+      }
+    }
+  }
+  async function pullSbrCrmFromGh() {
+    if (!githubDataToken()) return;
+    try {
+      const res = await githubDataGet(SBR_CRM_GH_PATH);
+      const remote = Array.isArray(res.json && res.json.records) ? res.json.records : [];
+      if (!remote.length) return;
+      const byKey = new Map(sbrCrmEvents.map(e => [crmKey(e), e]));
+      let added = 0;
+      remote.forEach(e => { if (e && !byKey.has(crmKey(e))) { sbrCrmEvents.push(e); added++; } });
+      if (added) {
+        GM_setValue(SBR_CRM_KEY, JSON.stringify(sbrCrmEvents));   // utan push (undvik cirkel)
+        if (document.getElementById('sbr-crm-body')) renderCrmEvents();
+        vlog('CRM: hämtade ' + added + ' nya rader från central kopia.', 'ok');
+      }
+    } catch (e) { vlog('CRM: kunde inte hämta central kopia — ' + (e && e.message ? e.message : e), 'err'); }
+  }
 
   // ---- "Hanterat" (manuell flagga, CRM-vyn) --------------------------------
   // Samma mönster som huvudpanelens manualIn/isManualIn, men egen nyckelrymd
@@ -10687,26 +10731,34 @@
   // sbr_manual_calendar-nyckeln är tom på visitstockholm även efter import i
   // SBR-vyn. Hämta då central kopia från eventbot-data (max 1 gång/60 s,
   // bara om GitHub-PAT är satt).
-  let cmsExportRemoteCal = null, cmsExportRemoteTs = 0, cmsExportRemoteFetching = false;
-  async function loadCmsExportCal() {
-    let cal = [];
-    try { cal = JSON.parse(GM_getValue(SBR_CAL_KEY, '[]')) || []; } catch { cal = []; }
-    if (cal.length) return cal;
-    if (!githubDataToken()) return cal;
-    if (cmsExportRemoteFetching) return cmsExportRemoteCal || [];
-    if (cmsExportRemoteCal && Date.now() - cmsExportRemoteTs < 60000) return cmsExportRemoteCal;
-    cmsExportRemoteFetching = true;
-    try {
-      const res = await githubDataGet(SBR_CAL_GH_PATH);
-      const recs = Array.isArray(res.json && res.json.records) ? res.json.records : [];
-      cmsExportRemoteCal = recs; cmsExportRemoteTs = Date.now();
-      if (recs.length) vlog('CMS-export: hämtade ' + recs.length + ' importerade event från eventbot-data (central kopia).', 'ok');
-      return recs;
-    } catch (e) {
-      vlog('CMS-export: kunde inte hämta central lista — ' + (e && e.message ? e.message : e), 'err');
-      return cmsExportRemoteCal || [];
-    } finally { cmsExportRemoteFetching = false; }
+  // (v7.100.18/20) Generisk cross-domän-läsning: GM-lagret är per domän i
+  // SBR-bot, så listor importerade i SBR-vyn (eventlistan OCH CRM-importen)
+  // läses även från central kopia i eventbot-data (max 1 hämtning/60 s per
+  // lista, bara om GitHub-PAT är satt).
+  function makeSharedListLoader(gmKey, ghPath) {
+    const cache = { arr: null, ts: 0, fetching: false };
+    return async function load() {
+      let local = [];
+      try { local = JSON.parse(GM_getValue(gmKey, '[]')) || []; } catch { local = []; }
+      if (local.length) return local;
+      if (!githubDataToken()) return local;
+      if (cache.fetching) return cache.arr || [];
+      if (cache.arr && Date.now() - cache.ts < 60000) return cache.arr;
+      cache.fetching = true;
+      try {
+        const res = await githubDataGet(ghPath);
+        const recs = Array.isArray(res.json && res.json.records) ? res.json.records : [];
+        cache.arr = recs; cache.ts = Date.now();
+        if (recs.length) vlog('CMS-export: hämtade ' + recs.length + ' poster från eventbot-data (' + ghPath + ').', 'ok');
+        return recs;
+      } catch (e) {
+        vlog('CMS-export: kunde inte hämta ' + ghPath + ' — ' + (e && e.message ? e.message : e), 'err');
+        return cache.arr || [];
+      } finally { cache.fetching = false; }
+    };
   }
+  const loadCmsExportCal = makeSharedListLoader(SBR_CAL_KEY, SBR_CAL_GH_PATH);
+  const loadCmsExportCrm = makeSharedListLoader(SBR_CRM_KEY, SBR_CRM_GH_PATH);
   async function checkCmsExportStatus() {
     if (location.hostname === 'www.stockholmbusinessregion.se') return;
     const debug = (msg) => { if (msg !== lastCmsExportDebug) { lastCmsExportDebug = msg; vlog('CMS-export: ' + msg, 'err'); } };
@@ -10721,12 +10773,13 @@
     const titleEn = (document.getElementById('id_title_en')?.value || '').trim();
     const titleSv = (document.getElementById('id_title_sv')?.value || '').trim();
     const cal = await loadCmsExportCal();
-    if ((!titleEn && !titleSv) || !cal.length) {
+    const crm = await loadCmsExportCrm();
+    if ((!titleEn && !titleSv) || (!cal.length && !crm.length)) {
       candidates.forEach(c => setFieldNote(c, 'cmsexport', ''));
       lastCmsExportNote = null;
-      debug(!cal.length
-        ? (githubDataToken() ? 'ingen importerad lista än (importera i SBR-vyn — synkas till eventbot-data)' : 'ingen importerad lista än och ingen GitHub-PAT i Inställningar — importera i SBR-vyn och ange PAT')
-        : 'ingen titel ifylld än');
+      debug((!titleEn && !titleSv)
+        ? 'ingen titel ifylld än'
+        : (githubDataToken() ? 'inga importerade listor än (importera Eventlista + CRM i SBR-vyn — synkas till eventbot-data)' : 'inga importerade listor än och ingen GitHub-PAT i Inställningar — importera i SBR-vyn och ange PAT'));
       return;
     }
     lastCmsExportDebug = '';
@@ -10749,9 +10802,26 @@
       if (calDate && visitDates.size && !visitDates.has(calDate)) continue;
       best = e; bestSim = s;
     }
+    // (v7.100.20) CRM-match: samma titeltröskel som eventlistan; ett
+    // Visit-datum inom CRM-radens start–slut räcker (crmDatesOverlap).
+    let crmBest = null, crmBestSim = 0;
+    const visitDateArr = [...visitDates];
+    for (const e of crm) {
+      if (!e || !e.title) continue;
+      let s = Math.max(titleEn ? titleSim(titleEn, e.title) : 0, titleSv ? titleSim(titleSv, e.title) : 0);
+      if (s < 1) {
+        const nc = normText(e.title);
+        if ((normText(titleEn) && normText(titleEn) === nc) || (normText(titleSv) && normText(titleSv) === nc)) s = 1;
+      }
+      if (s < 0.75 || s <= crmBestSim) continue;
+      const cs = (parseSwedishDate(e.start_date || '') || (e.start_date || '')).slice(0, 10);
+      const ce = (parseSwedishDate(e.end_date || '') || (e.end_date || '')).slice(0, 10);
+      if (cs && visitDateArr.length && !visitDateArr.some(d => crmDatesOverlap(cs, ce, d, d))) continue;
+      crmBest = e; crmBestSim = s;
+    }
     const key = best
       ? 'in:' + (best.title_en || best.title_sv || '') + '@' + (best.start_date || '')
-      : 'out:' + (titleEn || titleSv);
+      : (crmBest ? 'crm:' + crmKey(crmBest) : 'out:' + (titleEn || titleSv));
     const wrap = fieldWrapper(anchor);
     const noteExists = !!(wrap && wrap.querySelector('.vseh-field-note-cmsexport'));
     if (key === lastCmsExportNote && noteExists) return;
@@ -10766,6 +10836,17 @@
         (mTitle ? ' <span style="font-weight:400;">(matchar ”' + esc(mTitle) + '”)</span>' : '') + '</div>');
       vlog('CMS-export: "' + (titleEn || titleSv) + '" FINNS i importerad lista (”' + mTitle + '”' +
         (best.start_date ? ', ' + best.start_date : '') + ') — grön popup vid besökssiffror.', 'ok');
+    } else if (crmBest) {
+      const pTxt = crmBest.participants
+        ? ' – antal deltagare redan <b>' + Number(crmBest.participants).toLocaleString('sv-SE') + '</b> i CRM'
+        : '';
+      setFieldNote(anchor, 'cmsexport',
+        '<div style="border:1px solid #d97706;background:rgba(217,119,6,.10);color:#b45309;border-radius:7px;padding:6px 10px;font-weight:600;">' +
+        '🧾 Finns i CRM-importen (SBR)' + pTxt + ' – lägg inte in besökssiffror här.' +
+        ' <span style="font-weight:400;">(matchar ”' + esc(crmBest.title) + '”' + (crmBest.start_date ? ', ' + esc(crmBest.start_date) : '') + ')</span></div>');
+      vlog('CMS-export: "' + (titleEn || titleSv) + '" finns EJ i eventlistan men I CRM-importen (”' + crmBest.title + '”' +
+        (crmBest.start_date ? ', ' + crmBest.start_date : '') + (crmBest.participants ? ', ' + crmBest.participants + ' deltagare' : '') +
+        ') — orange popup vid besökssiffror (inga dubblerade besökssiffror).', 'err');
     } else {
       setFieldNote(anchor, 'cmsexport',
         '<div style="border:1px solid #d6336c;background:rgba(214,51,108,.10);color:#d6336c;border-radius:7px;padding:6px 10px;font-weight:600;">' +
