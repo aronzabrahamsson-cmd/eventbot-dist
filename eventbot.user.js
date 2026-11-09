@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.16
+// @version      7.100.17
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1875,6 +1875,32 @@
     const root = await mountDraftail(fieldId);
     const editable = root && (root.querySelector('.public-DraftEditor-content') || root);
     if (!editable || !editable.isContentEditable) return false;
+    // (v7.100.17) Spara originaltexten INNAN vi rör fältet — om tömningen lyckas
+    // men paste sedan misslyckas (t.ex. Firefox där syntetisk clipboardData kan
+    // bli tom) är fältet tomt i React-state och skulle sparas tomt. Då återställer
+    // vi originalet direkt via restoreOriginal() innan vi ger upp.
+    const originalText = readDraftailText(fieldId);
+    const restoreOriginal = async (allowPaste) => {
+      if (!originalText) return;
+      try {
+        const props = root && getDraftProps(root);
+        if (props) {
+          const EditorState = props.editorState.constructor;
+          const ContentState = props.editorState.getCurrentContent().constructor;
+          let ns = EditorState.createWithContent(ContentState.createFromText(originalText, "\n"));
+          if (typeof EditorState.moveSelectionToEnd === "function") ns = EditorState.moveSelectionToEnd(ns);
+          props.onChange(ns);
+          for (let i = 0; i < 50; i++) { await new Promise(r => setTimeout(r, 100)); if (draftailTextLanded(fieldId, originalText)) return; }
+        }
+      } catch {}
+      if (!allowPaste) return;   // utan verifierad tom markering skulle en paste kunna duplicera
+      try {
+        const dt2 = new DataTransfer();
+        dt2.setData('text/plain', originalText);
+        editable.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt2, bubbles: true, cancelable: true }));
+        for (let i = 0; i < 50; i++) { await new Promise(r => setTimeout(r, 100)); if (draftailTextLanded(fieldId, originalText)) return; }
+      } catch {}
+    };
     editable.focus();
     // Rensa först: markera HELA befintliga innehållet så paste
     // ERSÄTTER den gamla texten i stället för att lägga den nya bredvid/
@@ -1950,8 +1976,9 @@
       } catch {}
     }
     if (!emptied) {
+      await restoreOriginal(false);   // (v7.100.17) delete-event hann delvis mutera fältet — återställ
       vlog('Beskrivning: AVBRYTER skrivning till ' + fieldId +
-        ' — fältet kunde inte tömmas verifierat (innehåll kvar efter delete) och en paste skulle duplicera texten. Klistra in manuellt.', 'err');
+        ' — fältet kunde inte tömmas verifierat (innehåll kvar efter delete) och en paste skulle duplicera texten. Original återställt via React-props om möjligt, annars klistra in manuellt.', 'err');
       return false;
     }
     // Draft.js är en kontrollerad React-komponent: råa DOM-ändringar den inte
@@ -2000,18 +2027,15 @@
     // lämnas fältet orört (paste kan i värsta fall ha landat synligt,
     // men aldrig dubblerat).
     if (await waitLanded()) return true;
-    return false;
-    // TIDLIGARE SISTA RESERV (borttagen 2026-10-09): att skriva Draft.js-JSON
-    // direkt i det dolda input-fältet skapade en split-brain — React/Draftails
-    // internal state uppdaterades aldrig, fältet blev oredigerbart vid nästa
-    // tangenttryckning, och efter sparning kunde originaltexten komma tillbaka
-    // eftersom skärmen visade Reacts state medan det dolda fältet innehöll
-    // något annat. En TYDIG misslyckande (fältet lämnas orört, användaren
-    // klistrar in manuellt) är mycket bättre än en tyst osynkad skrivning.
+    // (v7.100.17) Paste landade INTE — fältet är verifierat TOMT i React-state just
+    // nu, så en sparning skulle radera hela beskrivningen. Återställ
+    // originaltexten direkt (React-props först, andra paste som reserv).
+    await restoreOriginal(true);
+    const restored = originalText ? draftailTextLanded(fieldId, originalText) : false;
     warnDraftailOnce(fieldId, 'Beskrivning: kunde INTE skriva till ' + fieldId +
-      ' automatiskt (varken paste eller insättning verifierades) — fältet är orört, klistra in texten manuellt.');
-    vlog('Beskrivning: AUTOMATISK IFYLLNING MISSLYCKADES för ' + fieldId +
-      ' — fältet lämnas orört (ingen dold JSON-skrivning längre). Klistra in manuellt.', 'err');
+      ' automatiskt (paste verifierades inte) — ' + (restored ? 'originaltexten är återställd.' : 'ÅTERSTÄLLNING misslyckades också — fältet kan vara tomt, klistra in manuellt!'));
+    vlog('Beskrivning: AUTOMATISK IFYLLNING MISSLYCKADES för ' + fieldId + ' — ' +
+      (restored ? 'originaltexten återställd (ingen data förlorad).' : 'kunde inte återställa — fältet kan vara tomt, klistra in manuellt!'), 'err');
     return false;
   }
   // (2026-10-19) Tidsbaserad skrivspärr per fält: på edit-sidor skrivs
@@ -2081,6 +2105,25 @@
         landed = draftailTextLanded(fieldId, text);
       }
       if (landed) {
+        // (v7.100.17) Split-brain-skydd: det dolda fältet kan vara uppdaterat
+        // medan SKÄRMEN fortfarande ser tom ut tills eventet sparas (texten
+        // ”finns kvar men syns inte”). Kontrollera editorns synliga text;
+        // vid mismatch tvinga re-render via samma props (fokus + forceSelection).
+        const want = String(text).replace(/\s+/g, ' ').trim();
+        for (let i = 0; i < 20; i++) {
+          await new Promise(r => setTimeout(r, 100));
+          const ed = root && root.querySelector('.public-DraftEditor-content');
+          const shown = ((ed && ed.textContent) || '').replace(/\s+/g, ' ').trim();
+          if (!want || shown === want) break;
+          if (i === 19) {
+            try {
+              const ES = editorState.constructor;
+              if (ed) ed.focus();
+              props.onChange(ES.forceSelection(editorState, editorState.getSelection().set('hasFocus', true)));
+              vlog('Beskrivning: ' + fieldId + ' verifierad i dolda fältet men skärmen visade inte texten — tvingade re-render (fokus).', 'err');
+            } catch {}
+          }
+        }
         vlog(`Beskrivning ifylld: ${fieldId} → ${String(text).slice(0, 60)}...`, 'ok');
         return true;
       }
@@ -10506,21 +10549,43 @@
   // (eller exakt normaliserad titel) och, när båda sidor har datum, samma datum
   // någonstans (annat datum = annat tillfälle av ev. återkommande event).
   // SBR hoppas över — där är exporten själv källa.
+  // (v7.100.16, på begäran) Visit EDIT/NEW: rosa/grön pop-up vid
+  // besökssiffrorna som visar om eventet finns i den importerade CMS-exporten
+  // (GM-nyckeln sbr_manual_calendar — samma data som SBR-vyns "Eventlista").
+  // Grön = finns i CMS-export/prognoskalender (lägg INTE in besökarantal),
+  // rosa = finns EJ där (fyll i besökssiffror om stort event).
+  // (v7.100.17) Fältet letas även upp via label (besök/attendees/visitors) och
+  // popupen fästs vid ett SYNLIGT ankare (besökssiffror → add_to_forecast →
+  // forecast_event_type → titel) — tidigare kunde fältet saknas/dold panel på
+  // EDIT göra popupen osynlig utan förklaring. Datum normaliseras också
+  // (svenska datumformat). Skälet loggas när ingen popup visas.
+  // Matchning: bästa titellikhet en/sv >= 0.75 (eller exakt normaliserad titel)
+  // och, när båda sidor har datum, samma datum någonstans.
   let lastCmsExportNote = null;
+  let lastCmsExportDebug = '';
   function checkCmsExportStatus() {
     if (location.hostname === 'www.stockholmbusinessregion.se') return;
-    const el = document.getElementById('id_expected_attendees');
-    if (!el) return;
+    const debug = (msg) => { if (msg !== lastCmsExportDebug) { lastCmsExportDebug = msg; vlog('CMS-export: ' + msg, 'err'); } };
+    const attendeesEl = sbrFindField(['id_expected_attendees'], /besök|besok|attendee|visitor/i);
+    if (!attendeesEl) {
+      debug('hoppar över — fält för besökssiffror hittades inte (varken id eller label)');
+      return;
+    }
+    const candidates = [attendeesEl, document.getElementById('id_add_to_forecast'),
+      document.getElementById('id_forecast_event_type'), document.getElementById('id_title_en')].filter(Boolean);
+    const anchor = candidates.find(e => e.getClientRects().length) || attendeesEl;
     const titleEn = (document.getElementById('id_title_en')?.value || '').trim();
     const titleSv = (document.getElementById('id_title_sv')?.value || '').trim();
     let cal = [];
     try { cal = JSON.parse(GM_getValue(SBR_CAL_KEY, '[]')) || []; } catch { cal = []; }
     if ((!titleEn && !titleSv) || !cal.length) {
-      setFieldNote(el, 'cmsexport', '');
+      candidates.forEach(c => setFieldNote(c, 'cmsexport', ''));
       lastCmsExportNote = null;
+      debug(!cal.length ? 'ingen importerad lista än (sbr_manual_calendar tom — importera i SBR-vyn först)' : 'ingen titel ifylld än');
       return;
     }
-    const visitDates = new Set(currentDateBlocksWithTimes().map(b => b.date).filter(Boolean));
+    lastCmsExportDebug = '';
+    const visitDates = new Set(currentDateBlocksWithTimes().map(b => parseSwedishDate(b.date) || b.date).filter(Boolean));
     let best = null, bestSim = 0;
     for (const e of cal) {
       const cands = [e.title_en || '', e.title_sv || ''];
@@ -10529,7 +10594,6 @@
         if (!ct) continue;
         s = Math.max(s, titleEn ? titleSim(titleEn, ct) : 0, titleSv ? titleSim(titleSv, ct) : 0);
       }
-      // exakt normaliserad titel räknas som full träff även under tröskeln
       if (s < 1) {
         const ne = normText(titleEn), ns = normText(titleSv);
         if ((ne && (ne === normText(e.title_en || '') || ne === normText(e.title_sv || ''))) ||
@@ -10537,21 +10601,20 @@
       }
       if (s < 0.75 || s <= bestSim) continue;
       const calDate = (e.start_date || '').trim();
-      // när båda sidor har datum måste något datum överensstämma — annars är det
-      // ett annat tillfälle av samma återkommande event
       if (calDate && visitDates.size && !visitDates.has(calDate)) continue;
       best = e; bestSim = s;
     }
     const key = best
       ? 'in:' + (best.title_en || best.title_sv || '') + '@' + (best.start_date || '')
       : 'out:' + (titleEn || titleSv);
-    const wrap = fieldWrapper(el);
+    const wrap = fieldWrapper(anchor);
     const noteExists = !!(wrap && wrap.querySelector('.vseh-field-note-cmsexport'));
-    if (key === lastCmsExportNote && noteExists) return;   // samma status, noten finns kvar — slipp loggspam
+    if (key === lastCmsExportNote && noteExists) return;
     lastCmsExportNote = key;
+    candidates.forEach(c => { if (c !== anchor) setFieldNote(c, 'cmsexport', ''); });
     if (best) {
       const mTitle = best.title_sv || best.title_en || '';
-      setFieldNote(el, 'cmsexport',
+      setFieldNote(anchor, 'cmsexport',
         '<div style="border:1px solid #1f7a4d;background:rgba(31,122,77,.12);color:#1f7a4d;border-radius:7px;padding:6px 10px;font-weight:600;">' +
         '✅ Inlagd i CMS-export/prognoskalender' + (best.start_date ? ' (' + esc(best.start_date) + ')' : '') +
         ' – lägg inte in besökarantal.' +
@@ -10559,7 +10622,7 @@
       vlog('CMS-export: "' + (titleEn || titleSv) + '" FINNS i importerad lista (”' + mTitle + '”' +
         (best.start_date ? ', ' + best.start_date : '') + ') — grön popup vid besökssiffror.', 'ok');
     } else {
-      setFieldNote(el, 'cmsexport',
+      setFieldNote(anchor, 'cmsexport',
         '<div style="border:1px solid #d6336c;background:rgba(214,51,108,.10);color:#d6336c;border-radius:7px;padding:6px 10px;font-weight:600;">' +
         '⚠️ Ej inlagd i CMS-export – fyll i besökssiffror om stort event. ' +
         '<span style="font-weight:400;">(' + cal.length + ' event i SBR-vyns Eventlista)</span></div>');
