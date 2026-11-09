@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.18
+// @version      7.100.19
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1819,43 +1819,50 @@
   }
 
   function getDraftProps(root) {
-    // React 17+ döpte om fiber-nyckeln på DOM-noden från __reactInternalInstance$
-    // till __reactFiber$ — bara den gamla nyckeln söks blev ALLA skrivningar
-    // till beskrivningsfälten en tyst no-op med en felrad per 1,5s-poll
-    // (bekräftat i loggen 2026-09-30, edit-sida /cms/api/event/edit/18056/).
-    // Provar båda namnen, plus __reactProps$-vägen som sista reserv.
+    // (v7.100.19) Bred sökning efter props med onChange + editorState:
+    // 1) fiber-vandring uppåt (båda nyckelnamnen, 60 hopp),
+    // 2) __reactProps$ på root,
+    // 3) __reactProps$ på alla noder i fältets wrapper,
+    // 4) __reactProps$ på alla noder i hela formuläret.
+    // editorState accepteras även duck-typat (getCurrentContent) och kan
+    // ligga i ett syskonvärde — då returneras en KOPIA (rör aldrig Reacts
+    // eget props-objekt). På en del Wagtail/React-builds hittas annars inga
+    // props alls och varje skrivning föll till contentEditable-reserven där
+    // skärmen inte alltid uppdaterades.
+    const isState = (v) => v && typeof v.getCurrentContent === 'function';
+    const okProps = (mp) => {
+      if (!mp || typeof mp.onChange !== 'function') return null;
+      const editorState = mp.editorState || Object.values(mp).find(isState);
+      if (!editorState) return null;
+      return mp.editorState ? mp : Object.assign({}, mp, { editorState });
+    };
     const instKey = Object.keys(root).find((k) =>
       k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")
     );
     let node = instKey ? root[instKey] : null;
     let hops = 0;
-    while (node && hops < 60) {   // (v7.100.18) fler hopp upp i fiber-trädet
-      const mp = node.memoizedProps;
-      if (mp && mp.onChange && mp.editorState) return mp;
+    while (node && hops < 60) {
+      const hit = node.memoizedProps && okProps(node.memoizedProps);
+      if (hit) return hit;
       node = node.return || node._debugOwner || null;
       hops++;
     }
-    // Reserv: React 17+ lägger komponentens props direkt på DOM-noden som
-    // __reactProps$<uid> (även kallad hoisted container props). Om fiber-
-    // vandringen ovan misslyckas (t.ex. pga prod-build utan memoizedProps
-    // på närmaste noder) kan props ligga här istället.
-    for (const k of Object.keys(root)) {
-      if (!k.startsWith("__reactProps$")) continue;
-      const mp = root[k];
-      if (mp && mp.onChange && mp.editorState) return mp;
-    }
-    // (v7.100.18) sista reserv: skanna hela fältets wrapper efter
-    // __reactProps$ på vilken nod som helst — vissa React/Wagtail-builds
-    // lägger props inte på root-noden utan på en inre komponentnod
-    // (vilket gjorde att updateDraftail föll tillbaka till contentEditable-
-    // reserven där skärmen inte alltid uppdaterades).
-    const wrapEl = root.closest('.w-field, .w-panel, [data-field]') || root.parentElement || root;
-    for (const el of wrapEl.querySelectorAll('*')) {
+    const scan = (el) => {
+      if (!el) return null;
       for (const k of Object.keys(el)) {
         if (!k.startsWith('__reactProps$')) continue;
-        const mp = el[k];
-        if (mp && mp.onChange && mp.editorState) return mp;
+        const hit = okProps(el[k]);
+        if (hit) return hit;
       }
+      return null;
+    };
+    let hit = scan(root);
+    if (hit) return hit;
+    const wrapEl = root.closest('.w-field, .w-panel, [data-field]') || root.parentElement || root;
+    for (const el of wrapEl.querySelectorAll('*')) { hit = scan(el); if (hit) return hit; }
+    const form = root.closest('form');
+    if (form && form !== wrapEl) {
+      for (const el of form.querySelectorAll('*')) { hit = scan(el); if (hit) return hit; }
     }
     return null;
   }
@@ -1906,7 +1913,13 @@
           for (let i = 0; i < 50; i++) { await new Promise(r => setTimeout(r, 100)); if (draftailTextLanded(fieldId, originalText)) return; }
         }
       } catch {}
-      if (!allowPaste) return;   // utan verifierad tom markering skulle en paste kunna duplicera
+      // (v7.100.19) paste är säker när fältet är tomt ELLER när aktuell
+      // markering täcker (nästan) hela originaltexten — annars skulle den kunna
+      // läggas till bredvid och duplicera.
+      let selLen = 0;
+      try { selLen = (window.getSelection().toString() || '').replace(/\s+/g, ' ').trim().length; } catch {}
+      const origLen = originalText.replace(/\s+/g, ' ').trim().length;
+      if (!allowPaste && !(origLen && selLen >= origLen * 0.9)) return;
       try {
         const dt2 = new DataTransfer();
         dt2.setData('text/plain', originalText);
@@ -1989,6 +2002,17 @@
       } catch {}
     }
     if (!emptied) {
+      // (v7.100.19) andra försök: bygg om markeringen från innehållet och prova igen
+      try {
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editable);
+        sel.removeAllRanges(); sel.addRange(range);
+        document.execCommand('delete');
+        emptied = await waitEmpty();
+      } catch {}
+    }
+    if (!emptied) {
       await restoreOriginal(false);   // (v7.100.17) delete-event hann delvis mutera fältet — återställ
       vlog('Beskrivning: AVBRYTER skrivning till ' + fieldId +
         ' — fältet kunde inte tömmas verifierat (innehåll kvar efter delete) och en paste skulle duplicera texten. Original återställt via React-props om möjligt, annars klistra in manuellt.', 'err');
@@ -2050,15 +2074,27 @@
         const shown = (editable.textContent || '').replace(/\s+/g, ' ').trim();
         if (!wantS || shown === wantS) break;
         if (i === 19) {
-          try { editable.focus(); } catch {}
           try {
             const props2 = getDraftProps(root);
             if (props2) {
               const ES2 = props2.editorState.constructor;
+              const CS2 = props2.editorState.getCurrentContent().constructor;
+              editable.focus();
+              // först bara tvinga re-render av befintlig state (forceSelection)
               props2.onChange(ES2.forceSelection(props2.editorState, props2.editorState.getSelection().set('hasFocus', true)));
+              await new Promise(r => setTimeout(r, 1000));
+              const shown2 = (editable.textContent || '').replace(/\s+/g, ' ').trim();
+              if (wantS && shown2 !== wantS) {
+                // state hade inte texten — skriv om via props direkt
+                let ns2 = ES2.createWithContent(CS2.createFromText(String(text), "\n"));
+                if (typeof ES2.moveSelectionToEnd === 'function') ns2 = ES2.moveSelectionToEnd(ns2);
+                props2.onChange(ns2);
+              }
+            } else {
+              editable.blur(); editable.focus();
             }
           } catch {}
-          vlog('Beskrivning: ' + fieldId + ' rätt i dolda fältet men skärmen visade inte texten — tvingade re-render (fokus).', 'err');
+          vlog('Beskrivning: ' + fieldId + ' rätt i dolda fältet men skärmen visade inte texten — tvingade re-render (fokus/forceSelection).', 'err');
         }
       }
       return true;
