@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.22
+// @version      7.100.23
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -5945,11 +5945,24 @@
       }
     }
   }
+  let sbrCrmNoPatLogged = false;
   async function pullSbrCrmFromGh() {
-    if (!githubDataToken()) return;
+    if (!githubDataToken()) {
+      // (v7.100.23) Lokala CRM-rader utan PAT på denna domän når aldrig
+      // Visit — logga tydligt EN gång per sida.
+      if (sbrCrmEvents.length && !sbrCrmNoPatLogged) {
+        sbrCrmNoPatLogged = true;
+        vlog('CRM: ' + sbrCrmEvents.length + ' lokala rader men ingen GitHub-PAT på denna domän — central synk uteblir (sätt PAT i Inställningar).', 'err');
+      }
+      return;
+    }
     try {
       const res = await githubDataGet(SBR_CRM_GH_PATH);
       const remote = Array.isArray(res.json && res.json.records) ? res.json.records : [];
+      // (v7.100.23) Självläkande push: lokala rader som saknas centralt (t.ex.
+      // importerade innan den centrala synken fanns, eller utan PAT då) pushas nu.
+      const remoteKeys = new Set(remote.filter(Boolean).map(e => crmKey(e)));
+      if (sbrCrmEvents.some(e => e && !remoteKeys.has(crmKey(e)))) pushSbrCrmToGh().catch(() => {});
       if (!remote.length) return;
       const byKey = new Map(sbrCrmEvents.map(e => [crmKey(e), e]));
       let added = 0;
@@ -6400,11 +6413,23 @@
     }
   }
   // Hämtar central kopia och mergar in saknade poster lokalt (SBR-vyn).
+  let sbrCalNoPatLogged = false;
   async function pullSbrCalFromGh() {
-    if (!githubDataToken()) return;
+    if (!githubDataToken()) {
+      // (v7.100.23) Samma varning som för CRM: lokala poster + saknad PAT.
+      if (sbrManualCal.length && !sbrCalNoPatLogged) {
+        sbrCalNoPatLogged = true;
+        vlog('Eventlista: ' + sbrManualCal.length + ' lokala poster men ingen GitHub-PAT på denna domän — central synk uteblir (sätt PAT i Inställningar).', 'err');
+      }
+      return;
+    }
     try {
       const res = await githubDataGet(SBR_CAL_GH_PATH);
       const remote = Array.isArray(res.json && res.json.records) ? res.json.records : [];
+      // (v7.100.23) Självläkande push: lokala poster som saknas centralt pushas
+      // nu, så listor importerade före v7.100.18 också når Visit EDIT/NEW.
+      const remoteKeys = new Set(remote.filter(Boolean).map(e => sbrCalKey(e)));
+      if (sbrManualCal.some(e => e && !remoteKeys.has(sbrCalKey(e)))) pushSbrCalToGh().catch(() => {});
       if (!remote.length) return;
       const byKey = new Map(sbrManualCal.map(e => [sbrCalKey(e), e]));
       let added = 0;
