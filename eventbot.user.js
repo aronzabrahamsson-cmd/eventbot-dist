@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.20
+// @version      7.100.21
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1799,9 +1799,13 @@
     if (!hidden) return null;
     const wrapper =
       hidden.closest(".w-field, .w-panel, [data-field]") || hidden.parentElement;
-    const findRoot = () =>
-      wrapper?.querySelector(".DraftEditor-root") ||
-      wrapper?.querySelector(".Draftail-Editor .DraftEditor-root");
+    // (v7.100.21) om flera .DraftEditor-root finns i wrappern (t.ex. en dold
+    // + en synlig): valj den SYNLIGA i forsta hand, annars skulle paste kunna
+    // landa i en osynlig instans medan skarmen inte uppdateras.
+    const findRoot = () => {
+      const roots = wrapper ? [...wrapper.querySelectorAll(".DraftEditor-root")] : [];
+      return roots.find(r => r.getClientRects().length) || roots[0] || null;
+    };
     let root = findRoot();
     if (!root) {
       hidden.scrollIntoView({ block: "center" });
@@ -1836,16 +1840,24 @@
       if (!editorState) return null;
       return mp.editorState ? mp : Object.assign({}, mp, { editorState });
     };
-    const instKey = Object.keys(root).find((k) =>
-      k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")
-    );
-    let node = instKey ? root[instKey] : null;
-    let hops = 0;
-    while (node && hops < 60) {
-      const hit = node.memoizedProps && okProps(node.memoizedProps);
-      if (hit) return hit;
-      node = node.return || node._debugOwner || null;
-      hops++;
+    // (v7.100.21) starta fiber-vandringen fran root OCH upp till 6 foraldrar —
+    // ibland sitter fiber-nyckeln inte på själva .DraftEditor-root utan på en
+    // foralder (portal/container).
+    const startNodes = [];
+    for (let p = root, i = 0; p && i < 6; i++) { startNodes.push(p); p = p.parentElement; }
+    for (const sn of startNodes) {
+      const instKey = Object.keys(sn).find((k) =>
+        k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")
+      );
+      if (!instKey) continue;
+      let node = sn[instKey];
+      let hops = 0;
+      while (node && hops < 60) {
+        const hit = node.memoizedProps && okProps(node.memoizedProps);
+        if (hit) return hit;
+        node = node.return || node._debugOwner || null;
+        hops++;
+      }
     }
     const scan = (el) => {
       if (!el) return null;
@@ -2097,6 +2109,14 @@
           vlog('Beskrivning: ' + fieldId + ' rätt i dolda fältet men skärmen visade inte texten — tvingade re-render (fokus/forceSelection).', 'err');
         }
       }
+      {
+        // (v7.100.21) samma sista utväg här: dolda fältet är rätt, patcha skärmen visuellt om den fortfarande är tom.
+        const shownNow = (editable.textContent || '').replace(/\s+/g, ' ').trim();
+        if (wantS && shownNow !== wantS) {
+          editable.textContent = String(text);
+          vlog('Beskrivning: ' + fieldId + ' — dolda fältet rätt men skärmen patchades visuellt (textContent); sparning påverkas inte.', 'err');
+        }
+      }
       return true;
     }
     // (v7.100.17) Paste landade INTE — fältet är verifierat TOMT i React-state just
@@ -2149,7 +2169,9 @@
       }
       const props = getDraftProps(root);
       if (!props) {
-        warnDraftailOnce(fieldId, `Beskrivning: hittade Draftail-fältet ${fieldId} men inte dess React-props — provar reservsökvägen (contentEditable).`);
+        const reactKeys = root ? Object.keys(root).filter(k => k.startsWith('__react')).join(',') : '?';
+        const nRoots = root && root.parentElement ? root.parentElement.querySelectorAll('.DraftEditor-root').length : '?';
+        warnDraftailOnce(fieldId, `Beskrivning: hittade Draftail-fältet ${fieldId} men inte dess React-props — provar reservsökvägen (contentEditable). Diagnostik: root __react-nycklar=[${reactKeys || 'inga'}], isConnected=${root ? root.isConnected : '?'}, antal .DraftEditor-root i parent=${nRoots}.`);
         if (await updateDraftailViaClipboard(fieldId, text)) {
           vlog(`Beskrivning ifylld (contentEditable-reserv): ${fieldId} → ${String(text).slice(0, 60)}...`, 'ok');
           return true;
@@ -2194,6 +2216,17 @@
               props.onChange(ES.forceSelection(editorState, editorState.getSelection().set('hasFocus', true)));
               vlog('Beskrivning: ' + fieldId + ' verifierad i dolda fältet men skärmen visade inte texten — tvingade re-render (fokus).', 'err');
             } catch {}
+          }
+        }
+        // (v7.100.21) sista utväg för SYNLIGHETEN: dolda fältet är rätt (sparningen
+        // blir rätt), men om skärmen fortfarande inte visar texten patchar vi
+        // editorns DOM direkt så användaren ser texten direkt.
+        {
+          const edNow = root && root.querySelector('.public-DraftEditor-content');
+          const shownNow = ((edNow && edNow.textContent) || '').replace(/\s+/g, ' ').trim();
+          if (want && shownNow !== want && edNow) {
+            edNow.textContent = String(text);
+            vlog('Beskrivning: ' + fieldId + ' — dolda fältet rätt men skärmen patchades visuellt (textContent); sparning påverkas inte.', 'err');
           }
         }
         vlog(`Beskrivning ifylld: ${fieldId} → ${String(text).slice(0, 60)}...`, 'ok');
@@ -5891,7 +5924,7 @@
     pushSbrCrmToGh().catch(() => {});
   }
   async function pushSbrCrmToGh() {
-    if (!githubDataToken()) return;
+    if (!githubDataToken()) { vlog('CRM: ingen GitHub-PAT på denna domän — central synk hoppas över (sätt PAT i SBR-panelens Inställningar och importera igen).', 'err'); return; }
     for (let attempt = 0; attempt < 3; attempt++) {
       let current;
       try { current = await githubDataGet(SBR_CRM_GH_PATH); }
@@ -6345,7 +6378,7 @@
   // hanterat-flaggor): union på sbrCalKey, lokala poster vinner, 409 → läs
   // om och försök igen.
   async function pushSbrCalToGh() {
-    if (!githubDataToken()) return;   // ingen PAT — lokal import räcker i SBR-vyn
+    if (!githubDataToken()) { vlog('Eventlista: ingen GitHub-PAT på denna domän — central synk hoppas över. GM-lagret är per domän: sätt samma PAT i SBR-panelens Inställningar och importera igen.', 'err'); return; }
     for (let attempt = 0; attempt < 3; attempt++) {
       let current;
       try { current = await githubDataGet(SBR_CAL_GH_PATH); }
@@ -10779,7 +10812,7 @@
       lastCmsExportNote = null;
       debug((!titleEn && !titleSv)
         ? 'ingen titel ifylld än'
-        : (githubDataToken() ? 'inga importerade listor än (importera Eventlista + CRM i SBR-vyn — synkas till eventbot-data)' : 'inga importerade listor än och ingen GitHub-PAT i Inställningar — importera i SBR-vyn och ange PAT'));
+        : (githubDataToken() ? 'inga importerade listor än (importera Eventlista + CRM i SBR-vyn; push kräver GitHub-PAT även i SBR-panelens Inställningar — GM-lagret är per domän)' : 'inga importerade listor än och ingen GitHub-PAT i Inställningar — importera i SBR-vyn och ange PAT'));
       return;
     }
     lastCmsExportDebug = '';
