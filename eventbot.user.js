@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.28
+// @version      7.100.29
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1060,6 +1060,40 @@
     }
     return out;
   }
+  // (v7.100.29, på begäran) "Visa originaltext"-knapp bredvid beskrivningen i NEW:
+  // växlar en ruta med källans originaltext (API:ns description-fält vid kort-
+  // skapande, eller hämtad sidtext vid URL-import) så redaktören kan jämföra
+  // agentens sammanfattning med ursprungsversionen. Data sparas i GM-nyckeln
+  // vseh_last_src när ett utkast skapas (createEvent/createEventFromUrl).
+  function installOriginalTextButton() {
+    const el = document.getElementById('id_description_en');
+    if (!el) return;
+    const wrap = fieldWrapper(el);
+    if (!wrap || wrap.querySelector('.vseh-origtext-btn')) return;
+    const row = document.createElement('div');
+    row.style.cssText = 'margin:4px 0;';
+    row.innerHTML = '<button type="button" class="vseh-origtext-btn" style="font-size:12px;padding:2px 8px;cursor:pointer;">\u2139 Visa originaltext</button>';
+    wrap.insertBefore(row, wrap.firstChild);
+    const btn = row.querySelector('.vseh-origtext-btn');
+    btn.addEventListener('click', () => {
+      let box = wrap.querySelector('.vseh-origtext-box');
+      if (box) { box.remove(); btn.textContent = '\u2139 Visa originaltext'; return; }
+      let src = null;
+      try { src = JSON.parse(GM_getValue('vseh_last_src', '') || 'null'); } catch {}
+      const srcLabel = src && src.source ? (SOURCE_LABEL[src.source] || src.source) : 'okänd källa';
+      const url = src && src.url ? `<a href="${esc(src.url)}" target="_blank" rel="noopener">${esc(src.url)}</a>` : '–';
+      const txt = src && src.description ? esc(src.description)
+        : '(källan hade ingen egen beskrivningstext — se käll-URL:en ovan)';
+      box = document.createElement('div');
+      box.className = 'vseh-origtext-box';
+      box.style.cssText = 'font-size:12px;border:1px solid var(--vd-line);border-radius:6px;padding:8px;margin:4px 0;max-height:320px;overflow:auto;background:var(--vd-bg2);';
+      box.innerHTML = `<div style="margin-bottom:4px;"><b>Originaltext från ${esc(srcLabel)}</b>${src && src.title ? ' — ' + esc(src.title) : ''}<br>Källa: ${url}</div>` +
+        `<pre style="white-space:pre-wrap;margin:0;font-family:inherit;">${txt}</pre>`;
+      wrap.insertBefore(box, row.nextSibling);
+      btn.textContent = '\u2139 Dölj originaltext';
+    });
+  }
+
   async function fetchTicketmaster({ key, radius, classification, maxPages, onProgress, onPage }) {
     const today = new Date().toISOString().split('T')[0] + 'T00:00:00Z';
     let occ = [], pagesFetched = 0;
@@ -4324,6 +4358,9 @@
     }
     const url = ev.external_website_url;
     if (!url) { setStatus('Eventet saknar käll-URL att skicka till Mistral.', 'err'); return; }
+    // (v7.100.29) Spara källans originaltext för "Visa originaltext"-knappen i NEW.
+    try { GM_setValue('vseh_last_src', JSON.stringify({ title: ev.title || '', description: ev.description || '',
+      url: url || '', source: ev._source || '', at: Date.now() })); } catch {}
 
     busyCreate.add(idx);
     activeEventIdx = idx;
@@ -4367,7 +4404,7 @@
       '- occurrences: EXAKT "occurrences" ovan (ändra inte).\n' +
       '- press_image_url: "image_url" ovan om ifyllt.\n' +
       '- main_category/categories/subcategory: mappa "category_hint" + titeln till din kategorilista.\n' +
-      '- description_sv/description_en: 2-5 meningar om VAD detta konkret är (artist/verk, ' +
+      '- description_sv/description_en: EXAKT 3-4 meningar (aldrig färre än 3, aldrig fler än 4) om VAD detta konkret är (artist/verk, ' +
       'genre, vad som är unikt) så läsaren kan avgöra intresse. Läs URL:en om möjligt, annars ' +
       'utifrån titeln. FÖRBJUDET: floskler ("en kväll fylld av musik och underhållning", ' +
       '"en oförglömlig upplevelse", "signaturljud", "lovar en intensiv upplevelse"), ' +
@@ -4817,6 +4854,10 @@
     } catch (e) {
       vlog('Kunde inte hämta sidans text själv (' + e.message + ') — agenten får försöka läsa URL:en direkt istället (mindre pålitligt).', 'err');
     }
+
+    // (v7.100.29) Spara sidtexten för "Visa originaltext"-knappen i NEW (max 20k tecken).
+    try { GM_setValue('vseh_last_src', JSON.stringify({ title: '(URL-import)', description: (pageText || '').slice(0, 20000),
+      url, source: 'url', at: Date.now() })); } catch {}
 
     const agentInput = pageText
       ? ('FÖRHÄMTAD SIDTEXT (hämtad av scriptet — detta ÄR sidans innehåll, använd ENDAST detta, ' +
@@ -11253,6 +11294,8 @@
     if (mode === 'small') mode = 'max';            // legacy-läge → maximera
     if (!['min', 'max'].includes(mode)) mode = 'min';
     buildPanel();
+    installOriginalTextButton();                          // (v7.100.29) "Visa originaltext" vid beskrivningen
+    setInterval(installOriginalTextButton, 2000);         // fälten kan renderas sent av Wagtail
     { const t1 = GM_getValue('tm_fetched_ts', 0); const e1 = $('vseh-tm-ts'); if (e1 && t1) e1.textContent = fmtStamp(t1);
       const t2 = GM_getValue('vs_fetched_ts', 0); const e2 = $('vseh-vs-ts'); if (e2 && t2) e2.textContent = fmtStamp(t2);
       const t3 = GM_getValue('billetto_fetched_ts', 0); const e3 = $('vseh-bl-ts'); if (e3 && t3) e3.textContent = fmtStamp(t3);
@@ -11279,6 +11322,8 @@
     if (/\/wt\/cms\/snippets\/api\/event\/(create|edit)\//.test(location.pathname)) {
       initSbrEditAutomation();
       setInterval(checkBrokenImageOnPage, 2000);   // (v7.100.10) bruten bild
+      installOriginalTextButton();                 // (v7.100.29) "Visa originaltext" vid beskrivningen
+      setInterval(installOriginalTextButton, 2000);
     }
     // (2026-10-26, v7.100.9) Dubblettkollen (SBR-DRAFT) körs på ALLA SBR:s
     // eventlist-URL:er (inte bara ?status=draft) — panelen OCH dubblettvyn
