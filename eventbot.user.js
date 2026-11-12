@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.30
+// @version      7.100.31
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -2035,8 +2035,12 @@
       // läggas till bredvid och duplicera.
       let selLen = 0;
       try { selLen = (window.getSelection().toString() || '').replace(/\s+/g, ' ').trim().length; } catch {}
-      const origLen = originalText.replace(/\s+/g, ' ').trim().length;
-      if (!allowPaste && !(origLen && selLen >= origLen * 0.9)) return;
+      // (v7.100.31) klistra ALDRIG in i ett icke-tomt state — då läggs texten
+      // bredvid vad som än ligger där (duplicering). Paste bara om det dolda
+      // fältet verifierat är TOMT, eller markeringen täcker (nästan) hela det
+      // innehåll som faktiskt ligger i state just nu.
+      const hiddenLen = hiddenNorm().length;
+      if (!(hiddenLen === 0 || (selLen > 0 && selLen >= hiddenLen * 0.9))) return;
       try {
         const dt2 = new DataTransfer();
         dt2.setData('text/plain', originalText);
@@ -2095,11 +2099,15 @@
     // bara fylla ett tomt fält. Om tömningen inte verifieras avbryts hela
     // skrivningen (ingen paste alls) — ett tydligt misslyckande är bättre
     // än duplicerad text.
+    // (v7.100.31) waitEmpty kontrollerar nu det DOLDA fältet (React-state = facit
+    // som sparas), inte bara skärmens DOM-text: efter textContent-nödpatchen kan
+    // DOM och state ha gått isär — DOM tom men state med gammal text gav falskt
+    // "tomt", och paste lade då till bredvid → duplicerad description.
+    const hiddenNorm = () => readDraftailText(fieldId).replace(/\s+/g, ' ').trim();
     const waitEmpty = async () => {
       for (let i = 0; i < 20; i++) {
         await new Promise(r => setTimeout(r, 100));
-        const cur = (editable.textContent || '').replace(/\s+/g, ' ').trim();
-        if (!cur) return true;
+        if (!hiddenNorm()) return true;   // state verifierat tom — paste kan inte duplicera
       }
       return false;
     };
@@ -2126,6 +2134,18 @@
         range.selectNodeContents(editable);
         sel.removeAllRanges(); sel.addRange(range);
         document.execCommand('delete');
+        emptied = await waitEmpty();
+      } catch {}
+    }
+    if (!emptied) {
+      // (v7.100.31) fjärde försök: rensa DOM-noderna direkt + beforeinput/input —
+      // vissa Draft.js-builds synkar state från DOM vid input när tangentbords-
+      // vägen inte tog (särskilt efter textContent-patch där DOM/state gått isär).
+      try {
+        editable.focus();
+        while (editable.firstChild) editable.removeChild(editable.firstChild);
+        editable.dispatchEvent(new InputEvent('beforeinput', { inputType: 'deleteContentBackward', bubbles: true, cancelable: true }));
+        editable.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
         emptied = await waitEmpty();
       } catch {}
     }
@@ -2224,6 +2244,39 @@
       }
       return true;
     }
+    // (v7.100.31) paste verifierades inte exakt — om state ändå innehåller text
+    // (t.ex. gammal + ny sammanfogad efter DOM/state-desync) görs ETT rensat
+    // återförsök: töm verifierat (dolt fält tomt) + klistra en gång till, bara
+    // exakt likhet accepteras. Misslyckas det återställs originalet — aldrig en
+    // okontrollerad andra paste ovanpå.
+    const hiddenAfter = hiddenNorm();
+    const wantNorm = String(text).replace(/\s+/g, ' ').trim();
+    if (hiddenAfter && hiddenAfter !== wantNorm) {
+      vlog('Beskrivning: ' + fieldId + ' innehåller oväntad text efter paste (' + hiddenAfter.length +
+        ' tecken) — gör ett rensat återförsök (töm verifierat + klistra igen).', 'err');
+      try {
+        editable.focus();
+        const sel2 = window.getSelection();
+        const range2 = document.createRange();
+        range2.selectNodeContents(editable);
+        sel2.removeAllRanges(); sel2.addRange(range2);
+        editable.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true, cancelable: true }));
+        editable.dispatchEvent(new InputEvent('beforeinput', { inputType: 'deleteContentBackward', bubbles: true, cancelable: true }));
+        editable.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
+        if (!await waitEmpty()) { try { document.execCommand('delete'); } catch {} await waitEmpty(); }
+      } catch {}
+      if (await waitEmpty()) {
+        try {
+          const dtR = new DataTransfer();
+          dtR.setData('text/plain', String(text));
+          editable.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dtR, bubbles: true, cancelable: true }));
+        } catch {}
+        if (await waitLanded()) {
+          vlog('Beskrivning: återförsök lyckades — ' + fieldId + ' är nu exakt den nya texten.', 'ok');
+          return true;
+        }
+      }
+    }
     // (v7.100.17) Paste landade INTE — fältet är verifierat TOMT i React-state just
     // nu, så en sparning skulle radera hela beskrivningen. Återställ
     // originaltexten direkt (React-props först, andra paste som reserv).
@@ -2248,7 +2301,18 @@
   // översättningsvägarna) loggade "Klar" även när skrivningen hade misslyckats
   // tyst — användaren trodde texten var ersatt när den gamla låg kvar.
   const draftailWriteStamp = new Map();
-  async function updateDraftail(fieldId, text, userAction = false) {
+  // (v7.100.31) skrivkö per fält: två parallella skrivningar till samma fält
+  // (dubbelklick på "Skriv om", eller poll + knapptryck samtidigt) kunde
+  // interfoliera tömning/paste i contentEditable-reserven och duplicera texten
+  // — kedja alla skrivningar till samma fält så de körs en i taget.
+  const draftailWriteQueue = new Map();   // fieldId -> Promise
+  function updateDraftail(fieldId, text, userAction = false) {
+    const prev = draftailWriteQueue.get(fieldId) || Promise.resolve();
+    const run = prev.catch(() => {}).then(() => updateDraftailInner(fieldId, text, userAction));
+    draftailWriteQueue.set(fieldId, run.catch(() => {}));
+    return run;
+  }
+  async function updateDraftailInner(fieldId, text, userAction = false) {
     const last = draftailWriteStamp.get(fieldId) || 0;
     if (!userAction && Date.now() - last < 15000) {
       vlog('Beskrivning: skrivning till ' + fieldId + ' spärrad (redan skriven för <15 s sedan) — hoppar över för att undvika duplicering.', 'err');
@@ -8826,9 +8890,16 @@
           vlog('Riktlinje-omskrivning: alla åtgärder är urkryssade — inget anrop skickas.', 'err');
           return;
         }
-        await rewriteGuidelineIssues(btn.dataset.lang, active);
+        // (v7.100.31) try/catch/finally — ett kast utanför funktionens egen
+        // try får inte bli en ohanterad rejection ("krasch") eller låsa knappen.
+        try {
+          await rewriteGuidelineIssues(btn.dataset.lang, active);
+        } catch (e) {
+          vlog('Knapp: oväntat fel — ' + (e && e.message ? e.message : e), 'err');
+        } finally {
         btn.disabled = false;
         btn.textContent = orig;
+        }
       });
     });
     // Checkbox-wire (2026-10-09): toggla GM-state + uppdatera radens stil
@@ -9155,9 +9226,16 @@
         btn.disabled = true;
         const orig = btn.textContent;
         btn.textContent = 'Anropar Mistral…';
-        await rewriteTitleCasing(btn.dataset.lang);
+        // (v7.100.31) try/catch/finally — ett kast utanför funktionens egen
+        // try får inte bli en ohanterad rejection ("krasch") eller låsa knappen.
+        try {
+          await rewriteTitleCasing(btn.dataset.lang);
+        } catch (e) {
+          vlog('Knapp: oväntat fel — ' + (e && e.message ? e.message : e), 'err');
+        } finally {
         btn.disabled = false;
         btn.textContent = orig;
+        }
       });
     });
   }
@@ -9193,9 +9271,16 @@
         btn.disabled = true;
         const orig = btn.textContent;
         btn.textContent = 'Anropar Mistral…';
-        await rewriteTitleRemoveDateTime(btn.dataset.lang);
+        // (v7.100.31) try/catch/finally — ett kast utanför funktionens egen
+        // try får inte bli en ohanterad rejection ("krasch") eller låsa knappen.
+        try {
+          await rewriteTitleRemoveDateTime(btn.dataset.lang);
+        } catch (e) {
+          vlog('Knapp: oväntat fel — ' + (e && e.message ? e.message : e), 'err');
+        } finally {
         btn.disabled = false;
         btn.textContent = orig;
+        }
       });
     });
   }
@@ -9259,9 +9344,16 @@
         btn.disabled = true;
         const orig = btn.textContent;
         btn.textContent = 'Anropar Mistral…';
-        await rewriteTitleShorten(btn.dataset.lang);
+        // (v7.100.31) try/catch/finally — ett kast utanför funktionens egen
+        // try får inte bli en ohanterad rejection ("krasch") eller låsa knappen.
+        try {
+          await rewriteTitleShorten(btn.dataset.lang);
+        } catch (e) {
+          vlog('Knapp: oväntat fel — ' + (e && e.message ? e.message : e), 'err');
+        } finally {
         btn.disabled = false;
         btn.textContent = orig;
+        }
       });
     });
   }
@@ -10299,8 +10391,19 @@
       if (btn.dataset.wired) return;
       btn.dataset.wired = '1';
       btn.addEventListener('click', async () => {
-        btn.disabled = true; btn.textContent = 'Översätter…';
-        await translateDescription(btn.dataset.lang);
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Översätter…';
+        // (v7.100.31) try/finally — kast får inte bli ohanterad rejection; knappen
+        // återställs alltid (tidigare lämnades den i "Översätter…").
+        try {
+          await translateDescription(btn.dataset.lang);
+        } catch (e) {
+          vlog('Översättning: oväntat fel — ' + (e && e.message ? e.message : e), 'err');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = orig;
+        }
       });
     });
   }
@@ -10340,8 +10443,18 @@
       if (btn.dataset.wired) return;
       btn.dataset.wired = '1';
       btn.addEventListener('click', async () => {
-        btn.disabled = true; btn.textContent = 'Översätter…';
-        await translateTitleAndDescription(btn.dataset.lang);
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Översätter…';
+        // (v7.100.31) try/finally — se ovan.
+        try {
+          await translateTitleAndDescription(btn.dataset.lang);
+        } catch (e) {
+          vlog('Översättning: oväntat fel — ' + (e && e.message ? e.message : e), 'err');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = orig;
+        }
       });
     });
   }
@@ -10852,9 +10965,16 @@
         btn.disabled = true;
         const orig = btn.textContent;
         btn.textContent = 'Anropar Mistral…';
-        await rewriteSbrDescriptionShape(btn.dataset.lang);
+        // (v7.100.31) try/catch/finally — ett kast utanför funktionens egen
+        // try får inte bli en ohanterad rejection ("krasch") eller låsa knappen.
+        try {
+          await rewriteSbrDescriptionShape(btn.dataset.lang);
+        } catch (e) {
+          vlog('Knapp: oväntat fel — ' + (e && e.message ? e.message : e), 'err');
+        } finally {
         btn.disabled = false;
         btn.textContent = orig;
+        }
       });
     });
   }
