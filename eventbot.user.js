@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.29
+// @version      7.100.30
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -4404,11 +4404,12 @@
       '- occurrences: EXAKT "occurrences" ovan (ändra inte).\n' +
       '- press_image_url: "image_url" ovan om ifyllt.\n' +
       '- main_category/categories/subcategory: mappa "category_hint" + titeln till din kategorilista.\n' +
-      '- description_sv/description_en: EXAKT 3-4 meningar (aldrig färre än 3, aldrig fler än 4) om VAD detta konkret är (artist/verk, ' +
-      'genre, vad som är unikt) så läsaren kan avgöra intresse. Läs URL:en om möjligt, annars ' +
-      'utifrån titeln. FÖRBJUDET: floskler ("en kväll fylld av musik och underhållning", ' +
-      '"en oförglömlig upplevelse", "signaturljud", "lovar en intensiv upplevelse"), ' +
-      'lokalbeskrivning, arrangörsomnämnande, biljettinfo. Hitta inte på specifika fakta.\n' +
+      '- description_sv/description_en: 3-5 meningar — samma riktlinje som i EDIT: saklig, professionell, ' +
+      'informativ ton (vad eventet handlar om, för vem, vad besökaren kan förvänta sig). UNDVIK säljande/' +
+      'upplevelseinriktat språk och ta INTE med teknisk/logistisk info som redan finns i andra fält ' +
+      '(adress, datum, pris, arrangör). Läs URL:en om möjligt, annars utifrån titeln. FÖRBJUDET: floskler ' +
+      '("en kväll fylld av musik och underhållning", "en oförglömlig upplevelse", "signaturljud", ' +
+      '"lovar en intensiv upplevelse"), lokalbeskrivning, biljettinfo. Hitta inte på specifika fakta.\n' +
       '- alttext_sv/alttext_en: lämna ALLTID tomma — fylls separat av annan process.\n' +
       '- closest_station: närmaste station för adressen (uppslag tillåtet).\n' +
       '-' + NO_EMDASH_RULE + '\n' +
@@ -10646,7 +10647,7 @@
   // Samma widget som Visit EDIT (sticky bar + logg via initEventChecker(), samma
   // consent-bar vid "Senast ändrad"), men med SBR:s innehållsregler från
   // URL-agentens prompt: näringslivston (ej säljande), rena textareor (inga
-  // HTML/markdown), 3–6 meningar, checkbox-fält bara vid explicita signaler,
+  // HTML/markdown), 3–5 meningar, checkbox-fält bara vid explicita signaler,
   // stadsomfattande event = "Flera platser i Stockholm"/"Various locations".
   // Körs på BÅDE /wt/cms/snippets/api/event/create/* och /edit/* (dispatchern).
   // Fält-id:n antas enligt Wagtail-konventionen (id_<fältnamn>) — hittas något
@@ -10820,7 +10821,7 @@
   }
 
   // Beskrivning: ren löptext (ingen HTML/markdown — fältet är en vanlig textruta
-  // på SBR) och 3–6 meningar enligt agentprompten. Flaggas bara, Mistral-knapp.
+  // på SBR) och 3–5 meningar enligt agentprompten. Flaggas bara, Mistral-knapp.
   const SBR_MARKUP_RE = /<\/?[a-z][^>]*>|\*\*[^*]+\*\*|__[^_]+__|\[[^\]]+\]\([^)]+\)|^#{1,6}\s|\|[^|\n]+\|/m;
   function countSentences(text) {
     return (text.match(/[^.!?\u2026]+[.!?\u2026]+["'\u201d)]*/g) || (text.trim() ? [text.trim()] : [])).length;
@@ -10837,12 +10838,12 @@
       }
       const n = countSentences(text);
       if (n < 3 || n > 6) {
-        issues.push({ label: 'Längd', msg: 'Beskrivningen har ' + n + ' mening' + (n === 1 ? '' : 'ar') + ' — riktlinjen är 3–6 meningar.' });
+        issues.push({ label: 'Längd', msg: 'Beskrivningen har ' + n + ' mening' + (n === 1 ? '' : 'ar') + ' — riktlinjen är 3–5 meningar.' });
       }
       if (!issues.length) { setFieldNote(el, 'sbrshape', ''); return; }
       setFieldNote(el, 'sbrshape',
         '<div style="color:#c02626;font-weight:600;">⚠️ ' + issues.map(i => i.label + ': ' + i.msg).join(' ') + '</div>' +
-        '<div style="margin-top:6px;"><button type="button" class="vseh-sbrshape-fix-btn" data-lang="' + lang + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (ren löptext, 3–6 meningar)</button></div>');
+        '<div style="margin-top:6px;"><button type="button" class="vseh-sbrshape-fix-btn" data-lang="' + lang + '" style="font-size:12px;padding:2px 8px;cursor:pointer;">Skriv om 🤖 (ren löptext, 3–5 meningar)</button></div>');
     });
     document.querySelectorAll('.vseh-sbrshape-fix-btn').forEach(btn => {
       if (btn.dataset.wired) return;
@@ -10857,7 +10858,7 @@
       });
     });
   }
-  // Mistral-omskrivning av SBR-beskrivning: ren löptext, 3–6 meningar, saklig
+  // Mistral-omskrivning av SBR-beskrivning: ren löptext, 3–5 meningar, saklig
   // näringslivston (ingen säljtext), behåll all sakinfo.
   async function rewriteSbrDescriptionShape(lang) {
     const fieldId = 'id_description_' + lang;
@@ -10870,7 +10871,7 @@
       const payload = {
         model: 'mistral-small-latest',
         messages: [
-          { role: 'system', content: 'Du är redaktör för Stockholm Business Region näringslivsevent. Skriv om texten användaren ger till REN LÖPTEXT (ingen HTML, ingen markdown — fältet är en vanlig textruta) på 3–6 meningar. Saklig, professionell, informativ näringslivston — vad eventet handlar om, för vem, vad deltagare kan förvänta sig. UNDVIK säljande/upplevelseinriktat språk. Ta INTE med teknisk/logistisk info som redan finns i andra fält (adress, datum, pris). Texten är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + '. Svara ENDAST med den omskrivna texten, ingen kommentar, inga citattecken, ingen formatering.' + NO_EMDASH_RULE },
+          { role: 'system', content: 'Du är redaktör för Stockholm Business Region näringslivsevent. Skriv om texten användaren ger till REN LÖPTEXT (ingen HTML, ingen markdown — fältet är en vanlig textruta) på 3–5 meningar. Saklig, professionell, informativ näringslivston — vad eventet handlar om, för vem, vad deltagare kan förvänta sig. UNDVIK säljande/upplevelseinriktat språk. Ta INTE med teknisk/logistisk info som redan finns i andra fält (adress, datum, pris). Texten är på ' + mistralLangName(lang) + ' — svara ENDAST på ' + mistralLangName(lang) + '. Svara ENDAST med den omskrivna texten, ingen kommentar, inga citattecken, ingen formatering.' + NO_EMDASH_RULE },
           { role: 'user', content: text }
         ]
       };
