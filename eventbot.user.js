@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.25
+// @version      7.100.26
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -8910,6 +8910,29 @@
     });
   }
 
+  // (v7.100.26, på begäran) Musikevent: "with" i rubriken ska vara "feat."
+  // ("Artist X with Artist Y" → "Artist X feat. Artist Y"). UNDANTAG:
+  // "with Friends" (valfri case) lämnas orörd. Deterministisk regex,
+  // ingen AI — körs bara när någon kategori innehåller "Music"
+  // (samma idempotens som stripEmojisFromTitles: när "with" är borta
+  // matchar regexet inte längre).
+  function fixWithToFeatInMusicTitles() {
+    const cats = currentCategoryTitles().map(c => c.toLowerCase());
+    if (!cats.some(c => c.includes('music'))) return;
+    ['id_title_en', 'id_title_sv'].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el || !el.value) return;
+      // \bwith\b som hela ord, men INTE följt av " friends" (valfri case).
+      const old = el.value;
+      const fixed = old.replace(/\bwith\b(?!\s+friends\b)/gi, 'feat.');
+      if (fixed !== old) {
+        simulateInput(el, fixed);
+        showAutoChangeNote(el, '"with" ändrad till "feat." i ' + id.replace('id_title_', 'rubrik ') + ' (musikregel — "with Friends" är undantaget)');
+        vlog('With→feat: ' + id + ': "' + old + '" → "' + fixed + '"', 'ok');
+      }
+    });
+  }
+
   // VERSALRUBRIKER ("IKEA'S NEW EXHIBITION") bryter mot stilguiden — flaggar
   // titlar som (i praktiken) är helt versala och erbjuder en Mistral-
   // omskrivning, samma knapp-mönster som checkGuidelineIssues() (på begäran
@@ -10962,6 +10985,7 @@
     safe('activateAddressGeotag', activateAddressGeotag);
     safe('autoPublishStatus', autoPublishStatus);
     safe('stripEmojisFromTitles', stripEmojisFromTitles);
+    safe('fixWithToFeatInMusicTitles', fixWithToFeatInMusicTitles);   // (v7.100.26)
     safe('stripEmDashesFromFields', stripEmDashesFromFields);
     safe('checkTitleCasing', checkTitleCasing);
     safe('checkDateTimeInTitle', checkDateTimeInTitle);
