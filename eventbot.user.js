@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.36
+// @version      7.100.37
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1934,6 +1934,8 @@
   }
 
   function getDraftProps(root) {
+    if (!root) return null;
+    if (root.__vsehDraftProps) return root.__vsehDraftProps;   // (v7.100.37) cachad positiv träff
     // (v7.100.19) Bred sökning efter props med onChange + editorState:
     // 1) fiber-vandring uppåt (båda nyckelnamnen, 60 hopp),
     // 2) __reactProps$ på root,
@@ -1945,17 +1947,23 @@
     // props alls och varje skrivning föll till contentEditable-reserven där
     // skärmen inte alltid uppdaterades.
     const isState = (v) => v && typeof v.getCurrentContent === 'function';
+    // (v7.100.37) onChange hittas även via valfritt prop-nyckel innehållande
+    // "change"; returerar alltid en normaliserad KOPIA {onChange, editorState}
+    // (rör aldrig Reacts eget props-objekt).
     const okProps = (mp) => {
-      if (!mp || typeof mp.onChange !== 'function') return null;
+      if (!mp) return null;
+      const onChange = typeof mp.onChange === 'function' ? mp.onChange
+        : Object.entries(mp).find(([k, v]) => /change/i.test(k) && typeof v === 'function')?.[1];
+      if (!onChange) return null;
       const editorState = mp.editorState || Object.values(mp).find(isState);
       if (!editorState) return null;
-      return mp.editorState ? mp : Object.assign({}, mp, { editorState });
+      return { onChange, editorState };
     };
     // (v7.100.21) starta fiber-vandringen fran root OCH upp till 6 foraldrar —
     // ibland sitter fiber-nyckeln inte på själva .DraftEditor-root utan på en
     // foralder (portal/container).
     const startNodes = [];
-    for (let p = root, i = 0; p && i < 6; i++) { startNodes.push(p); p = p.parentElement; }
+    for (let p = root, i = 0; p && i < 40; i++) { startNodes.push(p); p = p.parentElement; }   // (v7.100.37) alla föräldrar
     for (const sn of startNodes) {
       const instKey = Object.keys(sn).find((k) =>
         k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")
@@ -1963,9 +1971,9 @@
       if (!instKey) continue;
       let node = sn[instKey];
       let hops = 0;
-      while (node && hops < 60) {
+      while (node && hops < 120) {   // (v7.100.37)
         const hit = node.memoizedProps && okProps(node.memoizedProps);
-        if (hit) return hit;
+        if (hit) { root.__vsehDraftProps = hit; return hit; }   // (v7.100.37) cacha
         node = node.return || node._debugOwner || null;
         hops++;
       }
@@ -1975,17 +1983,38 @@
       for (const k of Object.keys(el)) {
         if (!k.startsWith('__reactProps$')) continue;
         const hit = okProps(el[k]);
-        if (hit) return hit;
+        if (hit) { root.__vsehDraftProps = hit; return hit; }   // (v7.100.37) cacha
       }
       return null;
     };
     let hit = scan(root);
     if (hit) return hit;
+    for (const sn of startNodes) { hit = scan(sn); if (hit) return hit; }   // (v7.100.37) även föräldrarna själva
     const wrapEl = root.closest('.w-field, .w-panel, [data-field]') || root.parentElement || root;
     for (const el of wrapEl.querySelectorAll('*')) { hit = scan(el); if (hit) return hit; }
     const form = root.closest('form');
     if (form && form !== wrapEl) {
       for (const el of form.querySelectorAll('*')) { hit = scan(el); if (hit) return hit; }
+    }
+    // (v7.100.37) React-root NEDÅT: __reactContainer$ på någon förälder (t.ex. body
+    // när editorn renderas i en portal utanför formuläret) → DFS över hela
+    // fiber-trädet (cap 8000 noder) tills okProps träffar.
+    for (const sn of startNodes) {
+      const contKey = Object.keys(sn).find((k) => k.startsWith('__reactContainer$'));
+      if (!contKey) continue;
+      const fiberRoot = sn[contKey];
+      const hostRoot = fiberRoot && (fiberRoot.current || (fiberRoot._reactRootContainer && fiberRoot._reactRootContainer._internalRoot && fiberRoot._reactRootContainer._internalRoot.current));
+      if (!hostRoot) continue;
+      let n = 0;
+      const stack = [hostRoot];
+      while (stack.length && n < 8000) {
+        const f = stack.pop();
+        n++;
+        const p = f.memoizedProps && okProps(f.memoizedProps);
+        if (p) { root.__vsehDraftProps = p; return p; }
+        if (f.child) stack.push(f.child);
+        if (f.sibling) stack.push(f.sibling);
+      }
     }
     return null;
   }
@@ -2245,6 +2274,16 @@
         const shownNow = (editable.textContent || '').replace(/\s+/g, ' ').trim();
         if (wantS && shownNow !== wantS) {
           editable.textContent = String(text);
+          // (v7.100.37) caret sist i fältet efter patchen — annars kändes fältet
+          // "låst" när användaren skulle fortsätta skriva efter auto-ändringen.
+          try {
+            const cr = document.createRange();
+            cr.selectNodeContents(editable);
+            cr.collapse(false);
+            const cs = window.getSelection();
+            cs.removeAllRanges();
+            cs.addRange(cr);
+          } catch {}
           vlog('Beskrivning: ' + fieldId + ' — dolda fältet rätt men skärmen patchades visuellt (textContent); sparning påverkas inte.', 'err');
         }
       }
@@ -2401,6 +2440,15 @@
           const shownNow = ((edNow && edNow.textContent) || '').replace(/\s+/g, ' ').trim();
           if (want && shownNow !== want && edNow) {
             edNow.textContent = String(text);
+            // (v7.100.37) caret sist — se kommentar i reservvägen ovan.
+            try {
+              const cr2 = document.createRange();
+              cr2.selectNodeContents(edNow);
+              cr2.collapse(false);
+              const cs2 = window.getSelection();
+              cs2.removeAllRanges();
+              cs2.addRange(cr2);
+            } catch {}
             vlog('Beskrivning: ' + fieldId + ' — dolda fältet rätt men skärmen patchades visuellt (textContent); sparning påverkas inte.', 'err');
           }
         }
