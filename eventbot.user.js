@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.33
+// @version      7.100.34
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -8266,6 +8266,29 @@
   const DATE_IN_TEXT_RE = new RegExp(
     '\\b\\d{1,2}(\\s*[-–]\\s*\\d{1,2})?\\s+(' + MONTH_NAMES_RE + ')\\b|' +
     '\\b(' + MONTH_NAMES_RE + ')\\s+\\d{1,2}(\\s*[-–]\\s*\\d{1,2})?\\b', 'i');
+  // (v7.100.34) Numeriska datum i löptext ("26/11", "2026-11-26") — samma princip
+  // som DATE_IN_TEXT_RE ovan. Andra siffran måste vara 01–12 (månad) så att priser
+  // som "16.50" inte träffas; bindestreck tillåts bara i ISO-format (årtal-först) så
+  // att tidsintervall som "16 - 20" inte räknas som datum.
+  const NUMERIC_DATE_IN_TEXT_RE = /\b\d{1,2}[./](?:0?[1-9]|1[0-2])(?:[./]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b/g;
+  // (v7.100.34) Vernissage-undantag: datum/tider som hör till vernissage/opening/
+  // invigning/premiär (sv + en) är TILLÅTNA i beskrivningen och ska INTE flaggas
+  // (på begäran). "Utställningen pågår: 26/11 - 23/12" är däremot vanlig datuminfo
+  // och flaggas som datumintervall.
+  const VERNISSAGE_CONTEXT_RE = /vernissag|opening|invigning|öppning|premi[äe]r|preview|private\s+view/i;
+  function dateHitIsVernissageContext(text, start) {
+    const before = text.slice(Math.max(0, start - 40), start);
+    return VERNISSAGE_CONTEXT_RE.test(before);
+  }
+  // Alla tids-/datumträffar i texten UTOM vernissage-undantagna.
+  function flaggableTimeRanges(text) {
+    return findAllRanges(text, TIME_IN_TEXT_RE).filter(([s]) => !dateHitIsVernissageContext(text, s));
+  }
+  function flaggableDateRanges(text) {
+    return findAllRanges(text, DATE_IN_TEXT_RE).concat(findAllRanges(text, NUMERIC_DATE_IN_TEXT_RE))
+      .filter(([s]) => !dateHitIsVernissageContext(text, s))
+      .sort((a, b) => a[0] - b[0]);
+  }
   // Länkar skrivna rakt in i löptexten ("Boka på www.example.com" /
   // "https://...") — länkar ska fyllas i i External website url-fältet,
   // inte i beskrivningen (samma princip som pris/tid/datum ovan).
@@ -8320,8 +8343,8 @@
   // är raden som faktiskt skickas till Mistral som redigeringsinstruktion.
   const GUIDELINE_FIXES = {
     'Prisinfo': { frag: 'tar bort prisuppgifter', instruction: 'Ta bort alla prisuppgifter/kronbelopp.' },
-    'Tidsinfo i fält': { frag: 'tar bort klockslag', instruction: 'Ta bort klockslag/tidsangivelser (tiden fylls redan i i datumfälten).' },
-    'Datuminfo i fält': { frag: 'tar bort datumangivelser', instruction: 'Ta bort datumangivelser (datumet fylls redan i i datumfälten).' },
+    'Tidsinfo i fält': { frag: 'tar bort klockslag', instruction: 'Ta bort klockslag/tidsangivelser (tiden fylls redan i i datumfälten). UNDANTAG: behåll tider som hör till vernissage/opening/invigning/premiär (t.ex. "Vernissage: torsdag 26/11 kl 16–20") — de är tillåtna i texten.' },
+    'Datuminfo i fält': { frag: 'tar bort datumangivelser', instruction: 'Ta bort datumangivelser (datumet fylls redan i i datumfälten) — även utställningsperioder som "Utställningen pågår: 26/11–23/12". UNDANTAG: behåll datum/tider som direkt hör till vernissage/opening/invigning/premiär — de är tillåtna i texten.' },
     'Platsinfo i fält': { frag: 'tar bort upprepat platsnamn', instruction: 'Ta bort upprepning av platsnamnet/venue (det fylls redan i i ett eget fält).' },
     'Adressinfo i fält': { frag: 'tar bort upprepad adress', instruction: 'Ta bort upprepning av adressen (den fylls redan i i ett eget fält).' },
     'Länk i fält': { frag: 'tar bort länkar/webbadresser', instruction: 'Ta bort webbadresser/länkar ur texten (länkar fylls redan i i länkfältet).' },
@@ -8389,8 +8412,8 @@
   function guidelineIssueRanges(text, label, venueNames, addressRaw) {
     switch (label) {
       case 'Prisinfo': return findAllRanges(text, PRICE_WORD_RE);
-      case 'Tidsinfo i fält': return findAllRanges(text, TIME_IN_TEXT_RE);
-      case 'Datuminfo i fält': return findAllRanges(text, DATE_IN_TEXT_RE);
+      case 'Tidsinfo i fält': return flaggableTimeRanges(text);   // (v7.100.34) vernissage-undantag
+      case 'Datuminfo i fält': return flaggableDateRanges(text);   // (v7.100.34) inkl. sifferdatum, vernissage-undantag
       case 'Platsinfo i fält': {
         const v = (venueNames || []).find(v => new RegExp(wordBoundaryPattern(v), 'i').test(text));
         return v ? findAllRanges(text, new RegExp(wordBoundaryPattern(v), 'i')) : [];
@@ -8767,12 +8790,17 @@
       if (priceHits && priceHits.length) {
         fieldIssues.push({ label: 'Prisinfo', msg: 'Möjlig prisuppgift (' + [...new Set(priceHits.map(h => h.toLowerCase()))].join(', ') + ') — hänvisa till arrangörens sida istället.' });
       }
-      if (TIME_IN_TEXT_RE.test(text)) {
-        fieldIssues.push({ label: 'Tidsinfo i fält', msg: 'Möjlig tidsangivelse i texten — tid ska fyllas i i datumfälten, inte skrivas i beskrivningen.' });
+      // (v7.100.34) Vernissage-undantag: tider/datum inom 40 tecken efter
+      // vernissage/opening/invigning/premiär (sv+en) räknas INTE som fel.
+      const timeHits = flaggableTimeRanges(text);
+      if (timeHits.length) {
+        const shown = [...new Set(timeHits.map(([s, e]) => text.slice(s, e).trim().toLowerCase()))].slice(0, 3).join(', ');
+        fieldIssues.push({ label: 'Tidsinfo i fält', msg: 'Möjlig tidsangivelse i texten (' + shown + ') — tid ska fyllas i i datumfälten, inte skrivas i beskrivningen (undantag: vernissage/opening).' });
       }
-      const dateHit = text.match(DATE_IN_TEXT_RE);
-      if (dateHit) {
-        fieldIssues.push({ label: 'Datuminfo i fält', msg: 'Möjlig datumangivelse i texten ("' + dateHit[0].trim() + '") — datum ska fyllas i i datumfälten, inte skrivas i beskrivningen.' });
+      const dateRanges = flaggableDateRanges(text);
+      if (dateRanges.length) {
+        const shown = [...new Set(dateRanges.map(([s, e]) => text.slice(s, e).trim()))].slice(0, 3).join(', ');
+        fieldIssues.push({ label: 'Datuminfo i fält', msg: 'Möjlig datumangivelse i texten ("' + shown + '") — datum ska fyllas i i datumfälten, inte skrivas i beskrivningen (undantag: vernissage/opening).' });
       }
       const venueHit = venueNames.find(v => new RegExp(wordBoundaryPattern(v), 'i').test(text));
       if (venueHit) {
@@ -9097,6 +9125,57 @@
         simulateInput(el, stripped);
         showAutoChangeNote(el, 'Emojis borttagna ur ' + id.replace('id_title_', 'rubrik '));
       }
+    });
+  }
+
+  // (v7.100.34) Instagram-handtag (@handle) i beskrivningen görs om till en fet
+  // markdown-hyperlänk inom paranteser:
+  //   "Insta: @christianwigardt"  →  "(Instagram: [**@christianwigardt**](https://www.instagram.com/christianwigardt))"
+  // Idempotent: handtag som redan ligger i en sådan länk ([**@...], @ direkt efter
+  // "**") rörs inte; mejladresser (foo@bar.se) träffas inte heller (lookbehind).
+  // Körs på description_en/sv (Visit Draftail + SBR textarea via updateDraftail).
+  const INSTA_HANDLE_RE = /(?<![\w.%+-])(?<!\*\*)@([A-Za-z0-9._]{2,30})\b/g;
+  const INSTA_PREFIX_RE = /\b(?:insta(?:gram)?|ig)\s*[:\-–—]?\s*$/i;
+  function transformInstagramHandles(text) {
+    let out = '', last = 0, changed = false, m;
+    const re = new RegExp(INSTA_HANDLE_RE.source, 'gi');
+    while ((m = re.exec(text))) {
+      const handle = m[1];
+      const before = text.slice(Math.max(0, m.index - 60), m.index);
+      if (/\(Instagram:\s*\[\*\*$/i.test(before)) continue;   // redan länkad
+      if (/instagram\.com\/$/i.test(before)) continue;           // redan i en URL
+      let start = m.index;
+      const pm = text.slice(Math.max(0, start - 12), start).match(INSTA_PREFIX_RE);
+      if (pm) start -= pm[0].length;                             // ät ev. "Insta:"-prefix
+      out += text.slice(last, start);
+      out += '(Instagram: [**@' + handle + '**](https://www.instagram.com/' + handle + '))';
+      last = m.index + m[0].length;
+      changed = true;
+    }
+    if (!changed) return text;
+    out += text.slice(last);
+    return out;
+  }
+  const instaLastText = new Map();   // fieldId -> senast sedd text (undvik omskrivningsloopar)
+  function linkifyInstagramHandles() {
+    ['id_description_en', 'id_description_sv'].forEach(id => {
+      const text = readFieldText(id);
+      if (!text) return;
+      if (instaLastText.get(id) === text) return;
+      instaLastText.set(id, text);
+      if (!new RegExp(INSTA_HANDLE_RE.source, 'gi').test(text)) return;
+      const fixed = transformInstagramHandles(text);
+      if (fixed === text) return;   // bara redan-länkade/mejl-träffar — inget att göra
+      vlog('Instagram: gör om @handle till länk i ' + id + ' → (Instagram: [**@…**](https://www.instagram.com/…))');
+      updateDraftail(id, fixed).then(ok => {
+        if (ok) {
+          instaLastText.set(id, fixed);
+          showAutoChangeNote(document.getElementById(id), 'Instagram-handle gjord till fet länk i ' + id.replace('id_description_', 'beskrivning ') + ': (Instagram: [**@…**](…))');
+          vlog('Instagram: länk skriven i ' + id + '.', 'ok');
+        } else {
+          vlog('Instagram: kunde INTE skriva länken till ' + id + ' automatiskt — gör om manuellt.', 'err');
+        }
+      }).catch(() => {});
     });
   }
 
@@ -10689,13 +10768,40 @@
   const TICKET_VENDOR_DOMAINS = ['ticketmaster.se', 'axs.com', 'eventim.se', 'tickster.com',
     'kulturbiljetter.se', 'billetto.se', 'tixly.com', 'kulturcentralen.nu', 'showtic.se', 'wannado.se',
     'ticketco.se', 'eventix.io', 'stockholmlive.se', 'gotevent.se'];
+  // (v7.100.34) Facebook-domäner: när länken (External website url) pekar mot
+  // Facebook ska länktexten bli "Mer info / More information (Facebook)" — skrivs
+  // om varje poll-tick så länge länken är en Facebook-länk (EDIT + NEW), även över
+  // befintlig text. När länken inte längre är Facebook återställs vår text så den
+  // generella ifyllnaden (Biljetter/Mer information) kan ta över igen.
+  const FACEBOOK_HOST_RE = /(^|\.)(facebook\.com|fb\.com|fb\.me)$/i;
+  const FB_LINK_TEXT = 'Mer info / More information (Facebook)';
+  function urlHostOf(rawUrl) {
+    try { return new URL(rawUrl).hostname.toLowerCase(); }
+    catch { try { return new URL('https://' + rawUrl).hostname.toLowerCase(); } catch { return ''; } }
+  }
   let linkTextAutofilled = false;
   function autofillLinkText() {
-    if (linkTextAutofilled) return;
     const urlEl = document.getElementById('id_external_website_url');
     const textEl = document.getElementById('id_external_website_url_text');
-    if (!urlEl || !textEl || textEl.value.trim() || !urlEl.value.trim()) return;
+    if (!urlEl || !textEl || !urlEl.value.trim()) return;
     const url = urlEl.value.toLowerCase();
+    const host = urlHostOf(urlEl.value);
+    if (FACEBOOK_HOST_RE.test(host)) {
+      if ((textEl.value || '').trim() !== FB_LINK_TEXT) {
+        simulateInput(textEl, FB_LINK_TEXT);
+        showAutoChangeNote(textEl, 'Länktext satt till "' + FB_LINK_TEXT + '" — länken pekar mot ' + host + '.');
+        vlog('EventEdit: länken pekar mot ' + host + ' — länktext satt till "' + FB_LINK_TEXT + '".', 'ok');
+      }
+      linkTextAutofilled = true;   // generella ifyllnaden ska inte köra över denna
+      return;
+    }
+    if ((textEl.value || '').trim() === FB_LINK_TEXT) {
+      simulateInput(textEl, '');
+      linkTextAutofilled = false;
+      vlog('EventEdit: länken pekar inte längre mot Facebook — återställde länktexten "' + FB_LINK_TEXT + '".', 'ok');
+    }
+    if (linkTextAutofilled) return;
+    if (textEl.value.trim()) return;   // rör aldrig text användaren redan skrivit
     linkTextAutofilled = true;
     // (v7.100.11) SBR-prompten: länktext = "Mer info / More information" eller
     // arrangörens namn — näringslivsevent har inga biljettleverantörer, så
@@ -11312,6 +11418,7 @@
     safe('checkBrokenImageOnPage', checkBrokenImageOnPage);   // (2026-10-26, v7.100.10) varning vid bruten bildfil
     safe('checkCmsExportStatus', checkCmsExportStatus);   // (v7.100.16) CMS-export-popup vid besökssiffror
     safe('checkBiggestEventsAttendeesGate', checkBiggestEventsAttendeesGate);   // (v7.100.33) spara-spärr utan besäkarantal i biggest-events-guiden
+    safe('linkifyInstagramHandles', linkifyInstagramHandles);   // (v7.100.34) @handle → (Instagram: [**@x**](https://www.instagram.com/x)) i description
   }
 
   // ---- Samma automatik även på MAIN:s create-sida (på uttrycklig begäran,
@@ -11356,6 +11463,7 @@
     checkDateTimeInTitle();
     checkCmsExportStatus().catch(e => vlog('CMS-export-check kastade: ' + (e && e.message ? e.message : e), 'err'));   // (v7.100.16, async från v7.100.18)
     try { checkBiggestEventsAttendeesGate(); } catch (e) { vlog('Biggest-gate kastade: ' + (e && e.message ? e.message : e), 'err'); }   // (v7.100.33)
+    try { autofillLinkText(); } catch (e) { vlog('Länktext-autofill kastade: ' + (e && e.message ? e.message : e), 'err'); }   // (v7.100.34) Facebook-länktext även på NEW
   }
   let mainAlwaysOnChecksStarted = false;
   function startMainAlwaysOnChecks() {
