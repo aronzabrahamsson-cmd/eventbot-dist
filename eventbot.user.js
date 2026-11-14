@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.32
+// @version      7.100.33
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -10606,6 +10606,77 @@
     }, true);
   }
 
+  // (v7.100.33) "Biggest events"-spärr: om eventet är taggat i guide-paret
+  // "The biggest Stockholm events"/"De största evenemangen i Stockholm" (GUIDE_TAG_ROWS-
+  // raderna für Festivals/Music) ska spara-rutan vara EJ klickbar tills besökarantalet
+  // (id_expected_attendees, eller fält med label besök/attendees/visitors) är ifyllt.
+  // Gäller bara Visit (SBR har inget related_guides). Körs varje poll-tick från
+  // runEditPageChecks() och från create-sidans always-on-poll.
+  const BIGGEST_EVENTS_GUIDE_RE = /biggest stockholm events|största evenemangen i stockholm/i;
+  let biggestGateActive = false;
+  let biggestGateNote = null;
+  function biggestEventsGuideTagged() {
+    try { return currentRelatedGuideTitles().some(t => BIGGEST_EVENTS_GUIDE_RE.test(String(t || ''))); }
+    catch { return false; }
+  }
+  function installBiggestGateSubmitGuard() {
+    const form = document.querySelector('form');
+    if (!form || form.dataset.biggestGuardInstalled) return;
+    form.dataset.biggestGuardInstalled = '1';
+    form.addEventListener('submit', e => {
+      if (!biggestGateActive) return;
+      e.preventDefault();
+      e.stopPropagation();
+      vlog('EventEdit: Sparande blockerat — eventet är taggat i "De största evenemangen i Stockholm" men besäkarantal saknas.', 'err');
+    }, true);
+  }
+  function setBiggestGate(block) {
+    installBiggestGateSubmitGuard();
+    if (block === biggestGateActive) return;
+    biggestGateActive = block;
+    // Bara knappar VI spärrar markeras (dataset) och bara de släpps igen —
+    // knappar som redan var disabled innan (t.ex. Wagtail vid pågående sparning)
+    // lämnas alltid som de var.
+    document.querySelectorAll('button[type="submit"], button.action-save, button.action-publish').forEach(b => {
+      if (block) {
+        if (b.dataset.vsehBiggestDisabled) return;
+        b.dataset.vsehBiggestDisabled = '1';
+        b.dataset.vsehBiggestWasDisabled = b.disabled ? '1' : '';
+        b.disabled = true;
+        b.style.opacity = '0.45';
+        b.style.cursor = 'not-allowed';
+      } else {
+        if (!b.dataset.vsehBiggestDisabled) return;
+        if (!b.dataset.vsehBiggestWasDisabled) { b.disabled = false; b.style.opacity = ''; b.style.cursor = ''; }
+        delete b.dataset.vsehBiggestDisabled;
+        delete b.dataset.vsehBiggestWasDisabled;
+      }
+    });
+    if (block) {
+      vlog('EventEdit: "Biggest events"-spärr AKTIV — spara-knapparna är ej klickbara tills besäkarantalet är ifyllt.', 'err');
+    } else {
+      vlog('EventEdit: "Biggest events"-spärr släppt — besäkarantal ifyllt eller guiden borttagen.', 'ok');
+    }
+  }
+  function checkBiggestEventsAttendeesGate() {
+    if (location.hostname === 'www.stockholmbusinessregion.se') return;   // SBR har inga guider
+    installBiggestGateSubmitGuard();
+    const attendeesEl = sbrFindField(['id_expected_attendees'], /besök|besok|attendee|visitor/i);
+    const tagged = biggestEventsGuideTagged();
+    const filled = !!(attendeesEl && (attendeesEl.value || '').trim());
+    const block = tagged && !!attendeesEl && !filled;
+    setBiggestGate(block);
+    if (!attendeesEl) return;
+    const noteHtml = block
+      ? '<div style="color:#c02626;font-weight:600;">\ud83d\udeab Spara är spärrad tills <b>besækarantal</b> är ifyllt — eventet är taggat i guiden "De största evenemangen i Stockholm" / "The biggest Stockholm events".</div>'
+      : '';
+    const key = block ? 'block:' + (attendeesEl.id || 'label') : 'clear';
+    if (key !== biggestGateNote) {
+      biggestGateNote = key;
+      setFieldNote(attendeesEl, 'biggestgate', noteHtml);
+    }
+  }
+
   // Fyller bara i om fältet är tomt (rör aldrig text du redan skrivit).
   // "Biljetter / Tickets" om länken går till en känd biljettleverantör ELLER
   // kategorin är Stage & Film — annars "Mer information / More information"
@@ -11043,6 +11114,7 @@
     const startAutomation = () => {
       initEventChecker();
       installResaleSubmitGuard();
+      installBiggestGateSubmitGuard();
       loadManuallyRemovedGuides();
       runEditPageChecks();
       runSbrEditPageChecks();
@@ -11239,6 +11311,7 @@
     safe('runGuideTagRules', () => runGuideTagRules().catch(() => {}));
     safe('checkBrokenImageOnPage', checkBrokenImageOnPage);   // (2026-10-26, v7.100.10) varning vid bruten bildfil
     safe('checkCmsExportStatus', checkCmsExportStatus);   // (v7.100.16) CMS-export-popup vid besökssiffror
+    safe('checkBiggestEventsAttendeesGate', checkBiggestEventsAttendeesGate);   // (v7.100.33) spara-spärr utan besäkarantal i biggest-events-guiden
   }
 
   // ---- Samma automatik även på MAIN:s create-sida (på uttrycklig begäran,
@@ -11258,6 +11331,7 @@
     if (mainEditStyleChecksStarted) { runEditPageChecks(); return; }
     mainEditStyleChecksStarted = true;
     installResaleSubmitGuard();
+    installBiggestGateSubmitGuard();
     loadManuallyRemovedGuides();
     runEditPageChecks();
     setInterval(runEditPageChecks, 1500);
@@ -11281,6 +11355,7 @@
     checkTitleCasing();
     checkDateTimeInTitle();
     checkCmsExportStatus().catch(e => vlog('CMS-export-check kastade: ' + (e && e.message ? e.message : e), 'err'));   // (v7.100.16, async från v7.100.18)
+    try { checkBiggestEventsAttendeesGate(); } catch (e) { vlog('Biggest-gate kastade: ' + (e && e.message ? e.message : e), 'err'); }   // (v7.100.33)
   }
   let mainAlwaysOnChecksStarted = false;
   function startMainAlwaysOnChecks() {
@@ -11348,6 +11423,7 @@
     const startAutomation = () => {
       initEventChecker();
       installResaleSubmitGuard();
+      installBiggestGateSubmitGuard();
       loadManuallyRemovedGuides();
       runEditPageChecks();
       installVenueAddButton();
