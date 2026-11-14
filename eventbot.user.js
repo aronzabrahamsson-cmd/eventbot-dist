@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.35
+// @version      7.100.36
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -9156,6 +9156,68 @@
     out += text.slice(last);
     return out;
   }
+  // (v7.100.36) "Festival"-kategorin överanvänds: om main_category ELLER någon
+  // category innehåller "festival" men ordet inte nämns i NÅGON av beskrivnings-
+  // texterna (en/sv) visas en varningsflagga bredvid respektive kategorifält.
+  function checkFestivalCategoryMention() {
+    const mainEl = document.getElementById('id_main_category');
+    const catsEl = document.getElementById('id_categories');
+    if (!mainEl && !catsEl) return;
+    let mainTitle = '', catTitles = [];
+    try { mainTitle = JSON.parse(document.querySelector('input[name="main_category"]')?.value || 'null')?.title || ''; } catch {}
+    try { const c = JSON.parse(document.querySelector('input[name="categories"]')?.value || 'null'); catTitles = Array.isArray(c) ? c.map(x => x && x.title).filter(Boolean) : []; } catch {}
+    const mainIsFestival = /festival/i.test(mainTitle);
+    const catIsFestival = catTitles.some(t => /festival/i.test(t));
+    if (!mainIsFestival && !catIsFestival) {
+      if (mainEl) setFieldNote(mainEl, 'festivalwarn', '');
+      if (catsEl) setFieldNote(catsEl, 'festivalwarn', '');
+      return;
+    }
+    const descEn = readFieldText('id_description_en');
+    const descSv = readFieldText('id_description_sv');
+    const mentioned = /festival/i.test(descEn || '') || /festival/i.test(descSv || '');
+    const html = mentioned ? '' :
+      '<div style="color:#b45309;font-weight:600;">⚠️ Kategorin innehåller "Festival" men ordet "festival" nämns INTE i beskrivningstexten — kontrollera att kategorin verkligen passar (Festival överanvänds).</div>';
+    if (mainEl) setFieldNote(mainEl, 'festivalwarn', mainIsFestival ? html : '');
+    if (catsEl) setFieldNote(catsEl, 'festivalwarn', catIsFestival ? html : '');
+  }
+
+  // (v7.100.36) Autorättning i descriptionsfälten (EDIT): punktkulan "• " tas bort
+  // och VERSAL-ord (hela ord i stora bokstäver, ≥2 tecken) skrivs om till normal
+  // versalstart: "• FACTORY TOUR ..." → "Factory tour ...". Förkortningar i
+  // versaler (SEK, EUR, VIP, WC …) lämnas orörda; blandade ord (iOS, McDonald) rörs inte.
+  const CAPS_WHITELIST = new Set(['SEK','EUR','USD','GBP','CHF','NOK','DKK','VIP','WC','TV','DJ','CD','LP','EP','HR','IT','AI','PR','ID','FAQ','SMS','MMS','PDF','GPS','SAS','SJ','SL','ATM','PIN','SIM','USB','DNA','IQ']);
+  const CAPS_WORD_RE = /(?<![A-Za-z0-9\u00C0-\u00FF])[A-Z\u00C0-\u00D6\u00D8-\u00DE]{2,}(?![A-Za-z0-9])/g;
+  function fixCapsAndBullets(text) {
+    let t = text;
+    if (t.includes('•')) {
+      t = t.replace(/[ \t]*•[ \t]*/g, ' ').replace(/ {2,}/g, ' ').replace(/^ +/, '').replace(/ +$/, '');
+    }
+    t = t.replace(CAPS_WORD_RE, w => CAPS_WHITELIST.has(w) ? w : w.charAt(0) + w.slice(1).toLowerCase());
+    return t;
+  }
+  const capsLastText = new Map();   // fieldId -> senast sedd text (undvik loopar)
+  function fixCapsAndBulletsInDescriptions() {
+    ['id_description_en', 'id_description_sv'].forEach(id => {
+      const text = readFieldText(id);
+      if (!text) return;
+      if (capsLastText.get(id) === text) return;
+      capsLastText.set(id, text);
+      const fixed = fixCapsAndBullets(text);
+      if (fixed === text) return;
+      vlog('Versaler/punktkulor: rättar ' + id + ' (• och VERSALER bort, förkortningar behållna).');
+      updateDraftail(id, fixed).then(ok => {
+        if (ok) {
+          capsLastText.set(id, fixed);
+          showAutoChangeNote(document.getElementById(id), 'VERSALER och punktkulor (•) borttagna i ' + id.replace('id_description_', 'beskrivning ') + ' (förkortningar som SEK/VIP behållna)');
+          vlog('Versaler/punktkulor: rättade ' + id + '.', 'ok');
+        } else {
+          vlog('Versaler/punktkulor: kunde INTE skriva till ' + id + ' automatiskt — rätta manuellt.', 'err');
+        }
+      }).catch(() => {});
+    });
+  }
+
   const instaLastText = new Map();   // fieldId -> senast sedd text (undvik omskrivningsloopar)
   function linkifyInstagramHandles() {
     ['id_description_en', 'id_description_sv'].forEach(id => {
@@ -11419,6 +11481,8 @@
     safe('checkCmsExportStatus', checkCmsExportStatus);   // (v7.100.16) CMS-export-popup vid besökssiffror
     safe('checkBiggestEventsAttendeesGate', checkBiggestEventsAttendeesGate);   // (v7.100.33) spara-spärr utan besäkarantal i biggest-events-guiden
     safe('linkifyInstagramHandles', linkifyInstagramHandles);   // (v7.100.34) @handle → (Instagram: [**@x**](https://www.instagram.com/x)) i description
+    safe('checkFestivalCategoryMention', checkFestivalCategoryMention);   // (v7.100.36) varning om Festival-kategori utan "festival" i texten
+    safe('fixCapsAndBulletsInDescriptions', fixCapsAndBulletsInDescriptions);   // (v7.100.36) VERSALER + • bort i description (EDIT)
   }
 
   // ---- Samma automatik även på MAIN:s create-sida (på uttrycklig begäran,
