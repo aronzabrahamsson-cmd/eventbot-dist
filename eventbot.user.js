@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EventBot
 // @namespace    visitstockholm.eventtools
-// @version      7.100.37
+// @version      7.100.38
 // @description  v7.54.0: Ny källa — Nortic. Ingen dokumenterad publik API hittades, men avläsning av nortic.se/stad/stockholms egna Nuxt-SSR-svar avslöjade den exakta anrops-URL:en (services.nortic.se/public/v1/events?city=Stockholm...) som sidan själv använder; bekräftat med 320 Stockholmsevent över 16 sidor. Ingen nyckel behövs — nytt "Nortic"-hämtningsläge i fliken Kalendrar, samma mönster som Ticketmaster/Billetto/Tickster. v7.53.10: Billetto-hämtningen byter datakälla till samma Algolia-sökindex som billetto.se:s egen sajt använder, istället för det publisher/annonsbegränsade v3/public/events-API:et (bekräftat: gav t.ex. hela 540+ Stockholmsevent inom 25 km mot tidigare ~140, och inkluderar nu "Grand Antiques Art & Design" som tidigare API:et aldrig kunde returnera). Kräver ingen egen API-nyckel längre — Billetto-fälten i Inställningar är borttagna. Fix Billetto-dubbletter från v7.53.8/9 (venue_name-kollisioner) kvarstår som skyddsnät. Käll-filterchipsen i "Ej inlagda" visar antal event per källa och inverterade färger på vald källa. Rättstavning "Dubblettkoll"/"Dubblett" (2 b). Draftvy-dubblettkoll med badges och jämförelsevy. Rewrite-agent (EventChecker) på edit-sidor. All funktion från v0.7.51 bevarad.
 // @match        https://www.visitstockholm.com/cms/api/event/create/*
 // @match        https://www.visitstockholm.se/cms/api/event/create/*
@@ -1930,12 +1930,51 @@
         root = findRoot();
       }
     }
+    if (root && !root.__vsehHydrationWaited) {
+      root.__vsehHydrationWaited = true;
+      // (v7.100.38) Legacy React 16 (/cms/api/event/edit/*): vid document-idle
+      // kan .DraftEditor-root ännu sakna ALLA __react*-nycklar — hydreringen
+      // kommer senare. getDraftProps skulle då missa allt och skriva via
+      // contentEditable-reserven. Vänta upp till 15 s (100 ms-intervall) tills
+      // nycklarna dyker upp innan vi går vidare.
+      const hasReactKeys = () => {
+        for (let p = root, i = 0; p && i < 40; i++) {
+          if (Object.keys(p).some(k => k.startsWith('__react'))) return true;
+          p = p.parentElement;
+        }
+        return false;
+      };
+      if (!hasReactKeys()) {
+        vlog('Draftail: väntar på hydrering (inga __react*-nycklar på root/föräldrar än) — ' + fieldId + '…');
+        let waited = 0;
+        while (!hasReactKeys() && waited < 15000) { await wait(100); waited += 100; }
+        vlog(hasReactKeys()
+          ? 'Draftail: hydrering klar efter ' + waited + ' ms (' + fieldId + ') — __react*-nycklar finns nu.'
+          : 'Draftail: hydrering uteblev efter 15 s (' + fieldId + ') — går vidare ändå (reservvägen).',
+          hasReactKeys() ? 'ok' : 'warn');
+      }
+    }
     return root || null;
   }
 
+  // (v7.100.38) getDraftProps = cachande wrapper runt getDraftPropsScan: loggar
+  // VILKEN källa som gav träffen (t.ex. "__reactEventHandlers$ på <DIV
+  // class=Draftail-Editor…>") så nästa logg är självförklarande.
   function getDraftProps(root) {
     if (!root) return null;
-    if (root.__vsehDraftProps) return root.__vsehDraftProps;   // (v7.100.37) cachad positiv träff
+    if (root.__vsehDraftProps) return root.__vsehDraftProps;
+    const hit = getDraftPropsScan(root);
+    if (hit) {
+      root.__vsehDraftProps = hit;
+      const df = root.closest('[data-field]');
+      vlog('Draftail: React-props hittade via ' + (hit.src || 'okänd källa') + ' (data-field: ' +
+        (df ? df.getAttribute('data-field') : (root.className || '?')) + ').', 'ok');
+    }
+    return hit;
+  }
+
+  function getDraftPropsScan(root) {
+    if (!root) return null;
     // (v7.100.19) Bred sökning efter props med onChange + editorState:
     // 1) fiber-vandring uppåt (båda nyckelnamnen, 60 hopp),
     // 2) __reactProps$ på root,
@@ -1950,14 +1989,14 @@
     // (v7.100.37) onChange hittas även via valfritt prop-nyckel innehållande
     // "change"; returerar alltid en normaliserad KOPIA {onChange, editorState}
     // (rör aldrig Reacts eget props-objekt).
-    const okProps = (mp) => {
+    const okProps = (mp, src) => {
       if (!mp) return null;
       const onChange = typeof mp.onChange === 'function' ? mp.onChange
         : Object.entries(mp).find(([k, v]) => /change/i.test(k) && typeof v === 'function')?.[1];
       if (!onChange) return null;
       const editorState = mp.editorState || Object.values(mp).find(isState);
       if (!editorState) return null;
-      return { onChange, editorState };
+      return { onChange, editorState, src: src || 'props' };
     };
     // (v7.100.21) starta fiber-vandringen fran root OCH upp till 6 foraldrar —
     // ibland sitter fiber-nyckeln inte på själva .DraftEditor-root utan på en
@@ -1971,19 +2010,23 @@
       if (!instKey) continue;
       let node = sn[instKey];
       let hops = 0;
-      while (node && hops < 120) {   // (v7.100.37)
-        const hit = node.memoizedProps && okProps(node.memoizedProps);
-        if (hit) { root.__vsehDraftProps = hit; return hit; }   // (v7.100.37) cacha
-        node = node.return || node._debugOwner || null;
+      while (node && hops < 200) {   // (v7.100.38) 200 hopp
+        // (v7.100.38) legacy React 16: interna instanser bär props i
+        // _currentElement.props (inte memoizedProps).
+        const hit = (node.memoizedProps && okProps(node.memoizedProps, instKey + '.memoizedProps'))
+          || (node._currentElement && node._currentElement.props && okProps(node._currentElement.props, instKey + '._currentElement.props'));
+        if (hit) return hit;
+        node = node.return || node._debugOwner || null;   // (v7.100.38) båda uppåt-vägarna
         hops++;
       }
     }
     const scan = (el) => {
       if (!el) return null;
       for (const k of Object.keys(el)) {
-        if (!k.startsWith('__reactProps$')) continue;
-        const hit = okProps(el[k]);
-        if (hit) { root.__vsehDraftProps = hit; return hit; }   // (v7.100.37) cacha
+        // (v7.100.38) legacy React 16 lägger props/handlers i __reactEventHandlers$, inte bara __reactProps$
+        if (!k.startsWith('__reactProps$') && !k.startsWith('__reactEventHandlers$')) continue;
+        const hit = okProps(el[k], k + ' på <' + el.tagName + (el.className ? ' class="' + String(el.className).slice(0, 40) + '"' : '') + '>');
+        if (hit) return hit;
       }
       return null;
     };
@@ -1996,11 +2039,20 @@
     if (form && form !== wrapEl) {
       for (const el of form.querySelectorAll('*')) { hit = scan(el); if (hit) return hit; }
     }
+    // (v7.100.38) hela dokumentet som sista props-svep (cap 20000 noder) —
+    // legacy React 16 kan lägga __reactEventHandlers$ på vilken nod som helst.
+    let docN = 0;
+    for (const el of document.querySelectorAll('*')) {
+      if (++docN > 20000) break;
+      hit = scan(el);
+      if (hit) return hit;
+    }
     // (v7.100.37) React-root NEDÅT: __reactContainer$ på någon förälder (t.ex. body
     // när editorn renderas i en portal utanför formuläret) → DFS över hela
     // fiber-trädet (cap 8000 noder) tills okProps träffar.
     for (const sn of startNodes) {
-      const contKey = Object.keys(sn).find((k) => k.startsWith('__reactContainer$'));
+      // (v7.100.38) stavfelet __reactContainere$ förekommer på legacy React 16
+      const contKey = Object.keys(sn).find((k) => k.startsWith('__reactContainer$') || k.startsWith('__reactContainere$'));
       if (!contKey) continue;
       const fiberRoot = sn[contKey];
       const hostRoot = fiberRoot && (fiberRoot.current || (fiberRoot._reactRootContainer && fiberRoot._reactRootContainer._internalRoot && fiberRoot._reactRootContainer._internalRoot.current));
@@ -2010,8 +2062,9 @@
       while (stack.length && n < 8000) {
         const f = stack.pop();
         n++;
-        const p = f.memoizedProps && okProps(f.memoizedProps);
-        if (p) { root.__vsehDraftProps = p; return p; }
+        const p = (f.memoizedProps && okProps(f.memoizedProps, contKey + '-DFS memoizedProps'))
+          || (f._currentElement && f._currentElement.props && okProps(f._currentElement.props, contKey + '-DFS _currentElement.props'));   // (v7.100.38)
+        if (p) return p;
         if (f.child) stack.push(f.child);
         if (f.sibling) stack.push(f.sibling);
       }
@@ -2027,6 +2080,263 @@
     if (draftailWarned.has(fieldId)) return;
     draftailWarned.add(fieldId);
     vlog(msg, 'err');
+  }
+
+  // (v7.100.38) Fält där verifierad tömning misslyckats tidigare i sessionen —
+  // inga fler delete-försök mot samma fält (poll-loopen ska inte hamra igen).
+  // Mönster som emdashDescTried. Sista utväg: draft.js-JSON direkt till dolda fältet.
+  const draftailBrokenClear = new Set();
+
+  // ===== STRUKTURBEVARANDE DRAFTAIL-SKRIVNING (v7.100.38, teknik portad från editorbot) =====
+  // Det dolda input-fältet hålls av Draftail synkat med rå Draft.js-JSON
+  // ({"blocks":[...],"entityMap":{...}}). Strukturbevarande skrivning ändrar
+  // texten segmentvis per block direkt i JSON:en — blocktyper, inlineStyleRanges,
+  // entityRanges och entityMap (länkar, atomic-block/bilder) bevaras och offsets
+  // räknas om. Skrivning via React-props när de finns (onChange + createFromRaw),
+  // annars writeDraftailJSON + guard rakt ner i dolda fältet (det som sparas).
+  function draftKey() { return 'k' + Math.random().toString(36).slice(2, 9); }
+  function readDraftailJSON(fieldId) {
+    const hidden = document.getElementById(fieldId);
+    if (!hidden || !hidden.value) return null;
+    try { const d = JSON.parse(hidden.value); return (d && d.blocks) ? d : null; }
+    catch { return null; }
+  }
+  function splitBlockSegments(text, entityRanges) {
+    const bounds = new Set([0, text.length]);
+    (entityRanges || []).forEach(r => { bounds.add(Math.min(r.offset, text.length)); bounds.add(Math.min(r.offset + r.length, text.length)); });
+    const points = [...bounds].sort((a, b) => a - b);
+    const segs = [];
+    for (let i = 0; i < points.length - 1; i++) {
+      const start = points[i], end = points[i + 1];
+      if (end <= start) continue;
+      const er = (entityRanges || []).find(r => r.offset <= start && r.offset + r.length >= end);
+      segs.push({ start, end, text: text.slice(start, end), entityKey: er ? er.key : null });
+    }
+    return segs;
+  }
+  function rebuildBlock(block, segTexts) {
+    const segs = splitBlockSegments(block.text || '', block.entityRanges);
+    let newText = '', cursor = 0;
+    const segStart = [], segEnd = [];
+    segs.forEach((sg, i) => {
+      segStart[i] = cursor;
+      const t = (segTexts && Object.prototype.hasOwnProperty.call(segTexts, i)) ? segTexts[i] : sg.text;
+      newText += t;
+      cursor += t.length;
+      segEnd[i] = cursor;
+    });
+    const newRanges = (block.entityRanges || []).map(r => {
+      const idx = segs.findIndex(sg => sg.entityKey === r.key && sg.start >= r.offset && sg.end <= r.offset + r.length);
+      const i = idx >= 0 ? idx : segs.findIndex(sg => sg.entityKey === r.key);
+      return i >= 0 ? { key: r.key, offset: segStart[i], length: segEnd[i] - segStart[i] } : r;
+    });
+    const newStyles = (block.inlineStyleRanges || []).map(r => {
+      const from = segs.findIndex(sg => sg.end > r.offset);
+      const to = segs.reduce((acc, sg, i) => (sg.start < r.offset + r.length ? i : acc), -1);
+      if (from < 0 || to < 0) return r;
+      return { style: r.style, offset: segStart[from], length: segEnd[to] - segStart[from] };
+    });
+    return Object.assign({}, block, { text: newText, entityRanges: newRanges, inlineStyleRanges: newStyles });
+  }
+  function extractDraftailJSON(content) {
+    const out = [];
+    (content.blocks || []).forEach((b, bi) => {
+      if ((b.type || '') === 'atomic') return;
+      splitBlockSegments(b.text || '', b.entityRanges).forEach((sg, si) => {
+        if (sg.text.trim()) out.push({ block: bi, seg: si, text: sg.text });
+      });
+    });
+    return out;
+  }
+  function writeDraftailJSON(fieldId, content) {
+    const hidden = document.getElementById(fieldId);
+    if (!hidden) return false;
+    try {
+      const payload = Object.assign({}, content, { entityMap: content.entityMap || {} });
+      hidden.value = JSON.stringify(payload);
+      hidden.dispatchEvent(new Event('input', { bubbles: true }));
+      hidden.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    } catch (err) {
+      vlog('Draftail: kunde inte skriva struktur till ' + fieldId + ': ' + (err && err.message ? err.message : err), 'err');
+      return false;
+    }
+  }
+  // Skriv-vakt (portat från editorbot): efter writeDraftailJSON pollas det dolda
+  // fältet i upp till 6 s — om något (React re-render, Wagtails poll) skriver
+  // tillbaka gammalt innehåll skrivs det om, upp till 3 gånger.
+  async function guardDraftailWrite(fieldId, content) {
+    const expected = JSON.stringify(Object.assign({}, content, { entityMap: content.entityMap || {} }));
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (!writeDraftailJSON(fieldId, content)) return false;
+      let stable = true;
+      for (let t = 0; t < 12; t++) {
+        await wait(500);
+        const hidden = document.getElementById(fieldId);
+        const cur = (hidden && hidden.value) || '';
+        if (cur !== expected) {
+          stable = false;
+          vlog('Draftail: dolt fält i ' + fieldId + ' skrevs över efter ' + ((t + 1) * 0.5) + 's (försök ' + attempt + '/3) — skriver om.', 'warn');
+          break;
+        }
+      }
+      if (stable) return true;
+    }
+    vlog('Draftail: kunde inte hålla innehållet i ' + fieldId + ' — något skriver ständigt över det dolda fältet (reserv används ändå; kontrollera manuellt).', 'err');
+    return false;
+  }
+  // Kanonisk jämförelse på JSON-nivå (nyckelordning oberoende) mot dolda fältet.
+  function canonDraftJSON(d) {
+    if (!d) return '';
+    const em = d.entityMap || {};
+    const emSorted = {};
+    Object.keys(em).sort().forEach(k => { emSorted[k] = em[k]; });
+    const blocks = (d.blocks || []).map(b => [b.key || '', b.text || '', b.type || '', b.depth || 0,
+      JSON.stringify(b.inlineStyleRanges || []), JSON.stringify(b.entityRanges || []), JSON.stringify(b.data || {})].join('|'));
+    return JSON.stringify({ blocks: blocks, entityMap: emSorted });
+  }
+  function draftailJSONLanded(fieldId, content) {
+    try { return canonDraftJSON(readDraftailJSON(fieldId)) === canonDraftJSON(content); }
+    catch { return false; }
+  }
+  function isTextareaField(fieldId) {
+    const el = document.getElementById(fieldId);
+    return !!(el && el.tagName === 'TEXTAREA');
+  }
+  // Sista utväg när tömning/paste inte går: bygg rått draft.js-JSON av en platt
+  // text och skriv direkt till dolda input (det som faktiskt sparas).
+  function draftailTextToJSON(text) {
+    const lines = String(text).split('\n');
+    return {
+      blocks: lines.map((l, i) => ({ key: 'v' + i + draftKey(), text: l, type: 'unstyled', depth: 0, inlineStyleRanges: [], entityRanges: [], data: {} })),
+      entityMap: {}
+    };
+  }
+  async function writeDraftailTextJSON(fieldId, text) {
+    const content = draftailTextToJSON(text);
+    const ok = await guardDraftailWrite(fieldId, content);
+    const landed = draftailJSONLanded(fieldId, content);
+    vlog('Beskrivning: RESERV — draft.js-JSON skriven direkt till dolda fältet för ' + fieldId +
+      ' (sparningen använder detta värde) — verifierad: ' + (landed ? 'JA' : 'NEJ') + '.', landed ? 'ok' : 'err');
+    return ok && landed;
+  }
+  // Strukturbevarande skrivning: transformFn får hela draft.js-JSON (djup kopia)
+  // och returnerar nytt JSON. Skrivs via props.onChange(createFromRaw) när props
+  // finns, annars writeDraftailJSON+guard. Verifieras på JSON-nivå mot dolda fältet.
+  function updateDraftailStructured(fieldId, transformFn, userAction = false) {
+    const prev = draftailWriteQueue.get(fieldId) || Promise.resolve();
+    const run = prev.catch(() => {}).then(() => updateDraftailStructuredInner(fieldId, transformFn, userAction));
+    draftailWriteQueue.set(fieldId, run.catch(() => {}));
+    return run;
+  }
+  async function updateDraftailStructuredInner(fieldId, transformFn, userAction = false) {
+    const last = draftailWriteStamp.get(fieldId) || 0;
+    if (!userAction && Date.now() - last < 15000) {
+      vlog('Beskrivning: skrivning till ' + fieldId + ' spärrad (redan skriven för <15 s sedan) — hoppar över för att undvika duplicering.', 'err');
+      return false;
+    }
+    draftailWriteStamp.set(fieldId, Date.now());
+    // SBR/textarea: ingen Draftail — kör transformFn på en enblock-JSON och
+    // skriv platt text (samma beteende som updateDraftail).
+    if (isTextareaField(fieldId)) {
+      const plainEl = document.getElementById(fieldId);
+      const cur = plainEl.value || '';
+      const nj = transformFn({ blocks: cur ? [{ key: 't', text: cur, type: 'unstyled', depth: 0, inlineStyleRanges: [], entityRanges: [], data: {} }] : [], entityMap: {} }) || {};
+      const txt = (nj.blocks || []).map(b => b.text || '').join('\n');
+      simulateInput(plainEl, txt);
+      vlog(`Beskrivning ifylld (textarea, strukturerad): ${fieldId} → ${txt.slice(0, 60)}...`, 'ok');
+      return true;
+    }
+    try {
+      let cur = readDraftailJSON(fieldId);
+      if (!cur) cur = draftailTextToJSON(readDraftailText(fieldId));
+      const before = canonDraftJSON(cur);
+      const newContent = transformFn(JSON.parse(JSON.stringify(cur)));
+      if (!newContent || !Array.isArray(newContent.blocks)) return false;
+      if (canonDraftJSON(newContent) === before) return true;   // inget ändrades
+      const root = await mountDraftail(fieldId);
+      const props = root && getDraftProps(root);
+      if (props) {
+        try {
+          const EditorState = props.editorState.constructor;
+          const ContentState = props.editorState.getCurrentContent().constructor;
+          let ns = EditorState.createWithContent(ContentState.createFromRaw(newContent));
+          if (typeof EditorState.moveSelectionToEnd === 'function') ns = EditorState.moveSelectionToEnd(ns);
+          props.onChange(ns);
+          for (let i = 0; i < 50; i++) {
+            await wait(100);
+            if (draftailJSONLanded(fieldId, newContent)) {
+              vlog(`Beskrivning strukturerad via React-props (${props.src || 'react'}): ${fieldId} — verifierad på JSON-nivå i dolda fältet.`, 'ok');
+              await refreshDraftailScreen(fieldId, root, props);
+              return true;
+            }
+          }
+          vlog('Beskrivning: React-vägen svarade men JSON:en verifierades inte i dolda fältet inom 5 s (' + fieldId + ') — reserv: writeDraftailJSON.', 'err');
+        } catch (e) {
+          vlog('Beskrivning: fel vid strukturerad props-skrivning (' + fieldId + '): ' + (e && e.message ? e.message : e) + ' — reserv: writeDraftailJSON.', 'err');
+        }
+      } else {
+        vlog('Beskrivning: inga React-props för ' + fieldId + ' — skriver JSON direkt till dolda fältet (reserv).', 'warn');
+      }
+      const ok = await guardDraftailWrite(fieldId, newContent);
+      if (ok && draftailJSONLanded(fieldId, newContent)) {
+        vlog(`Beskrivning strukturerad via dolda fältet (reserv): ${fieldId} — verifierad på JSON-nivå.`, 'ok');
+        await refreshDraftailScreen(fieldId, root, null);
+        return true;
+      }
+      vlog('Beskrivning: strukturerad skrivning MISSLYCKADES för ' + fieldId + ' (gamla innehållet ligger kvar).', 'err');
+      return false;
+    } catch (err) {
+      vlog(`Beskrivning: fel vid strukturerad ifyllning av ${fieldId} (fortsätter): ${err && err.message ? err.message : err}`, 'err');
+      return false;
+    }
+  }
+  // (v7.100.38) Text→text-transform per segment (em-dash, versaler, emoji …):
+  // segmentgränser följer entityRanges så länkar/stilar bevaras av rebuildBlock.
+  function transformDraftailText(fieldId, fn, userAction = false) {
+    return updateDraftailStructured(fieldId, (json) => {
+      (json.blocks || []).forEach((b, bi) => {
+        if ((b.type || '') === 'atomic') return;
+        const segs = splitBlockSegments(b.text || '', b.entityRanges);
+        const segTexts = {};
+        let changed = false;
+        segs.forEach((sg, i) => {
+          const t = fn(sg.text);
+          if (t !== sg.text) { segTexts[i] = t; changed = true; }
+        });
+        if (changed) json.blocks[bi] = rebuildBlock(b, segTexts);
+      });
+      return json;
+    }, userAction);
+  }
+  // (v7.100.38) Skärm-refresh utan textContent-patch: dolda fältet är rätt (det
+  // sparas), men om skärmen är stale försöker vi riktig re-render via
+  // focus()/blur() + props.onChange(forceSelection); annars lämnas DOM orörd.
+  async function refreshDraftailScreen(fieldId, root, props) {
+    const ed = root && root.querySelector('.public-DraftEditor-content');
+    if (!ed) return;
+    const want = readDraftailText(fieldId).replace(/\s+/g, ' ').trim();
+    for (let i = 0; i < 10; i++) {
+      await wait(100);
+      const shown = (ed.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!want || shown === want) return;
+      if (i === 9) {
+        try {
+          if (props) {
+            ed.blur(); ed.focus();
+            const ES = props.editorState.constructor;
+            props.onChange(ES.forceSelection(props.editorState, props.editorState.getSelection().set('hasFocus', true)));
+            await wait(500);
+          } else {
+            ed.blur(); ed.focus();
+          }
+        } catch {}
+        const shown2 = (ed.textContent || '').replace(/\s+/g, ' ').trim();
+        if (want && shown2 !== want) {
+          vlog('Beskrivning: ' + fieldId + ' — dolda fältet rätt, skärmen kan vara stale tills omladdning (ingen textContent-patch; DOM lämnad orörd).', 'warn');
+        }
+      }
+    }
   }
   // Reserv för updateDraftail när React-props inte kan hittas alls (vissa
   // Wagtail-sidor exponerar inte onChange/editorState via fiber-trädet,
@@ -2047,6 +2357,13 @@
     const root = await mountDraftail(fieldId);
     const editable = root && (root.querySelector('.public-DraftEditor-content') || root);
     if (!editable || !editable.isContentEditable) return false;
+    // (v7.100.38) Fältet kunde inte tömmas verifierat tidigare i sessionen —
+    // inga fler delete-försök (poll-loopen ska inte hamra); gå direkt till
+    // sista utväg: draft.js-JSON rakt ner i dolda fältet.
+    if (draftailBrokenClear.has(fieldId)) {
+      vlog('Beskrivning: ' + fieldId + ' är markerad "broken" (kunde inte tömmas tidigare) — hoppar över select-all/delete/paste och skriver JSON direkt till dolda fältet.', 'err');
+      return await writeDraftailTextJSON(fieldId, text);
+    }
     // (v7.100.17) Spara originaltexten INNAN vi rör fältet — om tömningen lyckas
     // men paste sedan misslyckas (t.ex. Firefox där syntetisk clipboardData kan
     // bli tom) är fältet tomt i React-state och skulle sparas tomt. Då återställer
@@ -2185,6 +2502,12 @@
       } catch {}
     }
     if (!emptied) {
+      // (v7.100.38) markera "broken": inga fler delete-försök mot detta fält
+      // denna session (se början av funktionen). Sista utväg först: skriva
+      // draft.js-JSON direkt till dolda fältet — garanterat det som sparas.
+      draftailBrokenClear.add(fieldId);
+      vlog('Beskrivning: AVBRYTER tömning av ' + fieldId + ' — kunde inte tömmas verifierat; markerar fältet "broken" för sessionen. Sista utväg: JSON direkt till dolda fältet.', 'err');
+      if (await writeDraftailTextJSON(fieldId, text)) return true;
       await restoreOriginal(false);   // (v7.100.17) delete-event hann delvis mutera fältet — återställ
       vlog('Beskrivning: AVBRYTER skrivning till ' + fieldId +
         ' — fältet kunde inte tömmas verifierat (innehåll kvar efter delete) och en paste skulle duplicera texten. Original återställt via React-props om möjligt, annars klistra in manuellt.', 'err');
@@ -2270,21 +2593,13 @@
         }
       }
       {
-        // (v7.100.21) samma sista utväg här: dolda fältet är rätt, patcha skärmen visuellt om den fortfarande är tom.
+        // (v7.100.38) INGEN textContent-patch längre — den desynkar DOM från
+        // Draft.js state (orsaken till "statiska"/låsta fält). Dolda fältet är
+        // rätt (det sparas); vid skärm-mismatch försök riktig re-render, annars
+        // lämna DOM orörd och logga.
         const shownNow = (editable.textContent || '').replace(/\s+/g, ' ').trim();
         if (wantS && shownNow !== wantS) {
-          editable.textContent = String(text);
-          // (v7.100.37) caret sist i fältet efter patchen — annars kändes fältet
-          // "låst" när användaren skulle fortsätta skriva efter auto-ändringen.
-          try {
-            const cr = document.createRange();
-            cr.selectNodeContents(editable);
-            cr.collapse(false);
-            const cs = window.getSelection();
-            cs.removeAllRanges();
-            cs.addRange(cr);
-          } catch {}
-          vlog('Beskrivning: ' + fieldId + ' — dolda fältet rätt men skärmen patchades visuellt (textContent); sparning påverkas inte.', 'err');
+          await refreshDraftailScreen(fieldId, root, getDraftProps(root));
         }
       }
       return true;
@@ -2432,24 +2747,15 @@
             } catch {}
           }
         }
-        // (v7.100.21) sista utväg för SYNLIGHETEN: dolda fältet är rätt (sparningen
-        // blir rätt), men om skärmen fortfarande inte visar texten patchar vi
-        // editorns DOM direkt så användaren ser texten direkt.
         {
+          // (v7.100.38) INGEN textContent-patch — den desynkar DOM från
+          // Draft.js state (orsaken till "statiska"/låsta fält). Dolda fältet
+          // är rätt (sparningen blir rätt); vid skärm-mismatch försök riktig
+          // re-render via refreshDraftailScreen, annars lämna DOM orörd.
           const edNow = root && root.querySelector('.public-DraftEditor-content');
           const shownNow = ((edNow && edNow.textContent) || '').replace(/\s+/g, ' ').trim();
           if (want && shownNow !== want && edNow) {
-            edNow.textContent = String(text);
-            // (v7.100.37) caret sist — se kommentar i reservvägen ovan.
-            try {
-              const cr2 = document.createRange();
-              cr2.selectNodeContents(edNow);
-              cr2.collapse(false);
-              const cs2 = window.getSelection();
-              cs2.removeAllRanges();
-              cs2.addRange(cr2);
-            } catch {}
-            vlog('Beskrivning: ' + fieldId + ' — dolda fältet rätt men skärmen patchades visuellt (textContent); sparning påverkas inte.', 'err');
+            await refreshDraftailScreen(fieldId, root, props);
           }
         }
         vlog(`Beskrivning ifylld: ${fieldId} → ${String(text).slice(0, 60)}...`, 'ok');
@@ -9076,7 +9382,9 @@
       // (2026-10-20, v7.100.4) updateDraftail returnerar nu ärligt true/false —
       // logga MISSLYCKADES (inte "Klar") när texten inte landade, så användaren
       // vet att den nya texten måste klistras in manuellt.
-      const writeOk = await updateDraftail(fieldId, cleaned, true);   // userAction — går alltid igenom spärren
+      // (v7.100.38) Draftail: strukturbevarande (blocktyper per rad följer med);
+      // textarea/SBR: platt text som tidigare. userAction — går alltid igenom spärren.
+      const writeOk = await writeDescriptionField(fieldId, cleaned, true);
       if (writeOk) {
         vlog('Riktlinje-omskrivning: Klar (' + fieldId + ')' + (cleaned === text ? ' — OBS: Mistral svarade med identisk text.' : ', ' + (text.length - cleaned.length) + ' tecken kortare.'), 'ok');
       } else {
@@ -9139,11 +9447,14 @@
       if (!text || !text.includes('—')) return;
       if (emdashDescTried.has(id)) return;
       emdashDescTried.add(id);
-      const fixed = text.replace(/\s*—\s*/g, ' – ').replace(/ {2,}/g, ' ').trim();
       vlog('Em-dash: försöker ersätta — i ' + id + ' (spärrad tills sidan laddas om).');
-      // (2026-10-20, v7.100.4) updateDraftail verifierar själv mot det dolda
-      // fältet och returnerar ärligt — ingen egen poll behövs längre.
-      updateDraftail(id, fixed).then(ok => {
+      // (v7.100.38) Draftail: strukturbevarande segmentvis skrivning (länkar/
+      // stilar bevaras via rebuildBlock); textarea/SBR: platt text som tidigare.
+      // Skrivningen verifierar själv mot det dolda fältet och returnerar ärligt.
+      const writeP = isTextareaField(id)
+        ? updateDraftail(id, text.replace(/\s*—\s*/g, ' – ').replace(/ {2,}/g, ' ').trim())
+        : transformDraftailText(id, t => t.replace(/\s*—\s*/g, ' – ').replace(/ {2,}/g, ' '));
+      writeP.then(ok => {
         if (ok) {
           emdashReplaced.add(id);
           showAutoChangeNote(document.getElementById(id), 'Em-dash (—) ersatt med tankstreck (–) i ' + id.replace('id_description_', 'beskrivning '));
@@ -9176,6 +9487,28 @@
     });
   }
 
+  // (v7.100.38) Helt ny platt text (Mistral rewrite/översättning) skriven
+  // strukturbevarande: nya block per rad, blocktyp/depth från motsvarande
+  // gammalt block följer med (rubriker/listor bevaras). Textarea/SBR skrivs
+  // platt via writeDescriptionField nedan.
+  function draftailFullTextTransform(newText) {
+    return (json) => {
+      const old = json.blocks || [];
+      json.blocks = String(newText).split('\n').map((l, i) => {
+        const o = old[i] || {};
+        return { key: o.key || draftKey(), text: l, type: o.type || 'unstyled', depth: o.depth || 0, inlineStyleRanges: [], entityRanges: [], data: o.data || {} };
+      });
+      return json;
+    };
+  }
+  // Gemensam skrivväg för "hela texten byts ut" (rewrite/translate): Draftail
+  // får strukturbevarande JSON, textarea/SBR får platt text som tidigare.
+  function writeDescriptionField(fieldId, text, userAction) {
+    return isTextareaField(fieldId)
+      ? updateDraftail(fieldId, text, userAction)
+      : updateDraftailStructured(fieldId, draftailFullTextTransform(text), userAction);
+  }
+
   // (v7.100.34) Instagram-handtag (@handle) i beskrivningen görs om till en fet
   // markdown-hyperlänk inom paranteser:
   //   "Insta: @christianwigardt"  →  "(Instagram: [**@christianwigardt**](https://www.instagram.com/christianwigardt))"
@@ -9203,6 +9536,67 @@
     if (!changed) return text;
     out += text.slice(last);
     return out;
+  }
+  // (v7.100.38) Draftail-variant av Instagram-linkify: @handle → riktig
+  // LINK-entitet (entityMap[k]={type:'LINK',mutability:'MUTABLE',data:{href}})
+  // + BOLD inlineStyleRange på "@h", med synlig text "(Instagram: " före.
+  // Idempotens via entityMap: ett @handle som redan täcks av en LINK-entitet
+  // mot instagram.com/<handle> rörs inte. Befintliga entity/inline-ranges
+  // mappas om över ändringarna; atomic-block rörs aldrig.
+  function linkifyInstagramInJSON(json) {
+    let changed = false;
+    let keyCounter = 0;
+    Object.keys(json.entityMap || {}).forEach(k => { const n = parseInt(String(k).replace(/\D/g, ''), 10); if (!isNaN(n) && n >= keyCounter) keyCounter = n + 1; });
+    (json.blocks || []).forEach((b, bi) => {
+      if ((b.type || '') === 'atomic') return;
+      const text = b.text || '';
+      const re = new RegExp(INSTA_HANDLE_RE.source, 'gi');
+      const edits = [];
+      let m;
+      while ((m = re.exec(text))) {
+        const handle = m[1];
+        const href = 'https://www.instagram.com/' + handle;
+        const already = (b.entityRanges || []).some(r => {
+          const ent = (json.entityMap || {})[r.key];
+          return r.offset <= m.index && r.offset + r.length >= m.index + m[0].length &&
+            ent && ent.type === 'LINK' && ent.data && String(ent.data.href || '').replace(/\/+$/, '') === href;
+        });
+        if (already) continue;
+        if (/instagram\.com\/$/i.test(text.slice(Math.max(0, m.index - 60), m.index))) continue;
+        let start = m.index;
+        const pm = text.slice(Math.max(0, start - 12), start).match(INSTA_PREFIX_RE);
+        if (pm) start -= pm[0].length;
+        if (/\(Instagram:\s*$/i.test(text.slice(Math.max(0, start - 20), start))) continue;
+        edits.push({ start, end: m.index + m[0].length, insert: '(Instagram: @' + handle + ')', linkOff: '(Instagram: '.length, linkLen: m[0].length, href });
+      }
+      if (!edits.length) return;
+      edits.sort((a, b) => a.start - b.start);
+      let newText = '', last = 0, acc = 0;
+      const eNew = edits.map(e => { const r = Object.assign({}, e, { newStart: e.start + acc }); acc += e.insert.length - (e.end - e.start); return r; });
+      for (const e of eNew) { newText += text.slice(last, e.start) + e.insert; last = e.end; }
+      newText += text.slice(last);
+      const mapStart = (p) => { for (const e of eNew) { if (p >= e.end) return e.newStart + e.insert.length + (p - e.end); if (p > e.start) return e.newStart; } return p; };
+      const mapEnd = (p) => { for (const e of eNew) { if (p >= e.end) return e.newStart + e.insert.length + (p - e.end); if (p > e.start) return e.newStart + e.insert.length; } return p; };
+      const newEntityRanges = (b.entityRanges || []).map(r => {
+        const ns = mapStart(r.offset), ne = mapEnd(r.offset + r.length);
+        return ne > ns ? { key: r.key, offset: ns, length: ne - ns } : null;
+      }).filter(Boolean);
+      const newInline = (b.inlineStyleRanges || []).map(r => {
+        const ns = mapStart(r.offset), ne = mapEnd(r.offset + r.length);
+        return ne > ns ? { style: r.style, offset: ns, length: ne - ns } : null;
+      }).filter(Boolean);
+      json.entityMap = json.entityMap || {};
+      for (const e of eNew) {
+        const key = 'ig' + (keyCounter++);
+        json.entityMap[key] = { type: 'LINK', mutability: 'MUTABLE', data: { href: e.href } };
+        const off = e.newStart + e.linkOff;
+        newEntityRanges.push({ key, offset: off, length: e.linkLen });
+        newInline.push({ style: 'BOLD', offset: off, length: e.linkLen });
+      }
+      json.blocks[bi] = Object.assign({}, b, { text: newText, entityRanges: newEntityRanges, inlineStyleRanges: newInline });
+      changed = true;
+    });
+    return changed ? json : null;
   }
   // (v7.100.36) "Festival"-kategorin överanvänds: om main_category ELLER någon
   // category innehåller "festival" men ordet inte nämns i NÅGON av beskrivnings-
@@ -9254,7 +9648,9 @@
       const fixed = fixCapsAndBullets(text);
       if (fixed === text) return;
       vlog('Versaler/punktkulor: rättar ' + id + ' (• och VERSALER bort, förkortningar behållna).');
-      updateDraftail(id, fixed).then(ok => {
+      // (v7.100.38) Draftail: strukturbevarande; textarea/SBR: platt text.
+      const writeP = isTextareaField(id) ? updateDraftail(id, fixed) : transformDraftailText(id, fixCapsAndBullets);
+      writeP.then(ok => {
         if (ok) {
           capsLastText.set(id, fixed);
           showAutoChangeNote(document.getElementById(id), 'VERSALER och punktkulor (•) borttagna i ' + id.replace('id_description_', 'beskrivning ') + ' (förkortningar som SEK/VIP behållna)');
@@ -9274,6 +9670,21 @@
       if (instaLastText.get(id) === text) return;
       instaLastText.set(id, text);
       if (!new RegExp(INSTA_HANDLE_RE.source, 'gi').test(text)) return;
+      // (v7.100.38) Draftail-fält: riktig LINK-entitet + BOLD på @handle (se
+      // linkifyInstagramInJSON); markdown-strängen ENDAST för textarea/SBR.
+      if (!isTextareaField(id)) {
+        vlog('Instagram: gör om @handle till LINK-entitet + fet text i ' + id + ' → (Instagram: @…)');
+        updateDraftailStructured(id, (json) => linkifyInstagramInJSON(json) || json).then(ok => {
+          if (ok) {
+            instaLastText.set(id, readFieldText(id));
+            showAutoChangeNote(document.getElementById(id), 'Instagram-handle gjord till fet länk i ' + id.replace('id_description_', 'beskrivning ') + ': (Instagram: @…)');
+            vlog('Instagram: länk skriven i ' + id + ' (LINK-entitet).', 'ok');
+          } else {
+            vlog('Instagram: kunde INTE skriva länken till ' + id + ' automatiskt — gör om manuellt.', 'err');
+          }
+        }).catch(() => {});
+        return;
+      }
       const fixed = transformInstagramHandles(text);
       if (fixed === text) return;   // bara redan-länkade/mejl-träffar — inget att göra
       vlog('Instagram: gör om @handle till länk i ' + id + ' → (Instagram: [**@…**](https://www.instagram.com/…))');
@@ -9575,7 +9986,10 @@
       vlog('Beskrivning: emojis hittade i ' + fieldId + ' — försöker rensa EN gång (spärrad tills sidan laddas om).');
       // (2026-10-20, v7.100.4) Logga ärligt vid misslyckande — tidigare såg
       // pollern tyst ut att ha lyckats fast den rensade texten aldrig landade.
-      const emojiOk = await updateDraftail(fieldId, text.replace(EMOJI_RE, '').replace(/ {2,}/g, ' '));
+      // (v7.100.38) Draftail: strukturbevarande segmentvis; textarea/SBR: platt.
+      const emojiOk = isTextareaField(fieldId)
+        ? await updateDraftail(fieldId, text.replace(EMOJI_RE, '').replace(/ {2,}/g, ' '))
+        : await transformDraftailText(fieldId, t => t.replace(EMOJI_RE, '').replace(/ {2,}/g, ' '));
       if (emojiOk) {
         showAutoChangeNote(document.getElementById(fieldId), 'Emojis borttagna ur ' + fieldId.replace('id_description_', 'beskrivning '));
       } else {
@@ -10684,7 +11098,8 @@
         newDesc = 'NOTE: The event is in Swedish.\n\n' + newDesc;
       }
       // (2026-10-20, v7.100.4) Ärligt resultat — "Klar" bara när texten landade.
-      const descWriteOk = await updateDraftail('id_description_' + targetLang, newDesc, true);   // userAction
+      // (v7.100.38) strukturbevarande för Draftail; textarea/SBR platt. userAction
+      const descWriteOk = await writeDescriptionField('id_description_' + targetLang, newDesc, true);
       if (!descWriteOk) {
         vlog('Översättning: MISSLYCKADES — beskrivningen kunde inte skrivas till id_description_' + targetLang +
           ' automatiskt (gamla texten ligger kvar). Klistra in manuellt. Ny text: "' + newDesc + '"', 'err');
@@ -10744,7 +11159,8 @@
       const oldTargetText = readFieldText('id_description_' + targetLang);   // (v7.100.11)
       if (oldTargetText) vlog('Översättning: Ersätter text i id_description_' + targetLang + ' — gammal text: "' + oldTargetText + '"');
       // (2026-10-20, v7.100.4) Ärligt resultat — "Klar" bara när texten landade.
-      const descWriteOk = await updateDraftail('id_description_' + targetLang, stripEmDashes(translated.trim()), true);   // userAction
+      // (v7.100.38) strukturbevarande för Draftail; textarea/SBR platt. userAction
+      const descWriteOk = await writeDescriptionField('id_description_' + targetLang, stripEmDashes(translated.trim()), true);
       if (descWriteOk) {
         vlog('Översättning: Klar (' + targetName + ').', 'ok');
       } else {
@@ -11293,7 +11709,9 @@
       if (!rewritten) throw new Error('Tomt svar från Mistral');
       const cleaned = stripEmDashes(rewritten.trim()).replace(EMOJI_RE, '').replace(/ {2,}/g, ' ');
       vlog('SBR-beskrivning: Ersätter text i ' + fieldId + ' — gammal text: "' + text.slice(0, 120) + '…"');
-      const ok = await updateDraftail(fieldId, cleaned, true);
+      // (v7.100.38) SBR är textarea — writeDescriptionField blir platt text där,
+      // strukturbevarande om fältet någon gång är Draftail.
+      const ok = await writeDescriptionField(fieldId, cleaned, true);
       if (ok) {
         showAutoChangeNote(document.getElementById(fieldId), 'Beskrivning ' + lang + ' omskriven av Mistral (ren löptext)');
         vlog('SBR-beskrivning: Klar (' + fieldId + ').', 'ok');
